@@ -56,6 +56,26 @@ class OcellaPlanningScraperTest(unittest.TestCase):
         self.assertEqual(application.documents[0].title, "Planning statement.pdf")
         self.assertEqual(application.documents[0].date_published, "2026-06-15")
 
+    def test_parse_detail_accepts_short_received_and_validated_labels(self) -> None:
+        detail_html = """
+        <html><body>
+          <table>
+            <tr><td>Reference</td><td>BR/111/24/PL</td></tr>
+            <tr><td>Location</td><td>8 Argyle Road, Bognor Regis, PO21 1DY</td></tr>
+            <tr><td>Received</td><td>21-06-24</td></tr>
+            <tr><td>Validated</td><td>10-07-24</td></tr>
+          </table>
+        </body></html>
+        """
+
+        application = self.scraper.parse_detail(
+            detail_html,
+            "https://planning.example.gov.uk/planningDetails?reference=BR/111/24/PL",
+        )
+
+        self.assertEqual(application.date_received, "2024-06-21")
+        self.assertEqual(application.date_validated, "2024-07-10")
+
 
 if __name__ == "__main__":
     unittest.main()

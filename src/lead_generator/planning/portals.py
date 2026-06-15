@@ -13,7 +13,7 @@ PORTAL_SIGNATURES: tuple[PortalSignature, ...] = (
     PortalSignature("idox", ("publicaccess", "applicationdetails.do", "online-applications")),
     PortalSignature("ocella", ("ocella", "ocellaweb", "ocella planning")),
     PortalSignature("northgate", ("northgate", "planning explorer", "general_search.aspx")),
-    PortalSignature("civica", ("civica", "authority public access", "planningexplorer")),
+    PortalSignature("civica", ("civica", "authority public access", "planningexplorer", "webforms/planning/details.html")),
     PortalSignature("agile", ("agile applications", "wphappdetail.displayurl", "/apas/run/")),
 )
 

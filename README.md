@@ -19,10 +19,10 @@ HTTP boundary, offline parser tests, and no dependency on the legacy GPL source.
 | Portal family | Status | Notes |
 | --- | --- | --- |
 | Idox PublicAccess | Live-tested | Discovers applications, parses summary fields, and extracts document attachment metadata/URLs. |
-| Ocella-style registers | Fixture-tested | Parses common listing/detail/document patterns; needs council-specific live validation for each target authority. |
-| Civica / Authority Public Access | Detected | Signature detection is present; a dedicated adapter still needs live fixtures. |
-| Agile Applications / APAS | Detected | Signature detection is present; a dedicated adapter still needs live fixtures. |
-| Northgate Planning Explorer | Detected | Signature detection is present; a dedicated adapter still needs live fixtures. |
+| Ocella-style registers | Live-tested | Parses common listing/detail/document patterns and live-tested against Arun Ocella detail pages. |
+| Civica / Authority Public Access | Live-tested | Parses common labelled listing/detail/document patterns and JavaScript-backed `details.html?refval=...` pages that expose a public planning-data API. Live-tested against Bath & North East Somerset. |
+| Agile Applications / APAS | Implemented | Parses common APAS listing/detail/document patterns; fixture-covered. Current live council examples were not confirmed in the latest smoke test. |
+| Northgate Planning Explorer | Live-tested | Parses common listing/detail/document patterns and live-tested against Wandsworth Northgate detail pages. ASP.NET search-form submission is not automated yet. |
 
 Attachment support currently returns document metadata and URLs. It does not
 download or store the files themselves yet.
@@ -44,6 +44,9 @@ $env:PYTHONPATH = "$PWD\src"
   --listing-url "https://planning.example.gov.uk/online-applications/search.do?action=weeklyList" `
   --fetch-documents
 ```
+
+The CLI also supports `ocella`, `civica`, `agile`, and `northgate` subcommands for
+non-Idox portals that expose application data in labelled HTML pages.
 
 For production use, pass a real council PublicAccess base URL and keep the
 default request delay in place unless the council's terms explicitly allow a

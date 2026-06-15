@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from http.cookiejar import CookieJar
 from dataclasses import dataclass
+import json
 import ssl
 from time import monotonic, sleep
 from urllib.error import HTTPError, URLError
@@ -66,6 +67,19 @@ class CouncilHttpClient:
             headers={
                 "User-Agent": self.user_agent,
                 "Content-Type": "application/x-www-form-urlencoded",
+            },
+            method="POST",
+        )
+        return self._send(request, url)
+
+    def post_json(self, url: str, data: object) -> FetchResponse:
+        encoded = json.dumps(data).encode("utf-8")
+        request = Request(
+            url,
+            data=encoded,
+            headers={
+                "User-Agent": self.user_agent,
+                "Content-Type": "application/json",
             },
             method="POST",
         )
