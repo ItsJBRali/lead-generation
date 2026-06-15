@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lead-generator-independence"
+version = "0.1.0"
+description = "Lead generation tooling for UK planning application data."
+requires-python = ">=3.11"
+dependencies = [
+    "certifi>=2024.8.30",
+    "lxml>=4.9",
+]
+
+[project.scripts]
+planning-scrape = "lead_generator.planning.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

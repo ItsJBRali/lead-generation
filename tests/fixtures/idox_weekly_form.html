@@ -1,0 +1,19 @@
+<!doctype html>
+<html>
+  <body>
+    <form action="/online-applications/weeklyListResults.do?action=firstPage" method="post">
+      <input type="hidden" name="_csrf" value="fixture-token">
+      <select name="searchCriteria.ward" id="ward">
+        <option value="">All wards</option>
+      </select>
+      <select name="week" id="week">
+        <option value="0">This week</option>
+        <option value="1">Last week</option>
+      </select>
+      <input type="radio" name="dateType" value="DC_Validated" id="dateValidated" checked>
+      <input type="radio" name="dateType" value="DC_Decided" id="dateDecided">
+      <input type="hidden" name="searchType" value="Application">
+      <input type="submit" value="Search">
+    </form>
+  </body>
+</html>
