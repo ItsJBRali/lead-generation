@@ -14,5 +14,11 @@ class PlanningScraper(ABC):
         """Return application identifiers from a council listing/search page."""
 
     @abstractmethod
-    def fetch_application(self, uid: str, url: str | None = None) -> PlanningApplication:
+    def fetch_application(
+        self,
+        uid: str,
+        url: str | None = None,
+        *,
+        include_documents: bool = False,
+    ) -> PlanningApplication:
         """Fetch and normalize one application detail page."""
