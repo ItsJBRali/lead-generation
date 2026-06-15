@@ -5,6 +5,7 @@ import json
 from datetime import date
 
 from lead_generator.planning.adapters.idox import IdoxCouncilConfig, IdoxPublicAccessScraper
+from lead_generator.planning.adapters.ocella import OcellaCouncilConfig, OcellaPlanningScraper
 from lead_generator.planning.http import CouncilHttpClient
 
 
@@ -30,6 +31,27 @@ def main() -> None:
         action="store_true",
         help="Fetch each detail page after discovering IDs.",
     )
+    idox.add_argument(
+        "--fetch-documents",
+        action="store_true",
+        help="Include document attachment metadata from each application.",
+    )
+
+    ocella = subparsers.add_parser("ocella", help="Scrape an Ocella-style planning register.")
+    ocella.add_argument("--authority", required=True, help="Council or planning authority name.")
+    ocella.add_argument("--base-url", required=True, help="Council planning-register base URL.")
+    ocella.add_argument("--listing-url", required=True, help="Listing/search results URL to parse.")
+    ocella.add_argument("--limit", type=int, help="Maximum applications to return.")
+    ocella.add_argument(
+        "--fetch-details",
+        action="store_true",
+        help="Fetch each detail page after discovering IDs.",
+    )
+    ocella.add_argument(
+        "--fetch-documents",
+        action="store_true",
+        help="Include document attachment metadata from application pages.",
+    )
 
     args = parser.parse_args()
 
@@ -49,7 +71,30 @@ def main() -> None:
         )
         if args.fetch_details:
             discovery.applications = [
-                scraper.fetch_application(application.uid, application.url)
+                scraper.fetch_application(
+                    application.uid,
+                    application.url,
+                    include_documents=args.fetch_documents,
+                )
+                for application in discovery.applications
+            ]
+        elif args.fetch_documents:
+            for application in discovery.applications:
+                application.documents = scraper.fetch_documents(application.uid)
+        print(json.dumps(discovery.to_dict(), indent=2, sort_keys=True))
+
+    if args.portal == "ocella":
+        scraper = OcellaPlanningScraper(
+            OcellaCouncilConfig(authority=args.authority, base_url=args.base_url)
+        )
+        discovery = scraper.discover_ids(listing_url=args.listing_url, limit=args.limit)
+        if args.fetch_details:
+            discovery.applications = [
+                scraper.fetch_application(
+                    application.uid,
+                    application.url,
+                    include_documents=args.fetch_documents,
+                )
                 for application in discovery.applications
             ]
         print(json.dumps(discovery.to_dict(), indent=2, sort_keys=True))
