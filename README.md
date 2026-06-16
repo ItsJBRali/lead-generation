@@ -4,8 +4,7 @@ This repository contains the first planning-data ingestion layer for the lead
 generation platform.
 
 The initial implementation targets UK council websites running Idox PublicAccess,
-one of the common planning portal products used by local authorities. It follows
-the same high-level workflow as `aspeakman/UKPlanning`:
+one of the common planning portal products used by local authorities:
 
 1. discover planning application identifiers from a council listing page
 2. fetch each application detail page
