@@ -51,3 +51,30 @@ non-Idox portals that expose application data in labelled HTML pages.
 For production use, pass a real council PublicAccess base URL and keep the
 default request delay in place unless the council's terms explicitly allow a
 higher rate.
+
+## Lead Generator GUI
+
+The Windows GUI is available as `dist/PlanningLeadGenerator.exe`. It lets a user:
+
+- choose a GeoJSON file containing council portal settings
+- choose an output folder
+- select a received-date range
+- edit the default lead keywords
+- run the search with council progress and a live log
+
+Each GeoJSON feature should include council metadata in `properties`, using keys
+such as `name`, `portal_family`, `base_url`, and, for non-Idox portals,
+`listing_url`.
+
+To run from source:
+
+```powershell
+$env:PYTHONPATH = "$PWD\src"
+& "C:\Users\JBRal\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe" -m lead_generator.planning.gui
+```
+
+To rebuild the executable:
+
+```powershell
+& "C:\Users\JBRal\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe" -m PyInstaller --noconfirm --clean --name PlanningLeadGenerator --onefile --windowed --paths src src\lead_generator\planning\gui.py
+```
