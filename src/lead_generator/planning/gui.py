@@ -81,7 +81,7 @@ class LeadGeneratorApp(ctk.CTk):
         ).grid(row=0, column=0, sticky="w")
         ctk.CTkLabel(
             header,
-            text="Search council planning portals from a GeoJSON list and save matched PDF leads.",
+            text="Search planning authorities overlapping a GeoJSON boundary and save matched PDF leads.",
             font=ctk.CTkFont(size=14),
             text_color="#9ca3af",
         ).grid(row=1, column=0, pady=(4, 0), sticky="w")
@@ -93,7 +93,7 @@ class LeadGeneratorApp(ctk.CTk):
         self.geojson_entry = self._path_row(
             file_panel,
             row=0,
-            label="GeoJSON file",
+            label="Search boundary GeoJSON",
             button_text="Browse file",
             command=self._choose_geojson,
         )
@@ -210,7 +210,7 @@ class LeadGeneratorApp(ctk.CTk):
 
     def _choose_geojson(self) -> None:
         path = filedialog.askopenfilename(
-            title="Choose council GeoJSON",
+            title="Choose search boundary GeoJSON",
             filetypes=[("GeoJSON files", "*.geojson *.json"), ("All files", "*.*")],
         )
         if path:

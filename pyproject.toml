@@ -19,3 +19,6 @@ planning-leads-gui = "lead_generator.planning.gui:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"lead_generator.planning.data" = ["planning_authorities.geojson"]

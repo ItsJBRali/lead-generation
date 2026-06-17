@@ -5,7 +5,7 @@ a = Analysis(
     ['src\\lead_generator\\planning\\gui.py'],
     pathex=['src'],
     binaries=[],
-    datas=[],
+    datas=[('src\\lead_generator\\planning\\data\\planning_authorities.geojson', 'lead_generator\\planning\\data')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

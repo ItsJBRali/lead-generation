@@ -9,169 +9,67 @@ from unittest.mock import patch
 
 from lead_generator.planning.leads import (
     LeadSearchConfig,
+    application_in_geojson,
     application_matches,
-    discover_planit_applications,
-    derive_portal_base_url,
-    load_council_targets,
+    load_authority_catalogue,
     parse_keywords,
-    prepare_council_targets,
+    point_in_geometry,
     run_lead_search,
     sanitize_path_part,
+    select_overlapping_authorities,
 )
-from lead_generator.planning.models import DiscoveryResult, PlanningApplication
+from lead_generator.planning.models import PlanningApplication
 
 
-class FakeScraper:
-    def discover_ids(self, **_: object) -> DiscoveryResult:
-        return DiscoveryResult(
-            authority="Example Council",
-            source_url="https://planning.example.gov.uk/search",
-            applications=[
-                PlanningApplication(
-                    authority="Example Council",
-                    uid="ABC123",
-                    url="https://planning.example.gov.uk/detail/ABC123",
-                    reference="24/01234/FUL",
-                )
-            ],
-        )
-
-    def fetch_application(
-        self,
-        uid: str,
-        url: str | None = None,
-        *,
-        include_documents: bool = False,
-    ) -> PlanningApplication:
-        return PlanningApplication(
-            authority="Example Council",
-            uid=uid,
-            url=url or "",
-            reference="24/01234/FUL",
-            description="New driveway gates and boundary wall",
-            date_received="2026-06-10",
-        )
+def polygon_feature(name: str, xmin: float, ymin: float, xmax: float, ymax: float) -> dict[str, object]:
+    return {
+        "type": "Feature",
+        "properties": {"name": name},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[[xmin, ymin], [xmax, ymin], [xmax, ymax], [xmin, ymax], [xmin, ymin]]],
+        },
+    }
 
 
 class LeadSearchTest(unittest.TestCase):
     def test_parse_keywords_deduplicates_and_strips_quotes(self) -> None:
         self.assertEqual(
-            parse_keywords(' "gates" \n“electric gates”\ngates\n'),
+            parse_keywords(' "gates" \n"electric gates"\ngates\n'),
             ["gates", "electric gates"],
         )
 
-    def test_load_council_targets_from_geojson_properties(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "councils.geojson"
-            path.write_text(
-                json.dumps(
-                    {
-                        "type": "FeatureCollection",
-                        "features": [
-                            {
-                                "type": "Feature",
-                                "properties": {
-                                    "name": "Example Council",
-                                    "portal_family": "idox",
-                                    "base_url": "https://planning.example.gov.uk",
-                                },
-                                "geometry": None,
-                            }
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            targets = load_council_targets(path)
-
-        self.assertEqual(len(targets), 1)
-        self.assertEqual(targets[0].authority, "Example Council")
-        self.assertEqual(targets[0].portal_family, "idox")
-
-    @patch("lead_generator.planning.leads.lookup_public_portal_metadata")
-    def test_load_council_targets_populates_name_and_portal_fields_for_name_only_geojson(self, lookup_mock) -> None:
-        lookup_mock.return_value = {
-            "portal_family": "ocella",
-            "base_url": "https://www1.arun.gov.uk/aplanning/OcellaWeb/",
-            "listing_url": "https://www1.arun.gov.uk/aplanning/OcellaWeb/planningSearch",
-            "portal_detail_url": "https://www1.arun.gov.uk/aplanning/OcellaWeb/planningDetails?reference=BR%2F111%2F24%2FPL",
+    def test_select_overlapping_authorities_uses_app_catalogue_not_user_properties(self) -> None:
+        user_geojson = {
+            "type": "FeatureCollection",
+            "features": [polygon_feature("search area", 0.1, 52.4, 0.2, 52.5)],
         }
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "councils.geojson"
-            path.write_text(
-                json.dumps(
-                    {
-                        "type": "FeatureCollection",
-                        "features": [
-                            {
-                                "type": "Feature",
-                                "properties": {"LAD23NM": "Arun"},
-                                "geometry": None,
-                            }
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
+        catalogue = load_authority_catalogue(Path("src/lead_generator/planning/data/planning_authorities.geojson"))
 
-            targets, _, _, enriched, enriched_count = prepare_council_targets(path)
+        targets = select_overlapping_authorities(user_geojson, catalogue)
 
-        self.assertEqual(len(targets), 1)
-        self.assertEqual(targets[0].authority, "Arun")
-        self.assertEqual(targets[0].portal_family, "ocella")
-        self.assertEqual(targets[0].source, "enriched public planning metadata")
-        self.assertGreaterEqual(enriched_count, 6)
-        properties = enriched["features"][0]["properties"]
-        self.assertEqual(properties["authority"], "Arun")
-        self.assertEqual(properties["council_name"], "Arun")
-        self.assertEqual(properties["portal_family"], "ocella")
-        self.assertEqual(properties["base_url"], "https://www1.arun.gov.uk/aplanning/OcellaWeb/")
-        self.assertEqual(properties["listing_url"], "https://www1.arun.gov.uk/aplanning/OcellaWeb/planningSearch")
+        target_by_authority = {target.authority: target for target in targets}
+        self.assertIn("Fenland", target_by_authority)
+        self.assertNotIn("search area", target_by_authority)
+        self.assertEqual(
+            target_by_authority["Fenland"].listing_url,
+            "https://www.publicaccess.fenland.gov.uk/publicaccess/search.do?action=advanced",
+        )
 
-    @patch("lead_generator.planning.leads.urlopen")
-    def test_discover_planit_applications_maps_public_metadata(self, urlopen_mock) -> None:
-        class Response:
-            def __enter__(self):
-                return self
+    def test_builtin_catalogue_entries_have_council_names_and_portal_urls(self) -> None:
+        catalogue = load_authority_catalogue(Path("src/lead_generator/planning/data/planning_authorities.geojson"))
 
-            def __exit__(self, *args):
-                return None
+        for feature in catalogue["features"]:
+            properties = feature["properties"]
+            self.assertTrue(properties["authority"])
+            self.assertTrue(properties["council_name"])
+            self.assertTrue(properties["listing_url"])
 
-            def read(self) -> bytes:
-                return json.dumps(
-                    {
-                        "from": 0,
-                        "to": 0,
-                        "total": 1,
-                        "records": [
-                            {
-                                "uid": "BR/111/24/PL",
-                                "url": "https://planning.example.gov.uk/detail",
-                                "address": "8 Argyle Road PO21 1DY",
-                                "description": "New driveway gates",
-                                "start_date": "2024-06-21",
-                                "postcode": "PO21 1DY",
-                                "other_fields": {
-                                    "date_received": "2024-06-21",
-                                    "date_validated": "2024-07-10",
-                                    "docs_url": "https://planning.example.gov.uk/docs",
-                                    "source_url": "https://planning.example.gov.uk/search",
-                                },
-                            }
-                        ],
-                    }
-                ).encode("utf-8")
+    def test_point_in_geometry_handles_polygon(self) -> None:
+        geometry = polygon_feature("area", 0, 0, 1, 1)["geometry"]
 
-        urlopen_mock.return_value = Response()
-
-        applications = discover_planit_applications("Arun", date(2024, 6, 1), date(2024, 6, 30))
-
-        self.assertEqual(len(applications), 1)
-        self.assertEqual(applications[0].reference, "BR/111/24/PL")
-        self.assertEqual(applications[0].description, "New driveway gates")
-        self.assertEqual(applications[0].date_received, "2024-06-21")
-        self.assertEqual(applications[0].raw["docs_url"], "https://planning.example.gov.uk/docs")
+        self.assertTrue(point_in_geometry((0.5, 0.5), geometry))
+        self.assertFalse(point_in_geometry((2, 2), geometry))
 
     def test_application_matches_date_and_keyword(self) -> None:
         application = PlanningApplication(
@@ -199,23 +97,55 @@ class LeadSearchTest(unittest.TestCase):
             )
         )
 
-    def test_run_lead_search_writes_csv_and_reference_folder(self) -> None:
+    def test_application_in_geojson_requires_point_inside_user_boundary(self) -> None:
+        user_geojson = {
+            "type": "FeatureCollection",
+            "features": [polygon_feature("search area", 0, 0, 1, 1)],
+        }
+        inside = PlanningApplication(
+            authority="Example",
+            uid="1",
+            url="https://example.test",
+            raw={"location": {"type": "Point", "coordinates": [0.5, 0.5]}},
+        )
+        outside = PlanningApplication(
+            authority="Example",
+            uid="2",
+            url="https://example.test",
+            raw={"location": {"type": "Point", "coordinates": [2, 2]}},
+        )
+
+        self.assertTrue(application_in_geojson(inside, user_geojson))
+        self.assertFalse(application_in_geojson(outside, user_geojson))
+
+    def test_run_lead_search_writes_only_location_matched_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            geojson = root / "councils.geojson"
-            geojson.write_text(
+            user_geojson = root / "search.geojson"
+            user_geojson.write_text(
+                json.dumps(
+                    {
+                        "type": "FeatureCollection",
+                        "features": [polygon_feature("search area", 0, 0, 1, 1)],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            catalogue = root / "catalogue.geojson"
+            catalogue.write_text(
                 json.dumps(
                     {
                         "type": "FeatureCollection",
                         "features": [
                             {
-                                "type": "Feature",
+                                **polygon_feature("Example Council", 0, 0, 1, 1),
                                 "properties": {
-                                    "name": "Example Council",
+                                    "authority": "Example Council",
                                     "portal_family": "idox",
                                     "base_url": "https://planning.example.gov.uk",
+                                    "listing_url": "https://planning.example.gov.uk/search",
+                                    "link_test_ok": True,
                                 },
-                                "geometry": None,
                             }
                         ],
                     }
@@ -223,37 +153,44 @@ class LeadSearchTest(unittest.TestCase):
                 encoding="utf-8",
             )
             config = LeadSearchConfig(
-                geojson_path=geojson,
+                geojson_path=user_geojson,
                 output_root=root,
                 start_date=date(2026, 6, 1),
                 end_date=date(2026, 6, 30),
                 keywords=["driveway gates"],
+                catalogue_path=catalogue,
             )
+            applications = [
+                PlanningApplication(
+                    authority="Example Council",
+                    uid="ABC123",
+                    url="https://planning.example.gov.uk/detail/ABC123",
+                    reference="24/01234/FUL",
+                    description="New driveway gates and boundary wall",
+                    date_received="2026-06-10",
+                    raw={"location": {"type": "Point", "coordinates": [0.5, 0.5]}},
+                ),
+                PlanningApplication(
+                    authority="Example Council",
+                    uid="DEF456",
+                    url="https://planning.example.gov.uk/detail/DEF456",
+                    reference="24/99999/FUL",
+                    description="New driveway gates",
+                    date_received="2026-06-10",
+                    raw={"location": {"type": "Point", "coordinates": [2, 2]}},
+                ),
+            ]
 
-            with patch("lead_generator.planning.leads.build_scraper", return_value=FakeScraper()):
+            with patch("lead_generator.planning.leads.discover_planit_applications", return_value=applications):
                 result = run_lead_search(config)
 
             self.assertEqual(result.leads_found, 1)
             self.assertTrue(result.csv_path.exists())
-            self.assertIn("24/01234/FUL", result.csv_path.read_text(encoding="utf-8"))
+            csv_text = result.csv_path.read_text(encoding="utf-8")
+            self.assertIn("24/01234/FUL", csv_text)
+            self.assertNotIn("24/99999/FUL", csv_text)
             self.assertTrue((result.output_dir / "Example Council" / "24 01234 FUL").exists())
-            self.assertTrue((result.output_dir / "councils_enriched.geojson").exists())
-
-    def test_derive_portal_base_url_keeps_family_specific_roots(self) -> None:
-        self.assertEqual(
-            derive_portal_base_url(
-                "https://www1.arun.gov.uk/aplanning/OcellaWeb/planningSearch",
-                "ocella",
-            ),
-            "https://www1.arun.gov.uk/aplanning/OcellaWeb/",
-        )
-        self.assertEqual(
-            derive_portal_base_url(
-                "https://planning.example.gov.uk/online-applications/search.do?action=advanced",
-                "idox",
-            ),
-            "https://planning.example.gov.uk",
-        )
+            self.assertTrue((result.output_dir / "selected_councils.geojson").exists())
 
     def test_sanitize_path_part_removes_windows_invalid_characters(self) -> None:
         self.assertEqual(sanitize_path_part("24/01234:FUL*"), "24 01234 FUL")

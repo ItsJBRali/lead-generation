@@ -56,21 +56,23 @@ higher rate.
 
 The Windows GUI is available as `dist/PlanningLeadGenerator.exe`. It lets a user:
 
-- choose a GeoJSON file containing council portal settings
+- choose a GeoJSON file containing the search boundary
 - choose an output folder
 - select a received-date range
 - edit the default lead keywords
 - run the search with council progress and a live log
 
-Each GeoJSON feature should include a council name in `properties`, using keys
-such as `name`, `council`, `area_name`, or `LAD23NM`. If portal fields such as
-`portal_family`, `base_url`, and `listing_url` are also present, the app uses
-those directly. If only a council name is present, the app populates missing
-fields such as `authority`, `council_name`, `portal_family`, `base_url`, and
-`listing_url` from public planning metadata where possible. A populated copy is
-saved as `councils_enriched.geojson` in the dated output folder. For councils
-enriched this way, the app still uses public planning metadata for application
-discovery because many raw council search pages require form submissions.
+The uploaded GeoJSON no longer needs council names or portal fields. The app
+bundles `planning_authorities.geojson`, a stored catalogue of planning
+authorities with council names, boundaries, portal families, and planning portal
+URLs. At the start of a run it intersects the uploaded boundary with that
+catalogue, saves the matched authorities to `selected_councils.geojson`, and
+then searches only those authorities.
+
+Application results are filtered twice: first by the selected received-date
+range and proposal keywords, then by the application point location. A lead is
+saved only when its latitude/longitude falls inside the uploaded GeoJSON
+boundary.
 
 To run from source:
 
@@ -82,5 +84,5 @@ $env:PYTHONPATH = "$PWD\src"
 To rebuild the executable:
 
 ```powershell
-& "C:\Users\JBRal\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe" -m PyInstaller --noconfirm --clean --name PlanningLeadGenerator --onefile --windowed --paths src src\lead_generator\planning\gui.py
+& "C:\Users\JBRal\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe" -m PyInstaller --noconfirm --clean PlanningLeadGenerator.spec
 ```
