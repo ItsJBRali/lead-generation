@@ -18,15 +18,18 @@ except ImportError:  # pragma: no cover - depends on local tooling
     certifi = None
 
 
-AREAS_URL = (
-    "https://www.planit.org.uk/api/areas/json?"
-    "area_type=active&pg_sz=20&"
-    "select=area_id,area_name,long_name,area_type,gss_code,planning_url,scraper_type,min_date,max_date,borders"
-)
+AREA_SELECT = "area_id,area_name,long_name,area_type,gss_code,planning_url,scraper_type,min_date,max_date,borders"
+AREAS_URL = f"https://www.planit.org.uk/api/areas/json?area_type=active&select={AREA_SELECT}"
+DEFAULT_PAGE_SIZE = 20
+PAGE_DELAY_SECONDS = 20
 OUTPUT = Path("src/lead_generator/planning/data/planning_authorities.geojson")
 CACHE = Path("build/planning_authority_area_records.json")
 LINK_CACHE = Path("build/planning_authority_link_tests.json")
-USER_AGENT = "LeadGeneratorPlanningScraper/0.1"
+USER_AGENT = "Mozilla/5.0 LeadGeneratorPlanningScraper/0.1 (+responsible planning data collection)"
+
+
+class ResponseTooLarge(RuntimeError):
+    """Raised when PlanIt refuses a page because the boundary payload is too large."""
 
 
 def main() -> None:
@@ -86,7 +89,8 @@ def main() -> None:
                 "source_url": AREAS_URL,
                 "features": features,
             },
-            indent=2,
+            ensure_ascii=False,
+            separators=(",", ":"),
         ),
         encoding="utf-8",
     )
@@ -99,10 +103,14 @@ def fetch_json(url: str) -> dict[str, object]:
             with urlopen(Request(url, headers={"User-Agent": USER_AGENT}), timeout=60, context=ssl_context()) as response:
                 return json.loads(response.read().decode("utf-8", errors="replace"))
         except HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            if exc.code == 400 and "Response content too large" in body:
+                raise ResponseTooLarge(body) from exc
             if exc.code != 429 or attempt == 5:
                 raise
             retry_after = exc.headers.get("Retry-After")
             delay = int(retry_after) if retry_after and retry_after.isdigit() else 10 * (attempt + 1)
+            print(f"Rate limited; waiting {delay}s before retrying")
             sleep(delay)
     raise RuntimeError(f"Could not fetch {url}")
 
@@ -110,6 +118,7 @@ def fetch_json(url: str) -> dict[str, object]:
 def fetch_all_areas(*, cached_only: bool = False) -> list[dict[str, object]]:
     records, total = read_records_cache()
     offset = len(records)
+    page_size = DEFAULT_PAGE_SIZE
     if cached_only:
         print(f"Using cached area records 0 to {offset - 1} of {total or offset}")
         return records
@@ -117,7 +126,14 @@ def fetch_all_areas(*, cached_only: bool = False) -> list[dict[str, object]]:
         print(f"Using cached area records 0 to {offset - 1} of {total}")
         return records
     while True:
-        payload = fetch_json(f"{AREAS_URL}&index={offset}")
+        try:
+            payload = fetch_json(f"{AREAS_URL}&pg_sz={page_size}&index={offset}")
+        except ResponseTooLarge as exc:
+            if page_size == 1:
+                raise
+            page_size = max(1, page_size // 2)
+            print(f"Area page at index {offset} is too large; retrying with pg_sz={page_size}: {exc}")
+            continue
         batch = payload.get("records", [])
         records.extend(batch)
         print(f"Fetched area records {payload.get('from')} to {payload.get('to')} of {payload.get('total')}")
@@ -127,7 +143,7 @@ def fetch_all_areas(*, cached_only: bool = False) -> list[dict[str, object]]:
         if not batch or next_offset >= total:
             break
         offset = next_offset
-        sleep(2)
+        sleep(PAGE_DELAY_SECONDS)
     return records
 
 
@@ -239,13 +255,14 @@ def ssl_context() -> ssl.SSLContext | None:
 
 def read_records_cache() -> tuple[list[dict[str, object]], int | None]:
     if not CACHE.exists():
-        return [], None
+        return read_records_from_catalogue(), None
     payload = json.loads(CACHE.read_text(encoding="utf-8"))
     records = payload.get("records", [])
     total = payload.get("total")
     if not isinstance(records, list):
-        return [], None
-    return records, int(total) if total is not None else None
+        records = []
+    records.extend(read_records_from_catalogue())
+    return deduplicate_records(records), int(total) if total is not None else None
 
 
 def write_records_cache(records: list[dict[str, object]], total: int) -> None:
@@ -254,15 +271,60 @@ def write_records_cache(records: list[dict[str, object]], total: int) -> None:
 
 
 def read_link_cache() -> dict[str | None, dict[str, object]]:
-    if not LINK_CACHE.exists():
-        return {}
-    payload = json.loads(LINK_CACHE.read_text(encoding="utf-8"))
-    return payload if isinstance(payload, dict) else {}
+    results = read_link_tests_from_catalogue()
+    if LINK_CACHE.exists():
+        payload = json.loads(LINK_CACHE.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            results.update(payload)
+    return results
 
 
 def write_link_cache(results: dict[str | None, dict[str, object]]) -> None:
     LINK_CACHE.parent.mkdir(parents=True, exist_ok=True)
     LINK_CACHE.write_text(json.dumps(results, indent=2), encoding="utf-8")
+
+
+def read_records_from_catalogue() -> list[dict[str, object]]:
+    if not OUTPUT.exists():
+        return []
+    catalogue = json.loads(OUTPUT.read_text(encoding="utf-8"))
+    records: list[dict[str, object]] = []
+    for feature in catalogue.get("features", []):
+        properties = feature.get("properties") or {}
+        records.append(
+            {
+                "area_id": properties.get("area_id"),
+                "area_name": properties.get("authority"),
+                "long_name": properties.get("council_name"),
+                "area_type": properties.get("area_type"),
+                "gss_code": properties.get("gss_code"),
+                "planning_url": properties.get("planning_url") or properties.get("listing_url"),
+                "scraper_type": properties.get("scraper_type"),
+                "min_date": properties.get("min_date"),
+                "max_date": properties.get("max_date"),
+                "borders": feature.get("geometry"),
+            }
+        )
+    return records
+
+
+def read_link_tests_from_catalogue() -> dict[str | None, dict[str, object]]:
+    if not OUTPUT.exists():
+        return {}
+    catalogue = json.loads(OUTPUT.read_text(encoding="utf-8"))
+    results: dict[str | None, dict[str, object]] = {}
+    for feature in catalogue.get("features", []):
+        properties = feature.get("properties") or {}
+        name = properties.get("authority")
+        if not name:
+            continue
+        results[name] = {
+            "ok": properties.get("link_test_ok", False),
+            "status": properties.get("link_test_status"),
+            "final_url": properties.get("link_test_final_url"),
+            "tls_verified": properties.get("link_test_tls_verified", False),
+        }
+    return results
 
 
 if __name__ == "__main__":
