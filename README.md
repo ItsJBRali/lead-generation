@@ -62,9 +62,12 @@ The Windows GUI is available as `dist/PlanningLeadGenerator.exe`. It lets a user
 - edit the default lead keywords
 - run the search with council progress and a live log
 
-Each GeoJSON feature should include council metadata in `properties`, using keys
-such as `name`, `portal_family`, `base_url`, and, for non-Idox portals,
-`listing_url`.
+Each GeoJSON feature should include a council name in `properties`, using keys
+such as `name`, `council`, `area_name`, or `LAD23NM`. If portal fields such as
+`portal_family`, `base_url`, and `listing_url` are also present, the app uses
+those directly. If only a council name is present, the app falls back to public
+planning metadata to discover received applications for that council and logs
+that fallback in the run log.
 
 To run from source:
 

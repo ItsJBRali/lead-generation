@@ -6,9 +6,13 @@ import re
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
+from time import sleep
 from typing import Callable, Iterable
-from urllib.parse import urlsplit
+from urllib.error import HTTPError
+from urllib.parse import urlencode, urljoin, urlsplit
 from urllib.request import Request, urlopen
+
+from lxml import html
 
 from lead_generator.planning.adapters.agile import AgileCouncilConfig, AgilePlanningScraper
 from lead_generator.planning.adapters.civica import CivicaCouncilConfig, CivicaPlanningScraper
@@ -90,6 +94,7 @@ class CouncilTarget:
     portal_family: str
     base_url: str
     listing_url: str | None = None
+    source: str = "geojson"
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +110,7 @@ class LeadSearchConfig:
 class LeadSearchResult:
     output_dir: Path
     csv_path: Path
+    geojson_features: int
     councils_total: int
     councils_completed: int
     leads_found: int
@@ -126,9 +132,14 @@ def parse_keywords(text: str) -> list[str]:
 
 
 def load_council_targets(geojson_path: Path) -> list[CouncilTarget]:
+    return load_council_targets_with_stats(geojson_path)[0]
+
+
+def load_council_targets_with_stats(geojson_path: Path) -> tuple[list[CouncilTarget], int, list[str]]:
     data = json.loads(geojson_path.read_text(encoding="utf-8"))
     features = data.get("features", [])
     targets: list[CouncilTarget] = []
+    skipped: list[str] = []
     for feature in features:
         properties = feature.get("properties") or {}
         authority = _first_property(properties, COUNCIL_NAME_KEYS)
@@ -136,11 +147,23 @@ def load_council_targets(geojson_path: Path) -> list[CouncilTarget]:
         listing_url = _first_property(properties, LISTING_URL_KEYS)
         portal_family = _first_property(properties, PORTAL_FAMILY_KEYS)
 
-        if not authority or not base_url:
+        if not authority:
+            skipped.append("feature without a council name")
+            continue
+        if not base_url:
+            targets.append(
+                CouncilTarget(
+                    authority=authority,
+                    portal_family="planit",
+                    base_url="https://www.planit.org.uk",
+                    source="public planning metadata",
+                )
+            )
             continue
         if not portal_family:
             portal_family = detect_portal_family("", f"{base_url} {listing_url or ''}")
         if not portal_family:
+            skipped.append(f"{authority}: no portal family could be detected")
             continue
 
         targets.append(
@@ -149,9 +172,10 @@ def load_council_targets(geojson_path: Path) -> list[CouncilTarget]:
                 portal_family=portal_family.lower(),
                 base_url=base_url,
                 listing_url=listing_url,
+                source="geojson portal metadata",
             )
         )
-    return targets
+    return targets, len(features), skipped
 
 
 def run_lead_search(
@@ -161,14 +185,27 @@ def run_lead_search(
     progress: ProgressCallback | None = None,
     should_cancel: CancelCallback | None = None,
 ) -> LeadSearchResult:
-    targets = load_council_targets(config.geojson_path)
+    targets, feature_count, skipped = load_council_targets_with_stats(config.geojson_path)
     output_dir = config.output_root / date.today().isoformat()
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = output_dir / "applications.csv"
     rows: list[dict[str, str]] = []
     completed = 0
 
-    _log(log, f"Loaded {len(targets)} councils from {config.geojson_path.name}")
+    _log(log, f"Read {feature_count} GeoJSON features from {config.geojson_path.name}")
+    _log(log, f"Prepared {len(targets)} council search targets")
+    public_count = sum(1 for target in targets if target.portal_family == "planit")
+    if public_count:
+        _log(log, f"{public_count} councils will use public planning metadata because no portal URL was supplied")
+    for message in skipped[:10]:
+        _log(log, f"Skipped {message}")
+    if len(skipped) > 10:
+        _log(log, f"Skipped {len(skipped) - 10} more features without usable council metadata")
+    if not targets:
+        raise ValueError(
+            "No councils could be searched. The GeoJSON needs council names in feature properties; "
+            "portal URLs are optional because the app can fall back to public planning metadata."
+        )
     _progress(progress, completed, len(targets))
 
     for target in targets:
@@ -180,15 +217,14 @@ def run_lead_search(
         try:
             scraper = build_scraper(target)
             discovery = discover_applications(scraper, target, config.start_date, config.end_date)
+            discovery = list(discovery)
+            _log(log, f"{target.authority}: found {len(discovery)} received applications in the date range")
+            matched_count = 0
             for stub in discovery:
                 if should_cancel and should_cancel():
                     break
                 try:
-                    application = scraper.fetch_application(
-                        stub.uid,
-                        stub.url,
-                        include_documents=True,
-                    )
+                    application = fetch_application(scraper, target, stub)
                 except Exception as exc:  # pragma: no cover - live-site resilience
                     _log(log, f"{target.authority}: failed to fetch {stub.reference or stub.uid}: {exc}")
                     continue
@@ -196,6 +232,7 @@ def run_lead_search(
                 if not application_matches(application, config.start_date, config.end_date, config.keywords):
                     continue
 
+                matched_count += 1
                 lead_folder = create_lead_folder(output_dir, target.authority, application)
                 download_pdf_documents(application.documents, lead_folder, log=log)
                 rows.append(
@@ -207,6 +244,7 @@ def run_lead_search(
                     }
                 )
                 _log(log, f"{target.authority}: saved {application.reference or application.uid}")
+            _log(log, f"{target.authority}: {matched_count} applications matched the keywords")
         except Exception as exc:  # pragma: no cover - live-site resilience
             _log(log, f"{target.authority}: failed: {exc}")
         finally:
@@ -218,6 +256,7 @@ def run_lead_search(
     return LeadSearchResult(
         output_dir=output_dir,
         csv_path=csv_path,
+        geojson_features=feature_count,
         councils_total=len(targets),
         councils_completed=completed,
         leads_found=len(rows),
@@ -226,6 +265,8 @@ def run_lead_search(
 
 def build_scraper(target: CouncilTarget):
     family = target.portal_family.lower()
+    if family == "planit":
+        return None
     if family == "idox":
         return IdoxPublicAccessScraper(IdoxCouncilConfig(target.authority, target.base_url))
     if family == "ocella":
@@ -240,6 +281,8 @@ def build_scraper(target: CouncilTarget):
 
 
 def discover_applications(scraper, target: CouncilTarget, start_date: date, end_date: date) -> Iterable[PlanningApplication]:
+    if target.portal_family == "planit":
+        return discover_planit_applications(target.authority, start_date, end_date)
     if target.portal_family == "idox":
         return scraper.discover_ids(
             listing_url=target.listing_url,
@@ -249,6 +292,114 @@ def discover_applications(scraper, target: CouncilTarget, start_date: date, end_
     if not target.listing_url:
         raise ValueError("listing_url is required for non-Idox councils")
     return scraper.discover_ids(listing_url=target.listing_url).applications
+
+
+def fetch_application(scraper, target: CouncilTarget, stub: PlanningApplication) -> PlanningApplication:
+    if target.portal_family == "planit":
+        return enrich_planit_application(stub)
+    return scraper.fetch_application(
+        stub.uid,
+        stub.url,
+        include_documents=True,
+    )
+
+
+def discover_planit_applications(authority: str, start_date: date, end_date: date) -> list[PlanningApplication]:
+    records: list[dict[str, object]] = []
+    page_size = 100
+    offset = 0
+    while True:
+        params = {
+            "auth": authority,
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "pg_sz": str(page_size),
+            "from": str(offset),
+        }
+        url = f"https://www.planit.org.uk/api/applics/json?{urlencode(params)}"
+        payload = _fetch_json_with_retry(url)
+        batch = payload.get("records", [])
+        records.extend(batch)
+        total = int(payload.get("total") or len(records))
+        next_offset = int(payload.get("to") or offset) + 1
+        if not batch or next_offset >= total:
+            break
+        offset = next_offset
+
+    return [_application_from_planit_record(authority, record) for record in records]
+
+
+def _fetch_json_with_retry(url: str) -> dict[str, object]:
+    last_error: Exception | None = None
+    for attempt in range(4):
+        request = Request(url, headers={"User-Agent": "LeadGeneratorPlanningScraper/0.1"})
+        try:
+            with urlopen(request, timeout=45) as response:
+                return json.loads(response.read().decode("utf-8", errors="replace"))
+        except HTTPError as exc:
+            last_error = exc
+            if exc.code != 429 or attempt == 3:
+                raise
+            sleep(2 * (attempt + 1))
+    raise RuntimeError(f"Could not fetch public planning metadata: {last_error}")
+
+
+def enrich_planit_application(application: PlanningApplication) -> PlanningApplication:
+    docs_url = application.raw.get("docs_url") if application.raw else None
+    if docs_url:
+        application.documents = fetch_planit_documents(str(docs_url))
+    return application
+
+
+def fetch_planit_documents(docs_url: str) -> list[PlanningDocument]:
+    request = Request(docs_url, headers={"User-Agent": "LeadGeneratorPlanningScraper/0.1"})
+    with urlopen(request, timeout=45) as response:
+        text = response.read().decode("utf-8", errors="replace")
+        page_url = response.geturl()
+    document = html.fromstring(text)
+    documents: list[PlanningDocument] = []
+    seen: set[str] = set()
+    for anchor in document.xpath("//a[@href]"):
+        href = anchor.get("href")
+        absolute_url = urljoin(page_url, href)
+        title = " ".join(anchor.itertext()).strip() or absolute_url.rsplit("/", 1)[-1]
+        if ".pdf" not in f"{href} {title}".lower():
+            continue
+        if absolute_url in seen:
+            continue
+        seen.add(absolute_url)
+        documents.append(PlanningDocument(title=title, url=absolute_url))
+    return documents
+
+
+def _application_from_planit_record(authority: str, record: dict[str, object]) -> PlanningApplication:
+    other_fields = record.get("other_fields") if isinstance(record.get("other_fields"), dict) else {}
+    reference = _record_string(record, "uid") or _record_string(record, "reference") or _record_string(record, "name")
+    date_received = _record_string(other_fields, "date_received") or _record_string(record, "start_date")
+    raw = {
+        "source": "planit",
+        "docs_url": _record_string(other_fields, "docs_url"),
+        "source_url": _record_string(other_fields, "source_url"),
+        "portal_url": _record_string(record, "url"),
+    }
+    return PlanningApplication(
+        authority=authority,
+        uid=reference or _record_string(record, "name") or "unknown",
+        url=_record_string(record, "url") or _record_string(record, "link") or "",
+        reference=reference,
+        address=_record_string(record, "address"),
+        description=_record_string(record, "description"),
+        status=_record_string(other_fields, "status") or _record_string(record, "app_state"),
+        date_received=date_received,
+        date_validated=_record_string(other_fields, "date_validated"),
+        applicant_name=_record_string(other_fields, "applicant_name") or _record_string(other_fields, "applicant_address"),
+        agent_name=_record_string(other_fields, "agent_name") or _record_string(other_fields, "agent_address"),
+        case_officer=_record_string(other_fields, "case_officer"),
+        parish=_record_string(other_fields, "parish"),
+        postcode=_record_string(record, "postcode"),
+        source_url=_record_string(other_fields, "source_url"),
+        raw={key: value for key, value in raw.items() if value},
+    )
 
 
 def application_matches(
@@ -328,6 +479,15 @@ def _first_property(properties: dict[str, object], keys: tuple[str, ...]) -> str
         if value not in (None, ""):
             return str(value).strip()
     return None
+
+
+def _record_string(record: object, key: str) -> str | None:
+    if not isinstance(record, dict):
+        return None
+    value = record.get(key)
+    if value in (None, ""):
+        return None
+    return str(value).strip()
 
 
 def _parse_iso_date(value: str | None) -> date | None:

@@ -10,6 +10,7 @@ from unittest.mock import patch
 from lead_generator.planning.leads import (
     LeadSearchConfig,
     application_matches,
+    discover_planit_applications,
     load_council_targets,
     parse_keywords,
     run_lead_search,
@@ -85,6 +86,75 @@ class LeadSearchTest(unittest.TestCase):
         self.assertEqual(len(targets), 1)
         self.assertEqual(targets[0].authority, "Example Council")
         self.assertEqual(targets[0].portal_family, "idox")
+
+    def test_load_council_targets_uses_public_metadata_fallback_for_name_only_geojson(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "councils.geojson"
+            path.write_text(
+                json.dumps(
+                    {
+                        "type": "FeatureCollection",
+                        "features": [
+                            {
+                                "type": "Feature",
+                                "properties": {"LAD23NM": "Arun"},
+                                "geometry": None,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            targets = load_council_targets(path)
+
+        self.assertEqual(len(targets), 1)
+        self.assertEqual(targets[0].authority, "Arun")
+        self.assertEqual(targets[0].portal_family, "planit")
+
+    @patch("lead_generator.planning.leads.urlopen")
+    def test_discover_planit_applications_maps_public_metadata(self, urlopen_mock) -> None:
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return json.dumps(
+                    {
+                        "from": 0,
+                        "to": 0,
+                        "total": 1,
+                        "records": [
+                            {
+                                "uid": "BR/111/24/PL",
+                                "url": "https://planning.example.gov.uk/detail",
+                                "address": "8 Argyle Road PO21 1DY",
+                                "description": "New driveway gates",
+                                "start_date": "2024-06-21",
+                                "postcode": "PO21 1DY",
+                                "other_fields": {
+                                    "date_received": "2024-06-21",
+                                    "date_validated": "2024-07-10",
+                                    "docs_url": "https://planning.example.gov.uk/docs",
+                                    "source_url": "https://planning.example.gov.uk/search",
+                                },
+                            }
+                        ],
+                    }
+                ).encode("utf-8")
+
+        urlopen_mock.return_value = Response()
+
+        applications = discover_planit_applications("Arun", date(2024, 6, 1), date(2024, 6, 30))
+
+        self.assertEqual(len(applications), 1)
+        self.assertEqual(applications[0].reference, "BR/111/24/PL")
+        self.assertEqual(applications[0].description, "New driveway gates")
+        self.assertEqual(applications[0].date_received, "2024-06-21")
+        self.assertEqual(applications[0].raw["docs_url"], "https://planning.example.gov.uk/docs")
 
     def test_application_matches_date_and_keyword(self) -> None:
         application = PlanningApplication(
