@@ -65,9 +65,12 @@ The Windows GUI is available as `dist/PlanningLeadGenerator.exe`. It lets a user
 Each GeoJSON feature should include a council name in `properties`, using keys
 such as `name`, `council`, `area_name`, or `LAD23NM`. If portal fields such as
 `portal_family`, `base_url`, and `listing_url` are also present, the app uses
-those directly. If only a council name is present, the app falls back to public
-planning metadata to discover received applications for that council and logs
-that fallback in the run log.
+those directly. If only a council name is present, the app populates missing
+fields such as `authority`, `council_name`, `portal_family`, `base_url`, and
+`listing_url` from public planning metadata where possible. A populated copy is
+saved as `councils_enriched.geojson` in the dated output folder. For councils
+enriched this way, the app still uses public planning metadata for application
+discovery because many raw council search pages require form submissions.
 
 To run from source:
 

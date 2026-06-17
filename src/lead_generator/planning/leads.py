@@ -72,11 +72,22 @@ COUNCIL_NAME_KEYS = (
     "council",
     "council_name",
     "name",
+    "NAME",
+    "NAME_1",
     "area_name",
+    "local_authority",
+    "local_authority_name",
     "lad_name",
+    "LAD25NM",
+    "LAD24NM",
     "LAD23NM",
     "LAD22NM",
     "LAD21NM",
+    "LAD20NM",
+    "LPA_NAME",
+    "LPA25NM",
+    "LPA24NM",
+    "LPA23NM",
 )
 PORTAL_FAMILY_KEYS = ("portal_family", "portal", "portal_type", "planning_portal")
 BASE_URL_KEYS = ("base_url", "portal_base_url", "planning_base_url", "planning_url", "url")
@@ -136,20 +147,45 @@ def load_council_targets(geojson_path: Path) -> list[CouncilTarget]:
 
 
 def load_council_targets_with_stats(geojson_path: Path) -> tuple[list[CouncilTarget], int, list[str]]:
+    targets, feature_count, skipped, _, _ = prepare_council_targets(geojson_path)
+    return targets, feature_count, skipped
+
+
+def prepare_council_targets(
+    geojson_path: Path,
+    *,
+    log: LogCallback | None = None,
+) -> tuple[list[CouncilTarget], int, list[str], dict[str, object], int]:
     data = json.loads(geojson_path.read_text(encoding="utf-8"))
     features = data.get("features", [])
     targets: list[CouncilTarget] = []
     skipped: list[str] = []
+    enriched_count = 0
     for feature in features:
         properties = feature.get("properties") or {}
-        authority = _first_property(properties, COUNCIL_NAME_KEYS)
+        feature["properties"] = properties
+        authority = _find_council_name(properties)
+        if authority:
+            enriched_count += _populate_name_properties(properties, authority)
+
         base_url = _first_property(properties, BASE_URL_KEYS)
         listing_url = _first_property(properties, LISTING_URL_KEYS)
         portal_family = _first_property(properties, PORTAL_FAMILY_KEYS)
+        had_original_portal_metadata = bool(base_url and portal_family)
 
         if not authority:
             skipped.append("feature without a council name")
             continue
+
+        if not base_url or not portal_family:
+            metadata = lookup_public_portal_metadata(authority)
+            if metadata:
+                enriched_count += _populate_portal_properties(properties, metadata)
+                base_url = _first_property(properties, BASE_URL_KEYS)
+                listing_url = _first_property(properties, LISTING_URL_KEYS)
+                portal_family = _first_property(properties, PORTAL_FAMILY_KEYS)
+                _log(log, f"{authority}: populated portal URL fields from public planning metadata")
+
         if not base_url:
             targets.append(
                 CouncilTarget(
@@ -163,8 +199,7 @@ def load_council_targets_with_stats(geojson_path: Path) -> tuple[list[CouncilTar
         if not portal_family:
             portal_family = detect_portal_family("", f"{base_url} {listing_url or ''}")
         if not portal_family:
-            skipped.append(f"{authority}: no portal family could be detected")
-            continue
+            portal_family = "planit"
 
         targets.append(
             CouncilTarget(
@@ -172,10 +207,10 @@ def load_council_targets_with_stats(geojson_path: Path) -> tuple[list[CouncilTar
                 portal_family=portal_family.lower(),
                 base_url=base_url,
                 listing_url=listing_url,
-                source="geojson portal metadata",
+                source="geojson portal metadata" if had_original_portal_metadata else "enriched public planning metadata",
             )
         )
-    return targets, len(features), skipped
+    return targets, len(features), skipped, data, enriched_count
 
 
 def run_lead_search(
@@ -185,26 +220,33 @@ def run_lead_search(
     progress: ProgressCallback | None = None,
     should_cancel: CancelCallback | None = None,
 ) -> LeadSearchResult:
-    targets, feature_count, skipped = load_council_targets_with_stats(config.geojson_path)
+    targets, feature_count, skipped, enriched_geojson, enriched_count = prepare_council_targets(
+        config.geojson_path,
+        log=log,
+    )
     output_dir = config.output_root / date.today().isoformat()
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = output_dir / "applications.csv"
+    enriched_geojson_path = output_dir / "councils_enriched.geojson"
+    enriched_geojson_path.write_text(json.dumps(enriched_geojson, indent=2), encoding="utf-8")
     rows: list[dict[str, str]] = []
     completed = 0
 
     _log(log, f"Read {feature_count} GeoJSON features from {config.geojson_path.name}")
+    _log(log, f"Populated {enriched_count} missing council/portal fields")
+    _log(log, f"Saved enriched GeoJSON to {enriched_geojson_path}")
     _log(log, f"Prepared {len(targets)} council search targets")
-    public_count = sum(1 for target in targets if target.portal_family == "planit")
+    public_count = sum(1 for target in targets if uses_public_metadata_search(target))
     if public_count:
-        _log(log, f"{public_count} councils will use public planning metadata because no portal URL was supplied")
+        _log(log, f"{public_count} councils will use public planning metadata for reliable application discovery")
     for message in skipped[:10]:
         _log(log, f"Skipped {message}")
     if len(skipped) > 10:
         _log(log, f"Skipped {len(skipped) - 10} more features without usable council metadata")
     if not targets:
         raise ValueError(
-            "No councils could be searched. The GeoJSON needs council names in feature properties; "
-            "portal URLs are optional because the app can fall back to public planning metadata."
+            "No councils could be searched. The app tried to populate council-name and portal fields, "
+            "but no feature contained a recognizable council name."
         )
     _progress(progress, completed, len(targets))
 
@@ -265,7 +307,7 @@ def run_lead_search(
 
 def build_scraper(target: CouncilTarget):
     family = target.portal_family.lower()
-    if family == "planit":
+    if uses_public_metadata_search(target):
         return None
     if family == "idox":
         return IdoxPublicAccessScraper(IdoxCouncilConfig(target.authority, target.base_url))
@@ -281,7 +323,7 @@ def build_scraper(target: CouncilTarget):
 
 
 def discover_applications(scraper, target: CouncilTarget, start_date: date, end_date: date) -> Iterable[PlanningApplication]:
-    if target.portal_family == "planit":
+    if uses_public_metadata_search(target):
         return discover_planit_applications(target.authority, start_date, end_date)
     if target.portal_family == "idox":
         return scraper.discover_ids(
@@ -295,7 +337,7 @@ def discover_applications(scraper, target: CouncilTarget, start_date: date, end_
 
 
 def fetch_application(scraper, target: CouncilTarget, stub: PlanningApplication) -> PlanningApplication:
-    if target.portal_family == "planit":
+    if uses_public_metadata_search(target):
         return enrich_planit_application(stub)
     return scraper.fetch_application(
         stub.uid,
@@ -310,7 +352,7 @@ def discover_planit_applications(authority: str, start_date: date, end_date: dat
     offset = 0
     while True:
         params = {
-            "auth": authority,
+            "auth": _planit_authority_name(authority),
             "start_date": start_date.isoformat(),
             "end_date": end_date.isoformat(),
             "pg_sz": str(page_size),
@@ -327,6 +369,38 @@ def discover_planit_applications(authority: str, start_date: date, end_date: dat
         offset = next_offset
 
     return [_application_from_planit_record(authority, record) for record in records]
+
+
+def lookup_public_portal_metadata(authority: str) -> dict[str, str] | None:
+    params = {
+        "auth": _planit_authority_name(authority),
+        "recent": "3650",
+        "pg_sz": "1",
+    }
+    url = f"https://www.planit.org.uk/api/applics/json?{urlencode(params)}"
+    try:
+        payload = _fetch_json_with_retry(url)
+    except Exception:
+        return None
+    records = payload.get("records") or []
+    if not records:
+        return None
+    record = records[0]
+    if not isinstance(record, dict):
+        return None
+    other_fields = record.get("other_fields") if isinstance(record.get("other_fields"), dict) else {}
+    source_url = _record_string(other_fields, "source_url")
+    detail_url = _record_string(record, "url")
+    portal_url = source_url or detail_url
+    if not portal_url:
+        return None
+    portal_family = detect_portal_family("", portal_url) or "planit"
+    return {
+        "portal_family": portal_family,
+        "base_url": derive_portal_base_url(portal_url, portal_family),
+        "listing_url": source_url or "",
+        "portal_detail_url": detail_url or "",
+    }
 
 
 def _fetch_json_with_retry(url: str) -> dict[str, object]:
@@ -470,6 +544,30 @@ def sanitize_path_part(value: str) -> str:
     return cleaned[:120] or "untitled"
 
 
+def derive_portal_base_url(portal_url: str, portal_family: str) -> str:
+    parsed = urlsplit(portal_url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    path = parsed.path
+    lower_path = path.lower()
+    if portal_family == "idox" and "/online-applications/" in lower_path:
+        return origin
+    if portal_family == "ocella" and "/ocellaweb/" in lower_path:
+        prefix = path[: lower_path.index("/ocellaweb/") + len("/OcellaWeb/")]
+        return f"{origin}{prefix}"
+    if portal_family == "northgate" and "/northgate/planningexplorer/" in lower_path:
+        prefix = path[: lower_path.index("/northgate/planningexplorer/") + len("/Northgate/PlanningExplorer/")]
+        return f"{origin}{prefix}"
+    if portal_family == "civica" and "/webforms/planning/" in lower_path:
+        prefix = path[: lower_path.index("/webforms/planning/") + len("/webforms/planning/")]
+        return f"{origin}{prefix}"
+    directory = path.rsplit("/", 1)[0]
+    return f"{origin}{directory}/" if directory else origin
+
+
+def uses_public_metadata_search(target: CouncilTarget) -> bool:
+    return target.portal_family == "planit" or target.source == "enriched public planning metadata"
+
+
 def _first_property(properties: dict[str, object], keys: tuple[str, ...]) -> str | None:
     lower_map = {key.lower(): value for key, value in properties.items()}
     for key in keys:
@@ -479,6 +577,61 @@ def _first_property(properties: dict[str, object], keys: tuple[str, ...]) -> str
         if value not in (None, ""):
             return str(value).strip()
     return None
+
+
+def _find_council_name(properties: dict[str, object]) -> str | None:
+    explicit = _first_property(properties, COUNCIL_NAME_KEYS)
+    if explicit:
+        return _clean_display_authority_name(explicit)
+    for key, value in properties.items():
+        if value in (None, ""):
+            continue
+        key_normalized = key.lower()
+        if "name" not in key_normalized and not key_normalized.endswith("nm"):
+            continue
+        cleaned = _clean_display_authority_name(str(value))
+        if cleaned:
+            return cleaned
+    return None
+
+
+def _clean_display_authority_name(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _planit_authority_name(value: str) -> str:
+    cleaned = _clean_display_authority_name(value)
+    cleaned = re.sub(
+        r"\s+(district council|borough council|city council|county council|council)$",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    return cleaned
+
+
+def _populate_name_properties(properties: dict[str, object], authority: str) -> int:
+    added = 0
+    for key in ("authority", "council_name", "name"):
+        if not properties.get(key):
+            properties[key] = authority
+            added += 1
+    return added
+
+
+def _populate_portal_properties(properties: dict[str, object], metadata: dict[str, str]) -> int:
+    added = 0
+    mapping = {
+        "portal_family": metadata.get("portal_family"),
+        "base_url": metadata.get("base_url"),
+        "listing_url": metadata.get("listing_url"),
+        "portal_detail_url": metadata.get("portal_detail_url"),
+    }
+    for key, value in mapping.items():
+        if value and not properties.get(key):
+            properties[key] = value
+            added += 1
+    return added
 
 
 def _record_string(record: object, key: str) -> str | None:

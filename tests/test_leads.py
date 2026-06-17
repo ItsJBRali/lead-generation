@@ -11,8 +11,10 @@ from lead_generator.planning.leads import (
     LeadSearchConfig,
     application_matches,
     discover_planit_applications,
+    derive_portal_base_url,
     load_council_targets,
     parse_keywords,
+    prepare_council_targets,
     run_lead_search,
     sanitize_path_part,
 )
@@ -87,7 +89,14 @@ class LeadSearchTest(unittest.TestCase):
         self.assertEqual(targets[0].authority, "Example Council")
         self.assertEqual(targets[0].portal_family, "idox")
 
-    def test_load_council_targets_uses_public_metadata_fallback_for_name_only_geojson(self) -> None:
+    @patch("lead_generator.planning.leads.lookup_public_portal_metadata")
+    def test_load_council_targets_populates_name_and_portal_fields_for_name_only_geojson(self, lookup_mock) -> None:
+        lookup_mock.return_value = {
+            "portal_family": "ocella",
+            "base_url": "https://www1.arun.gov.uk/aplanning/OcellaWeb/",
+            "listing_url": "https://www1.arun.gov.uk/aplanning/OcellaWeb/planningSearch",
+            "portal_detail_url": "https://www1.arun.gov.uk/aplanning/OcellaWeb/planningDetails?reference=BR%2F111%2F24%2FPL",
+        }
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "councils.geojson"
             path.write_text(
@@ -106,11 +115,19 @@ class LeadSearchTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            targets = load_council_targets(path)
+            targets, _, _, enriched, enriched_count = prepare_council_targets(path)
 
         self.assertEqual(len(targets), 1)
         self.assertEqual(targets[0].authority, "Arun")
-        self.assertEqual(targets[0].portal_family, "planit")
+        self.assertEqual(targets[0].portal_family, "ocella")
+        self.assertEqual(targets[0].source, "enriched public planning metadata")
+        self.assertGreaterEqual(enriched_count, 6)
+        properties = enriched["features"][0]["properties"]
+        self.assertEqual(properties["authority"], "Arun")
+        self.assertEqual(properties["council_name"], "Arun")
+        self.assertEqual(properties["portal_family"], "ocella")
+        self.assertEqual(properties["base_url"], "https://www1.arun.gov.uk/aplanning/OcellaWeb/")
+        self.assertEqual(properties["listing_url"], "https://www1.arun.gov.uk/aplanning/OcellaWeb/planningSearch")
 
     @patch("lead_generator.planning.leads.urlopen")
     def test_discover_planit_applications_maps_public_metadata(self, urlopen_mock) -> None:
@@ -220,6 +237,23 @@ class LeadSearchTest(unittest.TestCase):
             self.assertTrue(result.csv_path.exists())
             self.assertIn("24/01234/FUL", result.csv_path.read_text(encoding="utf-8"))
             self.assertTrue((result.output_dir / "Example Council" / "24 01234 FUL").exists())
+            self.assertTrue((result.output_dir / "councils_enriched.geojson").exists())
+
+    def test_derive_portal_base_url_keeps_family_specific_roots(self) -> None:
+        self.assertEqual(
+            derive_portal_base_url(
+                "https://www1.arun.gov.uk/aplanning/OcellaWeb/planningSearch",
+                "ocella",
+            ),
+            "https://www1.arun.gov.uk/aplanning/OcellaWeb/",
+        )
+        self.assertEqual(
+            derive_portal_base_url(
+                "https://planning.example.gov.uk/online-applications/search.do?action=advanced",
+                "idox",
+            ),
+            "https://planning.example.gov.uk",
+        )
 
     def test_sanitize_path_part_removes_windows_invalid_characters(self) -> None:
         self.assertEqual(sanitize_path_part("24/01234:FUL*"), "24 01234 FUL")
