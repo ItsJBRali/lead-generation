@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from datetime import date
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,13 +19,18 @@ from lead_generator.planning.leads import (
     _fetch_json_with_retry,
     application_in_geojson,
     application_matches,
+    application_link,
+    document_source_url_from_application_url,
     document_filename,
     document_download_candidates,
     download_document_bytes,
     download_pdf_documents,
+    enrich_planit_application,
+    fetch_arcus_salesforce_document_list,
     fetch_publisher_document_list,
     iter_document_links,
     load_authority_catalogue,
+    planit_document_source_urls,
     parse_keywords,
     point_in_geometry,
     run_lead_search,
@@ -230,7 +236,7 @@ class LeadSearchTest(unittest.TestCase):
             self.assertTrue((result.output_dir / "Example Council" / "24 01234 FUL").exists())
             self.assertTrue((result.output_dir / "selected_councils.geojson").exists())
 
-    def test_run_lead_search_starts_reverse_worker_from_last_council(self) -> None:
+    def test_run_lead_search_starts_four_workers_from_both_ends(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             user_geojson = root / "search.geojson"
@@ -276,6 +282,15 @@ class LeadSearchTest(unittest.TestCase):
                                     "listing_url": "https://c.example.gov.uk/search",
                                 },
                             },
+                            {
+                                **polygon_feature("Council D", 0, 0, 1, 1),
+                                "properties": {
+                                    "authority": "Council D",
+                                    "portal_family": "idox",
+                                    "base_url": "https://d.example.gov.uk",
+                                    "listing_url": "https://d.example.gov.uk/search",
+                                },
+                            },
                         ],
                     }
                 ),
@@ -291,23 +306,78 @@ class LeadSearchTest(unittest.TestCase):
             )
             started: list[str] = []
             lock = threading.Lock()
-            reverse_started = threading.Event()
+            all_started = threading.Event()
 
             def fake_discover(authority, start_date, end_date):
                 with lock:
                     started.append(authority)
-                if authority == "Council C":
-                    reverse_started.set()
-                if authority == "Council A":
-                    reverse_started.wait(timeout=1)
+                    if len(started) >= 4:
+                        all_started.set()
+                all_started.wait(timeout=1)
                 return []
 
             with patch("lead_generator.planning.leads.discover_planit_applications", side_effect=fake_discover):
                 result = run_lead_search(config)
 
-            self.assertEqual(result.councils_completed, 3)
-            self.assertIn("Council A", started[:2])
-            self.assertIn("Council C", started[:2])
+            self.assertEqual(result.councils_completed, 4)
+            self.assertEqual(set(started[:4]), {"Council A", "Council B", "Council C", "Council D"})
+
+    def test_document_source_url_from_idox_summary_url_uses_documents_tab(self) -> None:
+        self.assertEqual(
+            document_source_url_from_application_url(
+                "https://planning.example.gov.uk/online-applications/applicationDetails.do?activeTab=summary&keyVal=ABC123"
+            ),
+            "https://planning.example.gov.uk/online-applications/applicationDetails.do?activeTab=documents&keyVal=ABC123",
+        )
+
+    def test_planit_document_source_urls_use_portal_url_when_docs_url_missing(self) -> None:
+        application = PlanningApplication(
+            authority="Example",
+            uid="ABC123",
+            url="https://planning.example.gov.uk/online-applications/applicationDetails.do?activeTab=summary&keyVal=ABC123",
+            source_url="https://planning.example.gov.uk/online-applications/search.do?action=advanced",
+            raw={
+                "source_url": "https://planning.example.gov.uk/online-applications/search.do?action=advanced",
+                "portal_url": "https://planning.example.gov.uk/online-applications/applicationDetails.do?activeTab=summary&keyVal=ABC123",
+            },
+        )
+
+        self.assertEqual(
+            planit_document_source_urls(application),
+            [
+                "https://planning.example.gov.uk/online-applications/applicationDetails.do?activeTab=documents&keyVal=ABC123",
+                "https://planning.example.gov.uk/online-applications/applicationDetails.do?activeTab=summary&keyVal=ABC123",
+            ],
+        )
+
+    def test_application_link_prefers_application_page_over_search_page(self) -> None:
+        application = PlanningApplication(
+            authority="Example",
+            uid="ABC123",
+            url="https://planning.example.gov.uk/detail/ABC123",
+            source_url="https://planning.example.gov.uk/search",
+            raw={
+                "source_url": "https://planning.example.gov.uk/search",
+                "portal_url": "https://planning.example.gov.uk/detail/ABC123",
+            },
+        )
+
+        self.assertEqual(application_link(application), "https://planning.example.gov.uk/detail/ABC123")
+
+    def test_enrich_planit_application_falls_back_to_portal_url_when_docs_url_missing(self) -> None:
+        application = PlanningApplication(
+            authority="BCP",
+            uid="P/26/02835/HOU",
+            url="https://planning.bcpcouncil.gov.uk/Planning/Display/P/26/02835/HOU",
+            raw={"portal_url": "https://planning.bcpcouncil.gov.uk/Planning/Display/P/26/02835/HOU"},
+        )
+        documents = [PlanningDocument(title="Site Plan", url="https://planning.bcpcouncil.gov.uk/Document/Download?id=1")]
+
+        with patch("lead_generator.planning.leads.fetch_planit_documents", return_value=documents) as fetch_documents:
+            enriched = enrich_planit_application(application)
+
+        fetch_documents.assert_called_once_with("https://planning.bcpcouncil.gov.uk/Planning/Display/P/26/02835/HOU")
+        self.assertEqual(enriched.documents, documents)
 
     def test_document_download_retries_viewer_url_as_download_url(self) -> None:
         class FakeResponse:
@@ -474,6 +544,23 @@ class LeadSearchTest(unittest.TestCase):
             [("https://docs.example.gov.uk/PublicAccess_LIVE/Document/ViewDocument?id=ABC123", "Site layout.pdf")],
         )
 
+    def test_iter_document_links_ignores_generic_site_documents(self) -> None:
+        document = html.fromstring(
+            """
+            <html><body>
+              <a href="https://council.example.gov.uk/Accessibility">Accessibility</a>
+              <a href="/Document/Download?fileName=Design%20and%20Access%20Statement.pdf">Design and Access Statement</a>
+            </body></html>
+            """
+        )
+
+        links = list(iter_document_links(document, "https://planning.example.gov.uk/Planning/Display/ABC123"))
+
+        self.assertEqual(
+            links,
+            [("/Document/Download?fileName=Design%20and%20Access%20Statement.pdf", "Design and Access Statement")],
+        )
+
     def test_fetch_publisher_document_list_reads_ajax_rows(self) -> None:
         class FakeResponse:
             def __enter__(self):
@@ -504,6 +591,68 @@ class LeadSearchTest(unittest.TestCase):
         self.assertEqual(documents[0].title, "APPLICATION FORM REDACTED")
         self.assertEqual(documents[0].url, "https://app.example.gov.uk/docs/A29775F9/Document-A29775F9.pdf")
         self.assertEqual(documents[0].source_url, "https://app.example.gov.uk/planningdocuments=22%2F001")
+
+    def test_fetch_arcus_salesforce_document_list_reads_aura_rows(self) -> None:
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return json.dumps(
+                    {
+                        "actions": [
+                            {
+                                "state": "SUCCESS",
+                                "returnValue": [
+                                    {
+                                        "Id": "068ABC",
+                                        "Title": "Design and Access Statement",
+                                        "FileExtension": "pdf",
+                                        "FileType": "PDF",
+                                        "ContentSize": 12345,
+                                        "Document_Type__c": "Design And Access Statement",
+                                        "arcshared__Document_Date__c": "2026-01-13",
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                ).encode()
+
+        class FakeOpener:
+            def open(self, request, timeout):
+                self.request_url = request.full_url
+                self.request_data = request.data.decode()
+                return FakeResponse()
+
+        boot = {
+            "mode": "PROD",
+            "app": "siteforce:napiliApp",
+            "fwuid": "FWUID",
+            "loaded": {"APPLICATION@markup://siteforce:napiliApp": "APPHASH"},
+            "pathPrefix": "",
+        }
+        page_html = f'<script src="/s/sfsites/l/{quote(json.dumps(boot, separators=(",", ":")), safe="")}/bootstrap.js"></script>'
+        opener = FakeOpener()
+
+        documents = fetch_arcus_salesforce_document_list(
+            page_html,
+            "https://planning.example.gov.uk/s/papplication/a1M123/f26100751",
+            opener,
+        )
+
+        self.assertEqual(len(documents), 1)
+        self.assertIn("findContentVersionsForPlanning=1", opener.request_url)
+        self.assertIn("recordId%22%3A%22a1M123", opener.request_data)
+        self.assertEqual(documents[0].title, "Design and Access Statement.pdf")
+        self.assertEqual(
+            documents[0].url,
+            "https://planning.example.gov.uk/sfc/servlet.shepherd/version/download/068ABC",
+        )
+        self.assertEqual(documents[0].document_type, "Design And Access Statement")
 
     def test_document_download_follows_html_intermediate_page(self) -> None:
         class FakeResponse:

@@ -13,7 +13,7 @@ from http.cookiejar import CookieJar
 from email.message import Message
 from importlib import resources
 from pathlib import Path
-from time import sleep
+from time import monotonic, sleep
 from typing import Callable, Iterable
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlsplit, urlunsplit
@@ -74,10 +74,15 @@ CancelCallback = Callable[[], bool]
 
 USER_AGENT = "Mozilla/5.0 LeadGeneratorPlanningScraper/0.1 (+responsible planning data collection)"
 PLANIT_PAGE_SIZE = 100
-SEARCH_WORKER_COUNT = 2
+SEARCH_WORKER_COUNT = 4
 DOCUMENT_DOWNLOAD_DELAY_SECONDS = 0.0
 RATE_LIMIT_HTTP_CODES = {429, 503}
-MAX_RETRY_AFTER_SECONDS = 60.0
+MAX_RETRY_AFTER_SECONDS = 20.0
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 20.0
+REQUEST_THROTTLE_SECONDS = 0.25
+PLANIT_REQUEST_THROTTLE_SECONDS = 0.75
+_REQUEST_THROTTLE_LOCK = threading.Lock()
+_LAST_REQUEST_AT: dict[str, float] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,10 +227,14 @@ def run_lead_search(
 
     worker_count = min(SEARCH_WORKER_COUNT, len(targets))
     workers = [
-        threading.Thread(target=search_worker, args=("Forward search",), daemon=True),
+        threading.Thread(
+            target=search_worker,
+            args=(f"Search worker {index + 1}",),
+            kwargs={"reverse": bool(index % 2)},
+            daemon=True,
+        )
+        for index in range(worker_count)
     ]
-    if worker_count > 1:
-        workers.append(threading.Thread(target=search_worker, args=("Reverse search",), kwargs={"reverse": True}, daemon=True))
     for worker in workers:
         worker.start()
     for worker in workers:
@@ -327,15 +336,99 @@ def discover_planit_applications(authority: str, start_date: date, end_date: dat
 
 
 def enrich_planit_application(application: PlanningApplication) -> PlanningApplication:
-    docs_url = application.raw.get("docs_url") if application.raw else None
-    if docs_url:
-        application.documents = fetch_planit_documents(str(docs_url))
+    documents: list[PlanningDocument] = []
+    seen: set[str] = set()
+    for docs_url in planit_document_source_urls(application):
+        try:
+            fetched = fetch_planit_documents(docs_url)
+        except Exception:
+            continue
+        for document in fetched:
+            if document.url in seen:
+                continue
+            seen.add(document.url)
+            documents.append(document)
+        if documents:
+            break
+    if documents:
+        application.documents = documents
     return application
 
 
+def planit_document_source_urls(application: PlanningApplication) -> list[str]:
+    candidates: list[str] = []
+
+    def add(value: object, *, allow_listing: bool = False) -> None:
+        if not value:
+            return
+        url = str(value)
+        if not allow_listing and _looks_like_listing_url(url):
+            return
+        if url not in candidates:
+            candidates.append(url)
+
+    raw = application.raw or {}
+    add(raw.get("docs_url"), allow_listing=True)
+    for value in (raw.get("portal_url"), application.url, raw.get("source_url"), application.source_url):
+        derived = document_source_url_from_application_url(str(value)) if value else None
+        add(derived)
+    add(raw.get("portal_url"))
+    add(application.url)
+    add(raw.get("source_url"))
+    add(application.source_url)
+    return candidates
+
+
+def document_source_url_from_application_url(url: str) -> str | None:
+    if not url or _looks_like_listing_url(url):
+        return None
+    parts = urlsplit(url)
+    path = parts.path.casefold()
+    if "applicationdetails.do" in path:
+        query_items = parse_qsl(parts.query, keep_blank_values=True)
+        if not any(name.casefold() == "keyval" for name, _value in query_items):
+            return url
+        updated: list[tuple[str, str]] = []
+        replaced = False
+        for name, value in query_items:
+            if name.casefold() == "activetab":
+                updated.append((name, "documents"))
+                replaced = True
+            else:
+                updated.append((name, value))
+        if not replaced:
+            updated.insert(0, ("activeTab", "documents"))
+        return _with_query_items(parts, updated)
+    if any(marker in path for marker in ("/planning/display/", "/planning/application/", "/planningapplications/")):
+        return url
+    return url if _is_document_href(url) else None
+
+
+def _looks_like_listing_url(url: str) -> bool:
+    lowered = url.casefold()
+    parts = urlsplit(url)
+    path = parts.path.casefold().rstrip("/")
+    if "applicationdetails.do" in path:
+        return False
+    if any(
+        marker in lowered
+        for marker in (
+            "search.do?action=advanced",
+            "search.do?action=simple",
+            "search/advanced",
+            "advancedsearch",
+            "advanced-search",
+            "public-register",
+            "register-view",
+            "weekly/monthly",
+        )
+    ):
+        return True
+    return path.endswith("/search") or path.endswith("/search/advanced")
+
+
 def fetch_planit_documents(docs_url: str) -> list[PlanningDocument]:
-    opener = _build_document_opener()
-    text, page_url = _fetch_html_with_portal_session(docs_url, opener, timeout=45)
+    text, page_url, opener = _fetch_html_document_page(docs_url, timeout=45)
     document = html.fromstring(text)
     documents: list[PlanningDocument] = []
     seen: set[str] = set()
@@ -350,6 +443,11 @@ def fetch_planit_documents(docs_url: str) -> list[PlanningDocument]:
             continue
         seen.add(publisher_document.url)
         documents.append(publisher_document)
+    for arcus_document in fetch_arcus_salesforce_document_list(text, page_url, opener):
+        if arcus_document.url in seen:
+            continue
+        seen.add(arcus_document.url)
+        documents.append(arcus_document)
     return documents
 
 
@@ -442,14 +540,14 @@ def write_csv(csv_path: Path, rows: list[dict[str, str]]) -> None:
 
 def application_link(application: PlanningApplication) -> str:
     if application.raw:
-        for key in ("source_url", "portal_url", "docs_url"):
+        for key in ("portal_url", "docs_url", "source_url"):
             value = application.raw.get(key)
             if value:
                 return str(value)
-    if application.source_url:
-        return application.source_url
     if application.url:
         return application.url
+    if application.source_url:
+        return application.source_url
     return ""
 
 
@@ -522,8 +620,15 @@ def source_document_candidates(document: PlanningDocument, opener) -> list[str]:
         return []
     try:
         text, page_url = _fetch_html_with_portal_session(document.source_url, opener, timeout=30)
-    except Exception:
-        return []
+    except Exception as exc:
+        if not _is_tls_certificate_error(exc):
+            return []
+        try:
+            fallback_opener = _build_document_opener(verify_tls=False)
+            text, page_url = _fetch_html_with_portal_session(document.source_url, fallback_opener, timeout=30)
+            opener = fallback_opener
+        except Exception:
+            return []
     candidates: list[PlanningDocument] = []
     try:
         page = html.fromstring(text)
@@ -580,6 +685,8 @@ def iter_document_links(document: html.HtmlElement, page_url: str) -> Iterable[t
         href = anchor.get("href")
         absolute_url = urljoin(page_url, href)
         title = clean_text(" ".join(anchor.itertext())) or document_title_from_url(absolute_url)
+        if _is_generic_site_document(href, title):
+            continue
         if not _is_document_href(href) and not _is_document_link_text(title, href):
             continue
         if not _is_document_href(href) and _is_application_tab_href(href):
@@ -590,13 +697,18 @@ def iter_document_links(document: html.HtmlElement, page_url: str) -> Iterable[t
         for href in re.findall(r"['\"]([^'\"]+(?:document|download|attachment|viewDocument|showDocuments)[^'\"]*)['\"]", onclick, flags=re.IGNORECASE):
             absolute_url = urljoin(page_url, href)
             title = clean_text(" ".join(element.itertext())) or document_title_from_url(absolute_url)
+            if _is_generic_site_document(href, title):
+                continue
             yield href, title
     for element in document.xpath("//iframe[@src] | //embed[@src] | //object[@data]"):
         href = element.get("src") or element.get("data")
         if not _is_document_href(href):
             continue
         absolute_url = urljoin(page_url, href)
-        yield href, document_title_from_url(absolute_url)
+        title = document_title_from_url(absolute_url)
+        if _is_generic_site_document(href, title):
+            continue
+        yield href, title
 
 
 def iter_public_access_model_links(document: html.HtmlElement, page_url: str) -> Iterable[tuple[str, str]]:
@@ -671,6 +783,127 @@ def fetch_publisher_document_list(text: str, page_url: str, opener) -> list[Plan
     return documents
 
 
+def fetch_arcus_salesforce_document_list(text: str, page_url: str, opener) -> list[PlanningDocument]:
+    record_id = _salesforce_arcus_record_id(page_url)
+    context = _salesforce_aura_context(text)
+    if not record_id or not context:
+        return []
+    parts = urlsplit(page_url)
+    path_prefix = str(context.get("pathPrefix") or _salesforce_path_prefix(parts.path)).rstrip("/")
+    endpoint = urlunsplit(
+        (
+            parts.scheme,
+            parts.netloc,
+            f"{path_prefix}/s/sfsites/aura",
+            urlencode({"r": "0", "other.LC_ARC_Files_Viewer.findContentVersionsForPlanning": "1"}),
+            "",
+        )
+    )
+    message = {
+        "actions": [
+            {
+                "id": "1;a",
+                "descriptor": "apex://LC_ARC_Files_Viewer/ACTION$findContentVersionsForPlanning",
+                "callingDescriptor": "markup://c:ARC_Content_Version_Viewer",
+                "params": {
+                    "recordId": record_id,
+                    "isLatest": True,
+                    "showSensitveFiles": False,
+                    "orderBy": "arcshared__Document_Date__c",
+                    "sortType": "DESC",
+                },
+                "version": None,
+            }
+        ]
+    }
+    payload = urlencode(
+        {
+            "message": json.dumps(message, separators=(",", ":")),
+            "aura.context": json.dumps(context, separators=(",", ":")),
+            "aura.pageURI": parts.path,
+            "aura.token": "null",
+        }
+    ).encode("utf-8")
+    request = Request(
+        endpoint,
+        data=payload,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Referer": page_url,
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "X-Requested-With": "XMLHttpRequest",
+        },
+        method="POST",
+    )
+    try:
+        with _open_url_with_retry(request, timeout=45, opener=opener) as response:
+            response_text = response.read().decode("utf-8", errors="replace")
+    except Exception:
+        return []
+    try:
+        payload_data = json.loads(response_text)
+    except json.JSONDecodeError:
+        return []
+    records = []
+    for action in payload_data.get("actions", []):
+        if isinstance(action, dict) and isinstance(action.get("returnValue"), list):
+            records.extend(action["returnValue"])
+    documents: list[PlanningDocument] = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        version_id = str(record.get("Id") or "")
+        if not version_id:
+            continue
+        extension = clean_text(str(record.get("FileExtension") or "")).lower()
+        title = clean_text(str(record.get("Title") or "Document"))
+        if extension and not title.casefold().endswith(f".{extension}"):
+            title = f"{title}.{extension}"
+        documents.append(
+            PlanningDocument(
+                title=title,
+                url=normalize_url(f"{parts.scheme}://{parts.netloc}/sfc/servlet.shepherd/version/download/{version_id}"),
+                document_type=clean_text(str(record.get("Document_Type__c") or record.get("FileType") or "")) or None,
+                date_published=clean_text(str(record.get("arcshared__Document_Date__c") or "")) or None,
+                file_size=str(record.get("ContentSize")) if record.get("ContentSize") else None,
+                source_url=page_url,
+            )
+        )
+    return documents
+
+
+def _salesforce_arcus_record_id(page_url: str) -> str | None:
+    match = re.search(r"/s/papplication/([^/?#]+)", urlsplit(page_url).path, flags=re.IGNORECASE)
+    return unquote(match.group(1)) if match else None
+
+
+def _salesforce_path_prefix(path: str) -> str:
+    match = re.match(r"(.+?)/s/", path, flags=re.IGNORECASE)
+    return match.group(1) if match else ""
+
+
+def _salesforce_aura_context(text: str) -> dict[str, object] | None:
+    for match in re.finditer(r"/s/sfsites/l/([^/]+)/(?:inline|bootstrap)\.js", text):
+        try:
+            boot = json.loads(unquote(match.group(1)))
+        except json.JSONDecodeError:
+            continue
+        fwuid = boot.get("fwuid")
+        loaded = boot.get("loaded")
+        if fwuid and isinstance(loaded, dict):
+            return {
+                "mode": boot.get("mode") or "PROD",
+                "fwuid": fwuid,
+                "app": boot.get("app") or "siteforce:napiliApp",
+                "loaded": loaded,
+                "dn": [],
+                "globals": {},
+                "uad": True,
+                "pathPrefix": boot.get("pathPrefix") or "",
+            }
+    return None
+
+
 def document_title_from_url(url: str) -> str:
     parts = urlsplit(url)
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
@@ -717,6 +950,8 @@ def _is_document_href(href: str | None) -> bool:
     lowered = href.strip().lower()
     if lowered.startswith(("javascript:", "mailto:", "tel:", "#")):
         return False
+    if _is_generic_site_document(href, None):
+        return False
     if any(token in lowered for token in ("userguide", "prior1997", "/templates/", "content?id=")):
         return False
     if _is_application_tab_href(href) or "search.do" in lowered:
@@ -748,6 +983,35 @@ def _is_document_href(href: str | None) -> bool:
             ".rtf",
         )
     )
+
+
+def _is_generic_site_document(href: str | None, title: str | None) -> bool:
+    text = " ".join(value for value in (href, title) if value).casefold()
+    if not text:
+        return False
+    if "design and access" in text or "access statement" in text:
+        return False
+    generic_tokens = (
+        "accessibility",
+        "cookie",
+        "privacy",
+        "terms-and-conditions",
+        "terms conditions",
+        "terms%20and%20conditions",
+        "site-map",
+        "sitemap",
+        "contact-us",
+        "contact us",
+        "complaints",
+        "modern-slavery",
+        "freedom-of-information",
+        "foi",
+        "userguide",
+        "user-guide",
+        "adobe",
+        "acrobat",
+    )
+    return any(token in text for token in generic_tokens)
 
 
 def _is_document_link_text(title: str, href: str | None) -> bool:
@@ -924,6 +1188,7 @@ def _application_from_planit_record(authority: str, record: dict[str, object]) -
 def _open_url_with_retry(request: Request, *, timeout: float, opener=None):
     for attempt in range(4):
         try:
+            _throttle_request(request.full_url)
             if opener is not None:
                 return opener.open(request, timeout=timeout)
             return urlopen(request, timeout=timeout)
@@ -931,6 +1196,7 @@ def _open_url_with_retry(request: Request, *, timeout: float, opener=None):
             if exc.code not in RATE_LIMIT_HTTP_CODES or attempt == 3:
                 raise
             sleep(_retry_delay_seconds(exc, 5.0 * (attempt + 1)))
+            _skip_next_throttle(request.full_url)
     raise RuntimeError(f"Could not fetch {request.full_url}")
 
 
@@ -955,6 +1221,19 @@ def _fetch_html_with_portal_session(url: str, opener, *, timeout: float) -> tupl
     return text, page_url
 
 
+def _fetch_html_document_page(url: str, *, timeout: float):
+    opener = _build_document_opener()
+    try:
+        text, page_url = _fetch_html_with_portal_session(url, opener, timeout=timeout)
+        return text, page_url, opener
+    except Exception as exc:
+        if not _is_tls_certificate_error(exc):
+            raise
+    opener = _build_document_opener(verify_tls=False)
+    text, page_url = _fetch_html_with_portal_session(url, opener, timeout=timeout)
+    return text, page_url, opener
+
+
 def _disclaimer_accept_url(text: str, page_url: str) -> str | None:
     try:
         document = html.fromstring(text)
@@ -968,16 +1247,42 @@ def _disclaimer_accept_url(text: str, page_url: str) -> str | None:
 
 
 def _fetch_json_with_retry(url: str) -> dict[str, object]:
-    for attempt in range(4):
+    attempts = 2 if "planit.org.uk" in urlsplit(url).netloc.casefold() else 4
+    for attempt in range(attempts):
         request = Request(url, headers={"User-Agent": USER_AGENT})
         try:
-            with urlopen(request, timeout=45) as response:
+            _throttle_request(url)
+            with urlopen(request, timeout=DEFAULT_REQUEST_TIMEOUT_SECONDS) as response:
                 return json.loads(response.read().decode("utf-8", errors="replace"))
         except HTTPError as exc:
-            if exc.code not in RATE_LIMIT_HTTP_CODES or attempt == 3:
+            if exc.code not in RATE_LIMIT_HTTP_CODES or attempt == attempts - 1:
                 raise
-            sleep(_retry_delay_seconds(exc, 5.0 * (attempt + 1)))
+            sleep(min(_retry_delay_seconds(exc, 2.0 * (attempt + 1)), 8.0))
+            _skip_next_throttle(url)
     raise RuntimeError(f"Could not fetch public planning metadata: {url}")
+
+
+def _throttle_request(url: str) -> None:
+    netloc = urlsplit(url).netloc.casefold()
+    if not netloc:
+        return
+    delay = PLANIT_REQUEST_THROTTLE_SECONDS if netloc.endswith("planit.org.uk") else REQUEST_THROTTLE_SECONDS
+    with _REQUEST_THROTTLE_LOCK:
+        now = monotonic()
+        wait = delay - (now - _LAST_REQUEST_AT.get(netloc, 0.0))
+        if wait > 0:
+            sleep(wait)
+            now = monotonic()
+        _LAST_REQUEST_AT[netloc] = now
+
+
+def _skip_next_throttle(url: str) -> None:
+    netloc = urlsplit(url).netloc.casefold()
+    if not netloc:
+        return
+    delay = PLANIT_REQUEST_THROTTLE_SECONDS if netloc.endswith("planit.org.uk") else REQUEST_THROTTLE_SECONDS
+    with _REQUEST_THROTTLE_LOCK:
+        _LAST_REQUEST_AT[netloc] = monotonic() - delay
 
 
 def _retry_delay_seconds(exc: HTTPError, fallback_seconds: float) -> float:
