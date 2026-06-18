@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from datetime import date
+from urllib.error import HTTPError
 from pathlib import Path
 from unittest.mock import patch
 
@@ -11,6 +12,8 @@ from lead_generator.planning.leads import (
     LeadSearchConfig,
     application_in_geojson,
     application_matches,
+    document_download_candidates,
+    download_pdf_documents,
     load_authority_catalogue,
     parse_keywords,
     point_in_geometry,
@@ -18,7 +21,7 @@ from lead_generator.planning.leads import (
     sanitize_path_part,
     select_overlapping_authorities,
 )
-from lead_generator.planning.models import PlanningApplication
+from lead_generator.planning.models import PlanningApplication, PlanningDocument
 
 
 def polygon_feature(name: str, xmin: float, ymin: float, xmax: float, ymax: float) -> dict[str, object]:
@@ -210,10 +213,53 @@ class LeadSearchTest(unittest.TestCase):
             self.assertEqual(result.leads_found, 1)
             self.assertTrue(result.csv_path.exists())
             csv_text = result.csv_path.read_text(encoding="utf-8")
+            self.assertIn("application link", csv_text)
+            self.assertIn("https://planning.example.gov.uk/detail/ABC123", csv_text)
             self.assertIn("24/01234/FUL", csv_text)
             self.assertNotIn("24/99999/FUL", csv_text)
             self.assertTrue((result.output_dir / "Example Council" / "24 01234 FUL").exists())
             self.assertTrue((result.output_dir / "selected_councils.geojson").exists())
+
+    def test_document_download_retries_viewer_url_as_download_url(self) -> None:
+        class FakeResponse:
+            headers = {"Content-Type": "application/pdf"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return b"%PDF-1.4"
+
+        class FakeOpener:
+            def __init__(self) -> None:
+                self.urls: list[str] = []
+
+            def open(self, request, timeout):
+                self.urls.append(request.full_url)
+                if "documentviewer.do" in request.full_url:
+                    raise HTTPError(request.full_url, 404, "Not Found", {}, None)
+                return FakeResponse()
+
+        document = PlanningDocument(
+            title="Proposed plan.pdf",
+            url="https://planning.example.gov.uk/online-applications/documentviewer.do?keyVal=DOC001",
+            source_url="https://planning.example.gov.uk/online-applications/applicationDetails.do?activeTab=documents",
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            opener = FakeOpener()
+            with patch("lead_generator.planning.leads.build_opener", return_value=opener):
+                downloaded = download_pdf_documents([document], Path(directory))
+
+            self.assertEqual(downloaded, 1)
+            self.assertTrue((Path(directory) / "Proposed plan.pdf").exists())
+            self.assertEqual(
+                opener.urls,
+                document_download_candidates(document.url),
+            )
 
     def test_sanitize_path_part_removes_windows_invalid_characters(self) -> None:
         self.assertEqual(sanitize_path_part("24/01234:FUL*"), "24 01234 FUL")

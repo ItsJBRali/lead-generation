@@ -5,13 +5,14 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import date
+from http.cookiejar import CookieJar
 from importlib import resources
 from pathlib import Path
 from time import sleep
 from typing import Callable, Iterable
 from urllib.error import HTTPError
-from urllib.parse import urlencode, urljoin, urlsplit
-from urllib.request import Request, urlopen
+from urllib.parse import quote, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 
 from lxml import html
 
@@ -161,6 +162,7 @@ def run_lead_search(
                 rows.append(
                     {
                         "Reference": application.reference or application.uid,
+                        "application link": application_link(application),
                         "proposal": application.description or "",
                         "date received": application.date_received or "",
                         "council": target.authority,
@@ -277,7 +279,7 @@ def enrich_planit_application(application: PlanningApplication) -> PlanningAppli
 
 
 def fetch_planit_documents(docs_url: str) -> list[PlanningDocument]:
-    request = Request(docs_url, headers={"User-Agent": "LeadGeneratorPlanningScraper/0.1"})
+    request = Request(docs_url, headers={"User-Agent": "Mozilla/5.0 LeadGeneratorPlanningScraper/0.1"})
     with urlopen(request, timeout=45) as response:
         text = response.read().decode("utf-8", errors="replace")
         page_url = response.geturl()
@@ -293,7 +295,7 @@ def fetch_planit_documents(docs_url: str) -> list[PlanningDocument]:
         if absolute_url in seen:
             continue
         seen.add(absolute_url)
-        documents.append(PlanningDocument(title=title, url=absolute_url))
+        documents.append(PlanningDocument(title=title, url=normalize_url(absolute_url), source_url=page_url))
     return documents
 
 
@@ -361,9 +363,8 @@ def download_pdf_documents(
             filename = f"{filename}.pdf"
         path = _unique_path(destination / filename)
         try:
-            request = Request(document.url, headers={"User-Agent": "LeadGeneratorPlanningScraper/0.1"})
-            with urlopen(request, timeout=30) as response:
-                path.write_bytes(response.read())
+            payload = download_document_bytes(document)
+            path.write_bytes(payload)
             downloaded += 1
         except Exception as exc:  # pragma: no cover - network resilience
             _log(log, f"Could not download {document.title}: {exc}")
@@ -372,9 +373,73 @@ def download_pdf_documents(
 
 def write_csv(csv_path: Path, rows: list[dict[str, str]]) -> None:
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["Reference", "proposal", "date received", "council"])
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["Reference", "application link", "proposal", "date received", "council"],
+        )
         writer.writeheader()
         writer.writerows(rows)
+
+
+def application_link(application: PlanningApplication) -> str:
+    if application.raw:
+        for key in ("source_url", "portal_url", "docs_url"):
+            value = application.raw.get(key)
+            if value:
+                return str(value)
+    if application.source_url:
+        return application.source_url
+    if application.url:
+        return application.url
+    return ""
+
+
+def download_document_bytes(document: PlanningDocument) -> bytes:
+    last_error: Exception | None = None
+    opener = build_opener(HTTPCookieProcessor(CookieJar()))
+    for url in document_download_candidates(document.url):
+        headers = {"User-Agent": "Mozilla/5.0 LeadGeneratorPlanningScraper/0.1"}
+        if document.source_url:
+            headers["Referer"] = document.source_url
+        try:
+            request = Request(url, headers=headers)
+            with opener.open(request, timeout=30) as response:
+                payload = response.read()
+                content_type = response.headers.get("Content-Type", "").lower()
+                if "html" in content_type and not payload.lstrip().startswith(b"%PDF"):
+                    raise ValueError(f"{url} returned HTML instead of a PDF")
+                return payload
+        except HTTPError as exc:
+            last_error = exc
+            if exc.code != 404:
+                raise
+        except Exception as exc:
+            last_error = exc
+    raise last_error or RuntimeError(f"Could not download {document.url}")
+
+
+def document_download_candidates(url: str) -> list[str]:
+    normalized = normalize_url(url)
+    candidates = [normalized]
+    lowered = normalized.lower()
+    replacements = {
+        "documentviewer.do": "documentdownload.do",
+        "documentviewer": "documentdownload",
+        "viewdocument": "downloadDocument",
+    }
+    for old, new in replacements.items():
+        if old in lowered:
+            start = lowered.index(old)
+            candidate = normalized[:start] + new + normalized[start + len(old) :]
+            candidates.append(candidate)
+    return list(dict.fromkeys(candidates))
+
+
+def normalize_url(url: str) -> str:
+    parts = urlsplit(url)
+    path = quote(parts.path, safe="/%")
+    query = quote(parts.query, safe="=&?/%:+,;@")
+    return urlunsplit((parts.scheme, parts.netloc, path, query, parts.fragment))
 
 
 def iter_feature_geometries(geojson: dict[str, object]) -> Iterable[dict[str, object]]:
