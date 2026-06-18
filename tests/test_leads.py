@@ -65,6 +65,29 @@ class LeadSearchTest(unittest.TestCase):
             self.assertTrue(properties["council_name"])
             self.assertTrue(properties["listing_url"])
 
+    def test_builtin_catalogue_includes_known_english_gap_authorities(self) -> None:
+        catalogue = load_authority_catalogue(Path("src/lead_generator/planning/data/planning_authorities.geojson"))
+        authorities = {feature["properties"]["authority"] for feature in catalogue["features"]}
+
+        self.assertTrue(
+            {
+                "East Suffolk",
+                "BCP",
+                "North Northamptonshire",
+                "West Northamptonshire",
+                "Westmorland and Furness",
+                "Cumberland",
+                "Adur and Worthing",
+                "Mid Kent",
+                "South West Devon",
+                "Babergh Mid Suffolk",
+                "Bromsgrove Redditch",
+                "Chiltern South Bucks",
+                "South Norfolk Broadland",
+                "Greater Cambridge",
+            }.issubset(authorities)
+        )
+
     def test_point_in_geometry_handles_polygon(self) -> None:
         geometry = polygon_feature("area", 0, 0, 1, 1)["geometry"]
 
