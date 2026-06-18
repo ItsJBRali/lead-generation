@@ -448,6 +448,11 @@ def fetch_planit_documents(docs_url: str) -> list[PlanningDocument]:
             continue
         seen.add(arcus_document.url)
         documents.append(arcus_document)
+    for arcus_document in fetch_arcus_public_register_file_list(text, page_url, opener):
+        if arcus_document.url in seen:
+            continue
+        seen.add(arcus_document.url)
+        documents.append(arcus_document)
     return documents
 
 
@@ -563,6 +568,7 @@ def _download_document_file(document: PlanningDocument) -> DownloadedFile:
     last_error: Exception | None = None
     opener = _build_document_opener()
     verify_tls = True
+    tls_compat = False
     source_candidates: list[str] = []
     if document.source_url:
         source_candidates = source_document_candidates(document, opener)
@@ -603,6 +609,14 @@ def _download_document_file(document: PlanningDocument) -> DownloadedFile:
                 sleep(_retry_delay_seconds(exc, 5.0 * (attempt + 1)))
             except Exception as exc:
                 last_error = exc
+                if not tls_compat and _is_tls_compatibility_error(exc):
+                    tls_compat = True
+                    opener = _build_document_opener(tls_compat=True)
+                    if document.source_url:
+                        pending.extendleft(reversed(source_document_candidates(document, opener)))
+                    seen.discard(url)
+                    pending.appendleft(url)
+                    break
                 if verify_tls and _is_tls_certificate_error(exc):
                     verify_tls = False
                     opener = _build_document_opener(verify_tls=False)
@@ -692,6 +706,17 @@ def iter_document_links(document: html.HtmlElement, page_url: str) -> Iterable[t
         if not _is_document_href(href) and _is_application_tab_href(href):
             continue
         yield href, title
+    for attr in ("data-disabled-link", "data-link", "data-url", "data-href"):
+        for element in document.xpath(f"//*[@{attr}]"):
+            href = element.get(attr)
+            if not _is_document_href(href):
+                continue
+            absolute_url = urljoin(page_url, href)
+            title = clean_text(element.get("aria-label") or " ".join(element.itertext())) or document_title_from_url(absolute_url)
+            title = re.sub(r"^link\s*\(\s*download\s*\)\s*", "", title, flags=re.IGNORECASE).strip()
+            if _is_generic_site_document(href, title):
+                continue
+            yield href, title or document_title_from_url(absolute_url)
     for element in document.xpath("//*[@onclick]"):
         onclick = element.get("onclick") or ""
         for href in re.findall(r"['\"]([^'\"]+(?:document|download|attachment|viewDocument|showDocuments)[^'\"]*)['\"]", onclick, flags=re.IGNORECASE):
@@ -844,10 +869,87 @@ def fetch_arcus_salesforce_document_list(text: str, page_url: str, opener) -> li
         payload_data = json.loads(response_text)
     except json.JSONDecodeError:
         return []
-    records = []
+    records: list[dict[str, object]] = []
     for action in payload_data.get("actions", []):
         if isinstance(action, dict) and isinstance(action.get("returnValue"), list):
             records.extend(action["returnValue"])
+    return _salesforce_content_version_documents(records, page_url)
+
+
+def fetch_arcus_public_register_file_list(text: str, page_url: str, opener) -> list[PlanningDocument]:
+    record_id = _salesforce_arcus_record_id(page_url)
+    context = _salesforce_aura_context(text)
+    if not record_id or not context:
+        return []
+    parts = urlsplit(page_url)
+    path_prefix = str(context.get("pathPrefix") or _salesforce_path_prefix(parts.path)).rstrip("/")
+    endpoint = urlunsplit(
+        (
+            parts.scheme,
+            parts.netloc,
+            f"{path_prefix}/s/sfsites/aura",
+            urlencode({"r": "0", "aura.ApexAction.execute": "1"}),
+            "",
+        )
+    )
+    message = {
+        "actions": [
+            {
+                "id": "1;a",
+                "descriptor": "aura://ApexActionController/ACTION$execute",
+                "callingDescriptor": "UNKNOWN",
+                "params": {
+                    "namespace": "arcuscommunity",
+                    "classname": "PR_FilesListCont",
+                    "method": "getFiles",
+                    "params": {"recordId": record_id, "registerName": None},
+                    "cacheable": True,
+                    "isContinuation": False,
+                },
+            }
+        ]
+    }
+    payload = urlencode(
+        {
+            "message": json.dumps(message, separators=(",", ":")),
+            "aura.context": json.dumps(context, separators=(",", ":")),
+            "aura.pageURI": f"{parts.path}?tabset-ff68f=3",
+            "aura.token": "null",
+        }
+    ).encode("utf-8")
+    request = Request(
+        endpoint,
+        data=payload,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Referer": page_url,
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "X-Requested-With": "XMLHttpRequest",
+        },
+        method="POST",
+    )
+    try:
+        with _open_url_with_retry(request, timeout=45, opener=opener) as response:
+            response_text = response.read().decode("utf-8", errors="replace")
+    except Exception:
+        return []
+    try:
+        payload_data = json.loads(response_text)
+    except json.JSONDecodeError:
+        return []
+    records: list[dict[str, object]] = []
+    for action in payload_data.get("actions", []):
+        if not isinstance(action, dict):
+            continue
+        return_value = action.get("returnValue")
+        if isinstance(return_value, dict) and isinstance(return_value.get("returnValue"), list):
+            records.extend(item for item in return_value["returnValue"] if isinstance(item, dict))
+    return _salesforce_content_version_documents(records, page_url)
+
+
+def _salesforce_content_version_documents(records: list[dict[str, object]], page_url: str) -> list[PlanningDocument]:
+    parts = urlsplit(page_url)
+    path_prefix = _salesforce_path_prefix(parts.path).rstrip("/")
     documents: list[PlanningDocument] = []
     for record in records:
         if not isinstance(record, dict):
@@ -862,8 +964,8 @@ def fetch_arcus_salesforce_document_list(text: str, page_url: str, opener) -> li
         documents.append(
             PlanningDocument(
                 title=title,
-                url=normalize_url(f"{parts.scheme}://{parts.netloc}/sfc/servlet.shepherd/version/download/{version_id}"),
-                document_type=clean_text(str(record.get("Document_Type__c") or record.get("FileType") or "")) or None,
+                url=normalize_url(f"{parts.scheme}://{parts.netloc}{path_prefix}/sfc/servlet.shepherd/version/download/{version_id}"),
+                document_type=clean_text(str(record.get("Document_Type__c") or record.get("arcshared__Category__c") or record.get("FileType") or "")) or None,
                 date_published=clean_text(str(record.get("arcshared__Document_Date__c") or "")) or None,
                 file_size=str(record.get("ContentSize")) if record.get("ContentSize") else None,
                 source_url=page_url,
@@ -873,7 +975,7 @@ def fetch_arcus_salesforce_document_list(text: str, page_url: str, opener) -> li
 
 
 def _salesforce_arcus_record_id(page_url: str) -> str | None:
-    match = re.search(r"/s/papplication/([^/?#]+)", urlsplit(page_url).path, flags=re.IGNORECASE)
+    match = re.search(r"/s/(?:papplication|detail)/([^/?#]+)", urlsplit(page_url).path, flags=re.IGNORECASE)
     return unquote(match.group(1)) if match else None
 
 
@@ -1200,10 +1302,14 @@ def _open_url_with_retry(request: Request, *, timeout: float, opener=None):
     raise RuntimeError(f"Could not fetch {request.full_url}")
 
 
-def _build_document_opener(*, verify_tls: bool = True):
+def _build_document_opener(*, verify_tls: bool = True, tls_compat: bool = False):
     handlers = [HTTPCookieProcessor(CookieJar())]
     if not verify_tls:
         handlers.append(HTTPSHandler(context=ssl._create_unverified_context()))
+    elif tls_compat:
+        context = ssl.create_default_context()
+        context.set_ciphers("DEFAULT:@SECLEVEL=1")
+        handlers.append(HTTPSHandler(context=context))
     return build_opener(*handlers)
 
 
@@ -1227,6 +1333,10 @@ def _fetch_html_document_page(url: str, *, timeout: float):
         text, page_url = _fetch_html_with_portal_session(url, opener, timeout=timeout)
         return text, page_url, opener
     except Exception as exc:
+        if _is_tls_compatibility_error(exc):
+            opener = _build_document_opener(tls_compat=True)
+            text, page_url = _fetch_html_with_portal_session(url, opener, timeout=timeout)
+            return text, page_url, opener
         if not _is_tls_certificate_error(exc):
             raise
     opener = _build_document_opener(verify_tls=False)
@@ -1342,6 +1452,13 @@ def _is_tls_certificate_error(exc: Exception) -> bool:
     return "certificate" in str(exc).casefold() and "ssl" in str(exc).casefold()
 
 
+def _is_tls_compatibility_error(exc: Exception) -> bool:
+    text = str(exc).casefold()
+    if isinstance(exc, URLError):
+        text = f"{exc.reason} {exc}".casefold()
+    return "forcibly closed" in text or "winerror 10054" in text or "sslv3 alert handshake failure" in text
+
+
 def _comparable_title(value: str | None) -> str:
     if not value:
         return ""
@@ -1417,6 +1534,9 @@ def _extension_from_signature(payload: bytes) -> str | None:
 def _is_downloaded_file(payload: bytes, content_type: str, final_url: str) -> bool:
     if not payload:
         return False
+    normalized_content_type = content_type.split(";", 1)[0].strip().lower()
+    if normalized_content_type in {"application/json", "text/json", "application/javascript", "text/javascript"}:
+        return False
     if _extension_from_signature(payload):
         return True
     if _looks_like_html(payload, content_type):
@@ -1425,8 +1545,7 @@ def _is_downloaded_file(payload: bytes, content_type: str, final_url: str) -> bo
         return True
     if Path(urlsplit(final_url).path).suffix.lower() in _known_file_extensions():
         return True
-    content_type = content_type.split(";", 1)[0].strip().lower()
-    return content_type.startswith("application/") or content_type.startswith("image/")
+    return normalized_content_type.startswith("application/") or normalized_content_type.startswith("image/")
 
 
 def _looks_like_html(payload: bytes, content_type: str) -> bool:

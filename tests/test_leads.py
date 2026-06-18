@@ -26,6 +26,7 @@ from lead_generator.planning.leads import (
     download_document_bytes,
     download_pdf_documents,
     enrich_planit_application,
+    fetch_arcus_public_register_file_list,
     fetch_arcus_salesforce_document_list,
     fetch_publisher_document_list,
     iter_document_links,
@@ -561,6 +562,29 @@ class LeadSearchTest(unittest.TestCase):
             [("/Document/Download?fileName=Design%20and%20Access%20Statement.pdf", "Design and Access Statement")],
         )
 
+    def test_iter_document_links_reads_atrium_data_disabled_links(self) -> None:
+        document = html.fromstring(
+            """
+            <html><body>
+              <a data-disabled-link="/Document/Download?module=PLA&amp;recordNumber=1&amp;fileName=ApplicationFormRedacted.pdf"
+                 class="singledownloadlink"
+                 aria-label="Link(Download) ApplicationFormRedacted.pdf">01. Application Form</a>
+            </body></html>
+            """
+        )
+
+        links = list(iter_document_links(document, "https://planning.example.gov.uk/Planning/Display/ABC123"))
+
+        self.assertEqual(
+            links,
+            [
+                (
+                    "/Document/Download?module=PLA&recordNumber=1&fileName=ApplicationFormRedacted.pdf",
+                    "ApplicationFormRedacted.pdf",
+                )
+            ],
+        )
+
     def test_fetch_publisher_document_list_reads_ajax_rows(self) -> None:
         class FakeResponse:
             def __enter__(self):
@@ -653,6 +677,71 @@ class LeadSearchTest(unittest.TestCase):
             "https://planning.example.gov.uk/sfc/servlet.shepherd/version/download/068ABC",
         )
         self.assertEqual(documents[0].document_type, "Design And Access Statement")
+
+    def test_fetch_arcus_public_register_file_list_reads_milton_keynes_rows(self) -> None:
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return json.dumps(
+                    {
+                        "actions": [
+                            {
+                                "state": "SUCCESS",
+                                "returnValue": {
+                                    "returnValue": [
+                                        {
+                                            "Id": "068MK",
+                                            "Title": "Proposed Ground Floor Site Plan",
+                                            "FileExtension": "pdf",
+                                            "FileType": "PDF",
+                                            "ContentSize": 383959,
+                                            "arcshared__Category__c": "APPPLAN - Plans",
+                                            "arcshared__Document_Date__c": "2026-06-17",
+                                        }
+                                    ]
+                                },
+                            }
+                        ]
+                    }
+                ).encode()
+
+        class FakeOpener:
+            def open(self, request, timeout):
+                self.request_url = request.full_url
+                self.request_data = request.data.decode()
+                return FakeResponse()
+
+        boot = {
+            "mode": "PROD",
+            "app": "siteforce:communityApp",
+            "fwuid": "FWUID",
+            "loaded": {"APPLICATION@markup://siteforce:communityApp": "APPHASH"},
+            "pathPrefix": "/pr",
+        }
+        page_html = f'<script src="/pr/s/sfsites/l/{quote(json.dumps(boot, separators=(",", ":")), safe="")}/bootstrap.js"></script>'
+        opener = FakeOpener()
+
+        documents = fetch_arcus_public_register_file_list(
+            page_html,
+            "https://www.be.milton-keynes.gov.uk/pr/s/detail/a0lQH000002K7XF",
+            opener,
+        )
+
+        self.assertEqual(len(documents), 1)
+        self.assertIn("aura.ApexAction.execute=1", opener.request_url)
+        self.assertIn("PR_FilesListCont", opener.request_data)
+        self.assertIn("a0lQH000002K7XF", opener.request_data)
+        self.assertEqual(documents[0].title, "Proposed Ground Floor Site Plan.pdf")
+        self.assertEqual(
+            documents[0].url,
+            "https://www.be.milton-keynes.gov.uk/pr/sfc/servlet.shepherd/version/download/068MK",
+        )
+        self.assertEqual(documents[0].document_type, "APPPLAN - Plans")
 
     def test_document_download_follows_html_intermediate_page(self) -> None:
         class FakeResponse:
