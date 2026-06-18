@@ -3,6 +3,8 @@ from __future__ import annotations
 import csv
 import json
 import re
+import threading
+from collections import deque
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -68,9 +70,9 @@ ProgressCallback = Callable[[int, int], None]
 CancelCallback = Callable[[], bool]
 
 USER_AGENT = "Mozilla/5.0 LeadGeneratorPlanningScraper/0.1 (+responsible planning data collection)"
-PLANIT_PAGE_SIZE = 25
-PLANIT_PAGE_DELAY_SECONDS = 1.5
-DOCUMENT_DOWNLOAD_DELAY_SECONDS = 1.0
+PLANIT_PAGE_SIZE = 100
+SEARCH_WORKER_COUNT = 2
+DOCUMENT_DOWNLOAD_DELAY_SECONDS = 0.0
 RATE_LIMIT_HTTP_CODES = {429, 503}
 MAX_RETRY_AFTER_SECONDS = 60.0
 
@@ -146,45 +148,77 @@ def run_lead_search(
         raise ValueError("No planning authorities overlap the supplied GeoJSON boundary.")
     _progress(progress, completed, len(targets))
 
-    for target in targets:
-        if should_cancel and should_cancel():
-            _log(log, "Run cancelled.")
-            break
+    pending_targets = deque(targets)
+    lock = threading.Lock()
 
-        _log(log, f"Searching {target.authority} ({target.portal_family})")
-        try:
-            applications = discover_planit_applications(target.authority, config.start_date, config.end_date)
-            _log(log, f"{target.authority}: found {len(applications)} received applications in the date range")
-            matched_count = 0
-            for application in applications:
-                if should_cancel and should_cancel():
-                    break
-                if not application_matches(application, config.start_date, config.end_date, config.keywords):
-                    continue
-                if not application_in_geojson(application, user_geojson):
-                    continue
-                application = enrich_planit_application(application)
-                matched_count += 1
-                lead_folder = create_lead_folder(output_dir, target.authority, application)
-                download_pdf_documents(application.documents, lead_folder, log=log)
-                rows.append(
-                    {
-                        "Reference": application.reference or application.uid,
-                        "application link": application_link(application),
-                        "proposal": application.description or "",
-                        "date received": application.date_received or "",
-                        "council": target.authority,
-                    }
-                )
-                _log(log, f"{target.authority}: saved {application.reference or application.uid}")
-            _log(log, f"{target.authority}: {matched_count} applications matched keywords and location")
-        except Exception as exc:  # pragma: no cover - live-site resilience
-            _log(log, f"{target.authority}: failed: {exc}")
-        finally:
+    def next_target(reverse: bool) -> CouncilTarget | None:
+        with lock:
+            if not pending_targets:
+                return None
+            return pending_targets.pop() if reverse else pending_targets.popleft()
+
+    def mark_complete() -> None:
+        nonlocal completed
+        with lock:
             completed += 1
-            _progress(progress, completed, len(targets))
-            if completed < len(targets) and not (should_cancel and should_cancel()):
-                sleep(PLANIT_PAGE_DELAY_SECONDS)
+            current = completed
+        _progress(progress, current, len(targets))
+
+    def save_row(row: dict[str, str]) -> None:
+        with lock:
+            rows.append(row)
+
+    def search_worker(name: str, *, reverse: bool = False) -> None:
+        while True:
+            if should_cancel and should_cancel():
+                _log(log, f"{name}: cancelled.")
+                return
+            target = next_target(reverse)
+            if target is None:
+                return
+
+            _log(log, f"{name}: searching {target.authority} ({target.portal_family})")
+            try:
+                applications = discover_planit_applications(target.authority, config.start_date, config.end_date)
+                _log(log, f"{target.authority}: found {len(applications)} received applications in the date range")
+                matched_count = 0
+                for application in applications:
+                    if should_cancel and should_cancel():
+                        break
+                    if not application_matches(application, config.start_date, config.end_date, config.keywords):
+                        continue
+                    if not application_in_geojson(application, user_geojson):
+                        continue
+                    application = enrich_planit_application(application)
+                    matched_count += 1
+                    lead_folder = create_lead_folder(output_dir, target.authority, application)
+                    download_pdf_documents(application.documents, lead_folder, log=log)
+                    save_row(
+                        {
+                            "Reference": application.reference or application.uid,
+                            "application link": application_link(application),
+                            "proposal": application.description or "",
+                            "date received": application.date_received or "",
+                            "council": target.authority,
+                        }
+                    )
+                    _log(log, f"{target.authority}: saved {application.reference or application.uid}")
+                _log(log, f"{target.authority}: {matched_count} applications matched keywords and location")
+            except Exception as exc:  # pragma: no cover - live-site resilience
+                _log(log, f"{target.authority}: failed: {exc}")
+            finally:
+                mark_complete()
+
+    worker_count = min(SEARCH_WORKER_COUNT, len(targets))
+    workers = [
+        threading.Thread(target=search_worker, args=("Forward search",), daemon=True),
+    ]
+    if worker_count > 1:
+        workers.append(threading.Thread(target=search_worker, args=("Reverse search",), kwargs={"reverse": True}, daemon=True))
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
 
     write_csv(csv_path, rows)
     _log(log, f"Finished. Saved {len(rows)} leads to {csv_path}")
@@ -278,7 +312,6 @@ def discover_planit_applications(authority: str, start_date: date, end_date: dat
         if not batch or len(records) >= total:
             break
         page += 1
-        sleep(PLANIT_PAGE_DELAY_SECONDS)
     return [_application_from_planit_record(authority, record) for record in records]
 
 
@@ -377,7 +410,8 @@ def download_pdf_documents(
             payload = download_document_bytes(document)
             path.write_bytes(payload)
             downloaded += 1
-            sleep(DOCUMENT_DOWNLOAD_DELAY_SECONDS)
+            if DOCUMENT_DOWNLOAD_DELAY_SECONDS:
+                sleep(DOCUMENT_DOWNLOAD_DELAY_SECONDS)
         except HTTPError as exc:
             if exc.code == 404:
                 _log(log, f"Skipped unavailable document link: {document.title}")

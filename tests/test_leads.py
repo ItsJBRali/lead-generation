@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import tempfile
 import unittest
 from datetime import date
@@ -221,6 +222,85 @@ class LeadSearchTest(unittest.TestCase):
             self.assertNotIn("24/99999/FUL", csv_text)
             self.assertTrue((result.output_dir / "Example Council" / "24 01234 FUL").exists())
             self.assertTrue((result.output_dir / "selected_councils.geojson").exists())
+
+    def test_run_lead_search_starts_reverse_worker_from_last_council(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_geojson = root / "search.geojson"
+            user_geojson.write_text(
+                json.dumps(
+                    {
+                        "type": "FeatureCollection",
+                        "features": [polygon_feature("search area", 0, 0, 1, 1)],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            catalogue = root / "catalogue.geojson"
+            catalogue.write_text(
+                json.dumps(
+                    {
+                        "type": "FeatureCollection",
+                        "features": [
+                            {
+                                **polygon_feature("Council A", 0, 0, 1, 1),
+                                "properties": {
+                                    "authority": "Council A",
+                                    "portal_family": "idox",
+                                    "base_url": "https://a.example.gov.uk",
+                                    "listing_url": "https://a.example.gov.uk/search",
+                                },
+                            },
+                            {
+                                **polygon_feature("Council B", 0, 0, 1, 1),
+                                "properties": {
+                                    "authority": "Council B",
+                                    "portal_family": "idox",
+                                    "base_url": "https://b.example.gov.uk",
+                                    "listing_url": "https://b.example.gov.uk/search",
+                                },
+                            },
+                            {
+                                **polygon_feature("Council C", 0, 0, 1, 1),
+                                "properties": {
+                                    "authority": "Council C",
+                                    "portal_family": "idox",
+                                    "base_url": "https://c.example.gov.uk",
+                                    "listing_url": "https://c.example.gov.uk/search",
+                                },
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = LeadSearchConfig(
+                geojson_path=user_geojson,
+                output_root=root,
+                start_date=date(2026, 6, 1),
+                end_date=date(2026, 6, 30),
+                keywords=["driveway gates"],
+                catalogue_path=catalogue,
+            )
+            started: list[str] = []
+            lock = threading.Lock()
+            reverse_started = threading.Event()
+
+            def fake_discover(authority, start_date, end_date):
+                with lock:
+                    started.append(authority)
+                if authority == "Council C":
+                    reverse_started.set()
+                if authority == "Council A":
+                    reverse_started.wait(timeout=1)
+                return []
+
+            with patch("lead_generator.planning.leads.discover_planit_applications", side_effect=fake_discover):
+                result = run_lead_search(config)
+
+            self.assertEqual(result.councils_completed, 3)
+            self.assertIn("Council A", started[:2])
+            self.assertIn("Council C", started[:2])
 
     def test_document_download_retries_viewer_url_as_download_url(self) -> None:
         class FakeResponse:
