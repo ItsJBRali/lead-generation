@@ -4,14 +4,15 @@ import csv
 import json
 import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
+from email.utils import parsedate_to_datetime
 from http.cookiejar import CookieJar
 from importlib import resources
 from pathlib import Path
 from time import sleep
 from typing import Callable, Iterable
 from urllib.error import HTTPError
-from urllib.parse import quote, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit, urlunsplit
 from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 
 from lxml import html
@@ -65,6 +66,13 @@ DEFAULT_KEYWORDS = [
 LogCallback = Callable[[str], None]
 ProgressCallback = Callable[[int, int], None]
 CancelCallback = Callable[[], bool]
+
+USER_AGENT = "Mozilla/5.0 LeadGeneratorPlanningScraper/0.1 (+responsible planning data collection)"
+PLANIT_PAGE_SIZE = 25
+PLANIT_PAGE_DELAY_SECONDS = 1.5
+DOCUMENT_DOWNLOAD_DELAY_SECONDS = 1.0
+RATE_LIMIT_HTTP_CODES = {429, 503}
+MAX_RETRY_AFTER_SECONDS = 60.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +183,8 @@ def run_lead_search(
         finally:
             completed += 1
             _progress(progress, completed, len(targets))
+            if completed < len(targets) and not (should_cancel and should_cancel()):
+                sleep(PLANIT_PAGE_DELAY_SECONDS)
 
     write_csv(csv_path, rows)
     _log(log, f"Finished. Saved {len(rows)} leads to {csv_path}")
@@ -250,7 +260,7 @@ def councils_to_geojson(targets: list[CouncilTarget]) -> str:
 
 def discover_planit_applications(authority: str, start_date: date, end_date: date) -> list[PlanningApplication]:
     records: list[dict[str, object]] = []
-    page_size = 100
+    page_size = PLANIT_PAGE_SIZE
     page = 1
     while True:
         params = {
@@ -268,6 +278,7 @@ def discover_planit_applications(authority: str, start_date: date, end_date: dat
         if not batch or len(records) >= total:
             break
         page += 1
+        sleep(PLANIT_PAGE_DELAY_SECONDS)
     return [_application_from_planit_record(authority, record) for record in records]
 
 
@@ -279,8 +290,8 @@ def enrich_planit_application(application: PlanningApplication) -> PlanningAppli
 
 
 def fetch_planit_documents(docs_url: str) -> list[PlanningDocument]:
-    request = Request(docs_url, headers={"User-Agent": "Mozilla/5.0 LeadGeneratorPlanningScraper/0.1"})
-    with urlopen(request, timeout=45) as response:
+    request = Request(docs_url, headers={"User-Agent": USER_AGENT})
+    with _open_url_with_retry(request, timeout=45) as response:
         text = response.read().decode("utf-8", errors="replace")
         page_url = response.geturl()
     document = html.fromstring(text)
@@ -366,6 +377,12 @@ def download_pdf_documents(
             payload = download_document_bytes(document)
             path.write_bytes(payload)
             downloaded += 1
+            sleep(DOCUMENT_DOWNLOAD_DELAY_SECONDS)
+        except HTTPError as exc:
+            if exc.code == 404:
+                _log(log, f"Skipped unavailable document link: {document.title}")
+            else:
+                _log(log, f"Could not download {document.title}: HTTP {exc.code}")
         except Exception as exc:  # pragma: no cover - network resilience
             _log(log, f"Could not download {document.title}: {exc}")
     return downloaded
@@ -398,23 +415,28 @@ def download_document_bytes(document: PlanningDocument) -> bytes:
     last_error: Exception | None = None
     opener = build_opener(HTTPCookieProcessor(CookieJar()))
     for url in document_download_candidates(document.url):
-        headers = {"User-Agent": "Mozilla/5.0 LeadGeneratorPlanningScraper/0.1"}
+        headers = {"User-Agent": USER_AGENT}
         if document.source_url:
             headers["Referer"] = document.source_url
-        try:
-            request = Request(url, headers=headers)
-            with opener.open(request, timeout=30) as response:
-                payload = response.read()
-                content_type = response.headers.get("Content-Type", "").lower()
-                if "html" in content_type and not payload.lstrip().startswith(b"%PDF"):
-                    raise ValueError(f"{url} returned HTML instead of a PDF")
-                return payload
-        except HTTPError as exc:
-            last_error = exc
-            if exc.code != 404:
-                raise
-        except Exception as exc:
-            last_error = exc
+        request = Request(url, headers=headers)
+        for attempt in range(4):
+            try:
+                with opener.open(request, timeout=30) as response:
+                    payload = response.read()
+                    content_type = response.headers.get("Content-Type", "").lower()
+                    if "html" in content_type and not payload.lstrip().startswith(b"%PDF"):
+                        raise ValueError(f"{url} returned HTML instead of a PDF")
+                    return payload
+            except HTTPError as exc:
+                last_error = exc
+                if exc.code == 404:
+                    break
+                if exc.code not in RATE_LIMIT_HTTP_CODES or attempt == 3:
+                    raise
+                sleep(_retry_delay_seconds(exc, 5.0 * (attempt + 1)))
+            except Exception as exc:
+                last_error = exc
+                break
     raise last_error or RuntimeError(f"Could not download {document.url}")
 
 
@@ -429,9 +451,19 @@ def document_download_candidates(url: str) -> list[str]:
     }
     for old, new in replacements.items():
         if old in lowered:
-            start = lowered.index(old)
-            candidate = normalized[:start] + new + normalized[start + len(old) :]
-            candidates.append(candidate)
+            candidates.append(re.sub(re.escape(old), new, normalized, flags=re.IGNORECASE))
+    parts = urlsplit(normalized)
+    query_items = parse_qsl(parts.query, keep_blank_values=True)
+    has_module = any(name.casefold() == "module" for name, _value in query_items)
+    has_keyval = any(name.casefold() == "keyval" for name, _value in query_items)
+    if has_keyval and "documentdownload.do" in parts.path.casefold():
+        if not has_module:
+            candidates.append(_with_query_items(parts, [("module", "planning"), *query_items]))
+    if has_keyval and "documentviewer.do" in parts.path.casefold():
+        download_path = re.sub("documentviewer\\.do", "documentdownload.do", parts.path, flags=re.IGNORECASE)
+        candidates.append(_with_query_items(parts._replace(path=download_path), query_items))
+        if not has_module:
+            candidates.append(_with_query_items(parts._replace(path=download_path), [("module", "planning"), *query_items]))
     return list(dict.fromkeys(candidates))
 
 
@@ -440,6 +472,10 @@ def normalize_url(url: str) -> str:
     path = quote(parts.path, safe="/%")
     query = quote(parts.query, safe="=&?/%:+,;@")
     return urlunsplit((parts.scheme, parts.netloc, path, query, parts.fragment))
+
+
+def _with_query_items(parts, query_items: list[tuple[str, str]]) -> str:
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query_items), parts.fragment))
 
 
 def iter_feature_geometries(geojson: dict[str, object]) -> Iterable[dict[str, object]]:
@@ -587,17 +623,46 @@ def _application_from_planit_record(authority: str, record: dict[str, object]) -
     )
 
 
+def _open_url_with_retry(request: Request, *, timeout: float):
+    for attempt in range(4):
+        try:
+            return urlopen(request, timeout=timeout)
+        except HTTPError as exc:
+            if exc.code not in RATE_LIMIT_HTTP_CODES or attempt == 3:
+                raise
+            sleep(_retry_delay_seconds(exc, 5.0 * (attempt + 1)))
+    raise RuntimeError(f"Could not fetch {request.full_url}")
+
+
 def _fetch_json_with_retry(url: str) -> dict[str, object]:
     for attempt in range(4):
-        request = Request(url, headers={"User-Agent": "LeadGeneratorPlanningScraper/0.1"})
+        request = Request(url, headers={"User-Agent": USER_AGENT})
         try:
             with urlopen(request, timeout=45) as response:
                 return json.loads(response.read().decode("utf-8", errors="replace"))
         except HTTPError as exc:
-            if exc.code != 429 or attempt == 3:
+            if exc.code not in RATE_LIMIT_HTTP_CODES or attempt == 3:
                 raise
-            sleep(2 * (attempt + 1))
+            sleep(_retry_delay_seconds(exc, 5.0 * (attempt + 1)))
     raise RuntimeError(f"Could not fetch public planning metadata: {url}")
+
+
+def _retry_delay_seconds(exc: HTTPError, fallback_seconds: float) -> float:
+    retry_after = exc.headers.get("Retry-After") if exc.headers else None
+    if retry_after:
+        try:
+            return min(max(float(retry_after), 0.0), MAX_RETRY_AFTER_SECONDS)
+        except ValueError:
+            try:
+                retry_after_date = parsedate_to_datetime(retry_after)
+            except (TypeError, ValueError):
+                pass
+            else:
+                if retry_after_date.tzinfo is None:
+                    retry_after_date = retry_after_date.replace(tzinfo=timezone.utc)
+                delay = (retry_after_date - datetime.now(timezone.utc)).total_seconds()
+                return min(max(delay, 0.0), MAX_RETRY_AFTER_SECONDS)
+    return fallback_seconds
 
 
 def _record_string(record: object, key: str) -> str | None:

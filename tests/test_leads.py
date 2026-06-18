@@ -10,9 +10,11 @@ from unittest.mock import patch
 
 from lead_generator.planning.leads import (
     LeadSearchConfig,
+    _fetch_json_with_retry,
     application_in_geojson,
     application_matches,
     document_download_candidates,
+    download_document_bytes,
     download_pdf_documents,
     load_authority_catalogue,
     parse_keywords,
@@ -251,15 +253,94 @@ class LeadSearchTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             opener = FakeOpener()
-            with patch("lead_generator.planning.leads.build_opener", return_value=opener):
+            with (
+                patch("lead_generator.planning.leads.build_opener", return_value=opener),
+                patch("lead_generator.planning.leads.sleep"),
+            ):
                 downloaded = download_pdf_documents([document], Path(directory))
 
             self.assertEqual(downloaded, 1)
             self.assertTrue((Path(directory) / "Proposed plan.pdf").exists())
-            self.assertEqual(
-                opener.urls,
-                document_download_candidates(document.url),
-            )
+            self.assertEqual(opener.urls[0], document.url)
+            self.assertIn("documentdownload.do", opener.urls[1])
+
+    def test_document_download_candidates_add_idox_module_download_url(self) -> None:
+        candidates = document_download_candidates(
+            "https://planning.example.gov.uk/online-applications/documentviewer.do?keyVal=DOC001"
+        )
+
+        self.assertIn(
+            "https://planning.example.gov.uk/online-applications/documentdownload.do?module=planning&keyVal=DOC001",
+            candidates,
+        )
+
+    def test_fetch_json_waits_and_retries_after_rate_limit(self) -> None:
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return b'{"records": []}'
+
+        calls = 0
+
+        def fake_urlopen(request, timeout):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise HTTPError(request.full_url, 429, "Too Many Requests", {"Retry-After": "3"}, None)
+            return FakeResponse()
+
+        with (
+            patch("lead_generator.planning.leads.urlopen", side_effect=fake_urlopen),
+            patch("lead_generator.planning.leads.sleep") as sleep_mock,
+        ):
+            payload = _fetch_json_with_retry("https://www.planit.org.uk/api/applics/json")
+
+        self.assertEqual(payload, {"records": []})
+        sleep_mock.assert_called_once_with(3.0)
+
+    def test_document_download_waits_and_retries_after_rate_limit(self) -> None:
+        class FakeResponse:
+            headers = {"Content-Type": "application/pdf"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return b"%PDF-1.4"
+
+        class FakeOpener:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def open(self, request, timeout):
+                self.calls += 1
+                if self.calls == 1:
+                    raise HTTPError(request.full_url, 429, "Too Many Requests", {"Retry-After": "2"}, None)
+                return FakeResponse()
+
+        document = PlanningDocument(
+            title="Proposed plan.pdf",
+            url="https://planning.example.gov.uk/online-applications/documentdownload.do?module=planning&keyVal=DOC001",
+        )
+
+        opener = FakeOpener()
+        with (
+            patch("lead_generator.planning.leads.build_opener", return_value=opener),
+            patch("lead_generator.planning.leads.sleep") as sleep_mock,
+        ):
+            payload = download_document_bytes(document)
+
+        self.assertEqual(payload, b"%PDF-1.4")
+        self.assertEqual(opener.calls, 2)
+        sleep_mock.assert_called_once_with(2.0)
 
     def test_sanitize_path_part_removes_windows_invalid_characters(self) -> None:
         self.assertEqual(sanitize_path_part("24/01234:FUL*"), "24 01234 FUL")
