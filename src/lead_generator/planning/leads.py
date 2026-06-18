@@ -9,17 +9,19 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from email.utils import parsedate_to_datetime
 from http.cookiejar import CookieJar
+from email.message import Message
 from importlib import resources
 from pathlib import Path
 from time import sleep
 from typing import Callable, Iterable
 from urllib.error import HTTPError
-from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlsplit, urlunsplit
 from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 
 from lxml import html
 
 from lead_generator.planning.models import PlanningApplication, PlanningDocument
+from lead_generator.planning.parsing import clean_text
 
 
 DEFAULT_KEYWORDS = [
@@ -105,6 +107,14 @@ class LeadSearchResult:
     councils_total: int
     councils_completed: int
     leads_found: int
+
+
+@dataclass(slots=True)
+class DownloadedFile:
+    payload: bytes
+    final_url: str
+    content_type: str
+    filename: str | None = None
 
 
 def parse_keywords(text: str) -> list[str]:
@@ -323,23 +333,22 @@ def enrich_planit_application(application: PlanningApplication) -> PlanningAppli
 
 
 def fetch_planit_documents(docs_url: str) -> list[PlanningDocument]:
-    request = Request(docs_url, headers={"User-Agent": USER_AGENT})
-    with _open_url_with_retry(request, timeout=45) as response:
-        text = response.read().decode("utf-8", errors="replace")
-        page_url = response.geturl()
+    opener = build_opener(HTTPCookieProcessor(CookieJar()))
+    text, page_url = _fetch_html_with_portal_session(docs_url, opener, timeout=45)
     document = html.fromstring(text)
     documents: list[PlanningDocument] = []
     seen: set[str] = set()
-    for anchor in document.xpath("//a[@href]"):
-        href = anchor.get("href")
+    for href, title in iter_document_links(document, page_url):
         absolute_url = urljoin(page_url, href)
-        title = " ".join(anchor.itertext()).strip() or absolute_url.rsplit("/", 1)[-1]
-        if ".pdf" not in f"{href} {title}".lower():
-            continue
         if absolute_url in seen:
             continue
         seen.add(absolute_url)
         documents.append(PlanningDocument(title=title, url=normalize_url(absolute_url), source_url=page_url))
+    for publisher_document in fetch_publisher_document_list(text, page_url, opener):
+        if publisher_document.url in seen:
+            continue
+        seen.add(publisher_document.url)
+        documents.append(publisher_document)
     return documents
 
 
@@ -400,15 +409,13 @@ def download_pdf_documents(
 ) -> int:
     downloaded = 0
     for index, document in enumerate(documents, start=1):
-        if not _looks_like_pdf(document):
+        if not _looks_like_downloadable_document(document):
             continue
-        filename = sanitize_path_part(document.title or f"document-{index}.pdf")
-        if not filename.lower().endswith(".pdf"):
-            filename = f"{filename}.pdf"
-        path = _unique_path(destination / filename)
         try:
-            payload = download_document_bytes(document)
-            path.write_bytes(payload)
+            downloaded_file = download_document_file(document)
+            filename = document_filename(document, downloaded_file, fallback=f"document-{index}")
+            path = _unique_path(destination / filename)
+            path.write_bytes(downloaded_file.payload)
             downloaded += 1
             if DOCUMENT_DOWNLOAD_DELAY_SECONDS:
                 sleep(DOCUMENT_DOWNLOAD_DELAY_SECONDS)
@@ -445,10 +452,27 @@ def application_link(application: PlanningApplication) -> str:
     return ""
 
 
+def download_document_file(document: PlanningDocument) -> DownloadedFile:
+    return _download_document_file(document)
+
+
 def download_document_bytes(document: PlanningDocument) -> bytes:
+    return download_document_file(document).payload
+
+
+def _download_document_file(document: PlanningDocument) -> DownloadedFile:
     last_error: Exception | None = None
     opener = build_opener(HTTPCookieProcessor(CookieJar()))
-    for url in document_download_candidates(document.url):
+    source_candidates: list[str] = []
+    if document.source_url:
+        source_candidates = source_document_candidates(document, opener)
+    pending = deque([*source_candidates, *document_download_candidates(document.url)])
+    seen: set[str] = set()
+    while pending:
+        url = pending.popleft()
+        if url in seen:
+            continue
+        seen.add(url)
         headers = {"User-Agent": USER_AGENT}
         if document.source_url:
             headers["Referer"] = document.source_url
@@ -458,9 +482,18 @@ def download_document_bytes(document: PlanningDocument) -> bytes:
                 with opener.open(request, timeout=30) as response:
                     payload = response.read()
                     content_type = response.headers.get("Content-Type", "").lower()
-                    if "html" in content_type and not payload.lstrip().startswith(b"%PDF"):
-                        raise ValueError(f"{url} returned HTML instead of a PDF")
-                    return payload
+                    final_url = response.geturl() if hasattr(response, "geturl") else url
+                    if _is_downloaded_file(payload, content_type, final_url):
+                        return DownloadedFile(
+                            payload=payload,
+                            final_url=final_url,
+                            content_type=content_type,
+                            filename=_filename_from_headers(response.headers),
+                        )
+                    if _looks_like_html(payload, content_type):
+                        pending.extend(_document_links_from_html(payload, final_url))
+                        break
+                    raise ValueError(f"{url} did not return a downloadable file")
             except HTTPError as exc:
                 last_error = exc
                 if exc.code == 404:
@@ -472,6 +505,36 @@ def download_document_bytes(document: PlanningDocument) -> bytes:
                 last_error = exc
                 break
     raise last_error or RuntimeError(f"Could not download {document.url}")
+
+
+def source_document_candidates(document: PlanningDocument, opener) -> list[str]:
+    if not document.source_url:
+        return []
+    try:
+        text, page_url = _fetch_html_with_portal_session(document.source_url, opener, timeout=30)
+    except Exception:
+        return []
+    candidates: list[PlanningDocument] = []
+    try:
+        page = html.fromstring(text)
+    except Exception:
+        page = None
+    if page is not None:
+        candidates.extend(
+            PlanningDocument(title=title, url=normalize_url(urljoin(page_url, href)), source_url=page_url)
+            for href, title in iter_document_links(page, page_url)
+        )
+    candidates.extend(fetch_publisher_document_list(text, page_url, opener))
+    wanted = _comparable_title(document.title)
+    matching = [
+        candidate.url
+        for candidate in candidates
+        if not wanted
+        or _comparable_title(candidate.title) == wanted
+        or wanted in _comparable_title(candidate.title)
+        or _comparable_title(candidate.title) in wanted
+    ]
+    return list(dict.fromkeys(matching))
 
 
 def document_download_candidates(url: str) -> list[str]:
@@ -499,6 +562,197 @@ def document_download_candidates(url: str) -> list[str]:
         if not has_module:
             candidates.append(_with_query_items(parts._replace(path=download_path), [("module", "planning"), *query_items]))
     return list(dict.fromkeys(candidates))
+
+
+def iter_document_links(document: html.HtmlElement, page_url: str) -> Iterable[tuple[str, str]]:
+    yield from iter_public_access_model_links(document, page_url)
+    for anchor in document.xpath("//a[@href]"):
+        href = anchor.get("href")
+        absolute_url = urljoin(page_url, href)
+        title = clean_text(" ".join(anchor.itertext())) or document_title_from_url(absolute_url)
+        if not _is_document_href(href) and not _is_document_link_text(title, href):
+            continue
+        if not _is_document_href(href) and _is_application_tab_href(href):
+            continue
+        yield href, title
+    for element in document.xpath("//*[@onclick]"):
+        onclick = element.get("onclick") or ""
+        for href in re.findall(r"['\"]([^'\"]+(?:document|download|attachment|viewDocument|showDocuments)[^'\"]*)['\"]", onclick, flags=re.IGNORECASE):
+            absolute_url = urljoin(page_url, href)
+            title = clean_text(" ".join(element.itertext())) or document_title_from_url(absolute_url)
+            yield href, title
+    for element in document.xpath("//iframe[@src] | //embed[@src] | //object[@data]"):
+        href = element.get("src") or element.get("data")
+        if not _is_document_href(href):
+            continue
+        absolute_url = urljoin(page_url, href)
+        yield href, document_title_from_url(absolute_url)
+
+
+def iter_public_access_model_links(document: html.HtmlElement, page_url: str) -> Iterable[tuple[str, str]]:
+    text = html.tostring(document, encoding="unicode")
+    match = re.search(r"var\s+model\s*=\s*(\{.*?\})\s*;", text, flags=re.DOTALL)
+    if not match:
+        return
+    try:
+        model = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return
+    rows = model.get("Rows")
+    if not isinstance(rows, list):
+        return
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        guid = row.get("Guid")
+        if not guid:
+            continue
+        title = clean_text(str(row.get("Doc_Ref2") or row.get("Doc_Type") or "Document"))
+        href = urljoin(page_url, f"../Document/ViewDocument?{urlencode({'id': str(guid)})}")
+        yield href, title
+
+
+def fetch_publisher_document_list(text: str, page_url: str, opener) -> list[PlanningDocument]:
+    match = re.search(r'"url"\s*:\s*"([^"]*getDocumentList[^"]*)"', text)
+    if not match:
+        return []
+    context_match = re.search(r"\bvar\s+ctx\s*=\s*['\"]([^'\"]+)['\"]", text)
+    context_path = context_match.group(1).rstrip("/") if context_match else ""
+    endpoint = urljoin(page_url, match.group(1))
+    request = Request(
+        endpoint,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Referer": page_url,
+            "X-Requested-With": "XMLHttpRequest",
+        },
+    )
+    try:
+        with _open_url_with_retry(request, timeout=45, opener=opener) as response:
+            payload = response.read().decode("utf-8", errors="replace")
+    except Exception:
+        return []
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return []
+    rows = data.get("data")
+    if not isinstance(rows, list):
+        return []
+    documents: list[PlanningDocument] = []
+    for row in rows:
+        if not isinstance(row, list) or len(row) < 2:
+            continue
+        link = next((str(value) for value in reversed(row) if isinstance(value, str) and _is_document_href(value)), None)
+        if not link:
+            continue
+        if context_path and link.startswith("/"):
+            link = f"{context_path}{link}"
+        title = clean_text(str(row[3] if len(row) > 3 and row[3] else row[0] or "Document"))
+        documents.append(
+            PlanningDocument(
+                title=title,
+                url=normalize_url(urljoin(page_url, link)),
+                document_type=clean_text(str(row[0])) if row and row[0] else None,
+                date_published=clean_text(str(row[1])) if len(row) > 1 and row[1] else None,
+                source_url=page_url,
+            )
+        )
+    return documents
+
+
+def document_title_from_url(url: str) -> str:
+    parts = urlsplit(url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    for key in ("filename", "fileName", "documentName", "docName", "name", "file"):
+        value = query.get(key)
+        if value:
+            return Path(unquote(value.replace("\\", "/"))).name
+    return unquote(parts.path.rstrip("/").rsplit("/", 1)[-1]) or "Document"
+
+
+def document_filename(document: PlanningDocument, downloaded_file: DownloadedFile, *, fallback: str) -> str:
+    extension = _downloaded_extension(downloaded_file)
+    for value in (downloaded_file.filename, document.title, document_title_from_url(downloaded_file.final_url), fallback):
+        if not value:
+            continue
+        filename = sanitize_path_part(Path(value.replace("\\", "/")).name)
+        if filename and Path(filename).suffix:
+            return filename
+        if filename and extension:
+            return f"{filename}{extension}"
+        if filename:
+            return filename
+    return f"{fallback}{extension or '.bin'}"
+
+
+def _document_links_from_html(payload: bytes, page_url: str) -> list[str]:
+    text = payload.decode("utf-8", errors="replace")
+    try:
+        document = html.fromstring(text)
+    except Exception:
+        return []
+    links = [urljoin(page_url, href) for href, _title in iter_document_links(document, page_url)]
+    meta_refresh = document.xpath("//meta[translate(@http-equiv, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')='refresh']/@content")
+    for content in meta_refresh:
+        match = re.search(r"url\s*=\s*([^;]+)", content, flags=re.IGNORECASE)
+        if match:
+            links.append(urljoin(page_url, match.group(1).strip(" '\"")))
+    return list(dict.fromkeys(normalize_url(link) for link in links))
+
+
+def _is_document_href(href: str | None) -> bool:
+    if not href:
+        return False
+    lowered = href.strip().lower()
+    if lowered.startswith(("javascript:", "mailto:", "tel:", "#")):
+        return False
+    if any(token in lowered for token in ("userguide", "prior1997", "/templates/", "content?id=")):
+        return False
+    if _is_application_tab_href(href) or "search.do" in lowered:
+        return False
+    return any(
+        marker in lowered
+        for marker in (
+            "document",
+            "download",
+            "attachment",
+            "docview",
+            "doclist",
+            "showdocuments",
+            "viewdocument",
+            "wphappdocs",
+            "wchdisplaymedia",
+            "displaymedia",
+            "showimage",
+            ".pdf",
+            ".doc",
+            ".docx",
+            ".xls",
+            ".xlsx",
+            ".jpg",
+            ".jpeg",
+            ".png",
+            ".tif",
+            ".tiff",
+            ".rtf",
+        )
+    )
+
+
+def _is_document_link_text(title: str, href: str | None) -> bool:
+    normalized_title = title.casefold().strip()
+    lowered_href = (href or "").casefold()
+    if normalized_title not in {"documents", "view associated documents", "associated documents"}:
+        return False
+    return any(token in lowered_href for token in ("searchresult", "publicaccess", "documents", "runthirdpartysearch"))
+
+
+def _is_application_tab_href(href: str | None) -> bool:
+    if not href:
+        return False
+    lowered = href.strip().lower()
+    return "applicationdetails.do" in lowered and "activetab=documents" in lowered
 
 
 def normalize_url(url: str) -> str:
@@ -657,15 +911,43 @@ def _application_from_planit_record(authority: str, record: dict[str, object]) -
     )
 
 
-def _open_url_with_retry(request: Request, *, timeout: float):
+def _open_url_with_retry(request: Request, *, timeout: float, opener=None):
     for attempt in range(4):
         try:
+            if opener is not None:
+                return opener.open(request, timeout=timeout)
             return urlopen(request, timeout=timeout)
         except HTTPError as exc:
             if exc.code not in RATE_LIMIT_HTTP_CODES or attempt == 3:
                 raise
             sleep(_retry_delay_seconds(exc, 5.0 * (attempt + 1)))
     raise RuntimeError(f"Could not fetch {request.full_url}")
+
+
+def _fetch_html_with_portal_session(url: str, opener, *, timeout: float) -> tuple[str, str]:
+    request = Request(url, headers={"User-Agent": USER_AGENT})
+    with _open_url_with_retry(request, timeout=timeout, opener=opener) as response:
+        text = response.read().decode("utf-8", errors="replace")
+        page_url = response.geturl()
+    accept_url = _disclaimer_accept_url(text, page_url)
+    if accept_url:
+        accept_request = Request(accept_url, data=b"", headers={"User-Agent": USER_AGENT}, method="POST")
+        with _open_url_with_retry(accept_request, timeout=timeout, opener=opener) as response:
+            text = response.read().decode("utf-8", errors="replace")
+            page_url = response.geturl()
+    return text, page_url
+
+
+def _disclaimer_accept_url(text: str, page_url: str) -> str | None:
+    try:
+        document = html.fromstring(text)
+    except Exception:
+        return None
+    for form in document.xpath("//form[@action]"):
+        action = form.get("action") or ""
+        if "/disclaimer/accept" in action.casefold():
+            return urljoin(page_url, action)
+    return None
 
 
 def _fetch_json_with_retry(url: str) -> dict[str, object]:
@@ -717,9 +999,110 @@ def _parse_iso_date(value: str | None) -> date | None:
         return None
 
 
-def _looks_like_pdf(document: PlanningDocument) -> bool:
+def _looks_like_downloadable_document(document: PlanningDocument) -> bool:
     text = f"{document.title} {urlsplit(document.url).path}".lower()
-    return ".pdf" in text or document.document_type == "pdf"
+    return (
+        bool(document.url)
+        and (
+            _is_document_href(document.url)
+            or any(extension in text for extension in (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".rtf"))
+            or (document.document_type or "").casefold() in {"pdf", "document", "drawing", "plan", "supporting_document"}
+        )
+    )
+
+
+def _comparable_title(value: str | None) -> str:
+    if not value:
+        return ""
+    path = Path(value.replace("\\", "/"))
+    text = path.stem if path.suffix.lower() in _known_file_extensions() else value
+    text = re.sub(r"\.[a-z0-9]{2,5}$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"[^a-z0-9]+", " ", text.casefold())
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _filename_from_headers(headers: Message) -> str | None:
+    filename = headers.get_filename() if hasattr(headers, "get_filename") else None
+    if filename:
+        return Path(unquote(filename.replace("\\", "/"))).name
+    disposition = headers.get("Content-Disposition", "")
+    match = re.search(r"filename\*?=(?:UTF-8''|\"?)([^\";]+)", disposition, flags=re.IGNORECASE)
+    if match:
+        return Path(unquote(match.group(1).strip().strip('"').replace("\\", "/"))).name
+    return None
+
+
+def _downloaded_extension(downloaded_file: DownloadedFile) -> str:
+    filename = downloaded_file.filename or document_title_from_url(downloaded_file.final_url)
+    suffix = Path(filename.replace("\\", "/")).suffix.lower()
+    if suffix in _known_file_extensions():
+        return suffix
+    path_suffix = Path(urlsplit(downloaded_file.final_url).path).suffix.lower()
+    if path_suffix in _known_file_extensions():
+        return path_suffix
+    return _extension_from_content_type(downloaded_file.content_type) or _extension_from_signature(downloaded_file.payload) or ".bin"
+
+
+def _known_file_extensions() -> set[str]:
+    return {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".rtf", ".txt"}
+
+
+def _extension_from_content_type(content_type: str) -> str | None:
+    content_type = content_type.split(";", 1)[0].strip().lower()
+    return {
+        "application/pdf": ".pdf",
+        "application/msword": ".doc",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+        "application/vnd.ms-excel": ".xls",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/tiff": ".tif",
+        "application/rtf": ".rtf",
+        "text/rtf": ".rtf",
+        "text/plain": ".txt",
+    }.get(content_type)
+
+
+def _extension_from_signature(payload: bytes) -> str | None:
+    start = payload[:16]
+    if start.startswith(b"%PDF"):
+        return ".pdf"
+    if start.startswith(b"PK\x03\x04"):
+        return ".docx"
+    if start.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if start.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if start[:4] in (b"II*\x00", b"MM\x00*"):
+        return ".tif"
+    if start.startswith(b"{\\rtf"):
+        return ".rtf"
+    if start.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+        return ".doc"
+    return None
+
+
+def _is_downloaded_file(payload: bytes, content_type: str, final_url: str) -> bool:
+    if not payload:
+        return False
+    if _extension_from_signature(payload):
+        return True
+    if _looks_like_html(payload, content_type):
+        return False
+    if _extension_from_content_type(content_type):
+        return True
+    if Path(urlsplit(final_url).path).suffix.lower() in _known_file_extensions():
+        return True
+    content_type = content_type.split(";", 1)[0].strip().lower()
+    return content_type.startswith("application/") or content_type.startswith("image/")
+
+
+def _looks_like_html(payload: bytes, content_type: str) -> bool:
+    if "html" in content_type.lower():
+        return True
+    stripped = payload.lstrip().lower()
+    return stripped.startswith((b"<!doctype html", b"<html", b"<head", b"<body"))
 
 
 def _unique_path(path: Path) -> Path:

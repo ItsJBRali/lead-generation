@@ -9,14 +9,20 @@ from urllib.error import HTTPError
 from pathlib import Path
 from unittest.mock import patch
 
+from lxml import html
+
 from lead_generator.planning.leads import (
+    DownloadedFile,
     LeadSearchConfig,
     _fetch_json_with_retry,
     application_in_geojson,
     application_matches,
+    document_filename,
     document_download_candidates,
     download_document_bytes,
     download_pdf_documents,
+    fetch_publisher_document_list,
+    iter_document_links,
     load_authority_catalogue,
     parse_keywords,
     point_in_geometry,
@@ -341,8 +347,47 @@ class LeadSearchTest(unittest.TestCase):
 
             self.assertEqual(downloaded, 1)
             self.assertTrue((Path(directory) / "Proposed plan.pdf").exists())
-            self.assertEqual(opener.urls[0], document.url)
-            self.assertIn("documentdownload.do", opener.urls[1])
+            self.assertEqual(opener.urls[0], document.source_url)
+            self.assertEqual(opener.urls[1], document.url)
+            self.assertIn("documentdownload.do", opener.urls[2])
+
+    def test_document_download_warms_source_page_cookie_session(self) -> None:
+        class FakeResponse:
+            def __init__(self, payload: bytes, content_type: str = "text/html") -> None:
+                self._payload = payload
+                self.headers = {"Content-Type": content_type}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return self._payload
+
+        class FakeOpener:
+            def __init__(self) -> None:
+                self.warmed = False
+
+            def open(self, request, timeout):
+                if "activeTab=documents" in request.full_url:
+                    self.warmed = True
+                    return FakeResponse(b"<html>documents</html>")
+                if not self.warmed:
+                    raise HTTPError(request.full_url, 404, "Not Found", {}, None)
+                return FakeResponse(b"%PDF-1.4", "application/pdf")
+
+        document = PlanningDocument(
+            title="Application form.pdf",
+            url="https://planning.example.gov.uk/online-applications/files/hash/pdf/application.pdf",
+            source_url="https://planning.example.gov.uk/online-applications/applicationDetails.do?activeTab=documents&keyVal=ABC123",
+        )
+
+        with patch("lead_generator.planning.leads.build_opener", return_value=FakeOpener()):
+            payload = download_document_bytes(document)
+
+        self.assertEqual(payload, b"%PDF-1.4")
 
     def test_document_download_candidates_add_idox_module_download_url(self) -> None:
         candidates = document_download_candidates(
@@ -353,6 +398,127 @@ class LeadSearchTest(unittest.TestCase):
             "https://planning.example.gov.uk/online-applications/documentdownload.do?module=planning&keyVal=DOC001",
             candidates,
         )
+
+    def test_iter_document_links_keeps_non_pdf_document_endpoints(self) -> None:
+        document = html.fromstring(
+            """
+            <html><body>
+              <a href="/OcellaWeb/viewDocument?file=dv_pl_files%5CAPP%5CApplicationFormRedacted.pdf&module=pl">
+                View document
+              </a>
+              <a href="/online-applications/applicationDetails.do?activeTab=documents&keyVal=APP001">Documents tab</a>
+            </body></html>
+            """
+        )
+
+        links = list(iter_document_links(document, "https://planning.example.gov.uk/OcellaWeb/showDocuments"))
+
+        self.assertEqual(len(links), 1)
+        self.assertIn("viewDocument", links[0][0])
+        self.assertEqual(links[0][1], "View document")
+
+    def test_iter_document_links_extracts_public_access_model_rows(self) -> None:
+        document = html.fromstring(
+            """
+            <html><body><script>
+            var model = {"Rows":[{"Guid":"ABC123","Doc_Type":"Plan","Doc_Ref2":"Site layout.pdf"}],"FileSystemId":"PL"};
+            </script></body></html>
+            """
+        )
+
+        links = list(
+            iter_document_links(
+                document,
+                "https://docs.example.gov.uk/PublicAccess_LIVE/SearchResult/RunThirdPartySearch?FileSystemId=PL",
+            )
+        )
+
+        self.assertEqual(
+            links,
+            [("https://docs.example.gov.uk/PublicAccess_LIVE/Document/ViewDocument?id=ABC123", "Site layout.pdf")],
+        )
+
+    def test_fetch_publisher_document_list_reads_ajax_rows(self) -> None:
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return (
+                    b'{"data":[["Application Form","25/05/2022","","APPLICATION FORM REDACTED",'
+                    b'"/docs/A29775F9/Document-A29775F9.pdf",""]],"serviceError":null}'
+                )
+
+        class FakeOpener:
+            def open(self, request, timeout):
+                self.request_url = request.full_url
+                return FakeResponse()
+
+        opener = FakeOpener()
+        documents = fetch_publisher_document_list(
+            '"url": "/publisher/mvc/getDocumentList;jsessionid=abc"',
+            "https://app.example.gov.uk/planningdocuments=22%2F001",
+            opener,
+        )
+
+        self.assertEqual(len(documents), 1)
+        self.assertEqual(documents[0].title, "APPLICATION FORM REDACTED")
+        self.assertEqual(documents[0].url, "https://app.example.gov.uk/docs/A29775F9/Document-A29775F9.pdf")
+        self.assertEqual(documents[0].source_url, "https://app.example.gov.uk/planningdocuments=22%2F001")
+
+    def test_document_download_follows_html_intermediate_page(self) -> None:
+        class FakeResponse:
+            def __init__(self, url: str, payload: bytes, content_type: str) -> None:
+                self._url = url
+                self._payload = payload
+                self.headers = {"Content-Type": content_type}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return self._payload
+
+            def geturl(self) -> str:
+                return self._url
+
+        class FakeOpener:
+            def __init__(self) -> None:
+                self.urls: list[str] = []
+
+            def open(self, request, timeout):
+                self.urls.append(request.full_url)
+                if request.full_url.endswith("/viewer"):
+                    return FakeResponse(
+                        request.full_url,
+                        b'<html><body><a href="/download/file.pdf">Download file</a></body></html>',
+                        "text/html",
+                    )
+                return FakeResponse(request.full_url, b"%PDF-1.4", "application/pdf")
+
+        document = PlanningDocument(title="Viewer", url="https://planning.example.gov.uk/viewer")
+        opener = FakeOpener()
+
+        with patch("lead_generator.planning.leads.build_opener", return_value=opener):
+            payload = download_document_bytes(document)
+
+        self.assertEqual(payload, b"%PDF-1.4")
+        self.assertEqual(opener.urls, ["https://planning.example.gov.uk/viewer", "https://planning.example.gov.uk/download/file.pdf"])
+
+    def test_document_filename_uses_downloaded_content_type_when_title_has_no_extension(self) -> None:
+        filename = document_filename(
+            PlanningDocument(title="Planning statement", url="https://planning.example.gov.uk/download?id=1"),
+            DownloadedFile(payload=b"%PDF-1.4", final_url="https://planning.example.gov.uk/download?id=1", content_type="application/pdf"),
+            fallback="document-1",
+        )
+
+        self.assertEqual(filename, "Planning statement.pdf")
 
     def test_fetch_json_waits_and_retries_after_rate_limit(self) -> None:
         class FakeResponse:

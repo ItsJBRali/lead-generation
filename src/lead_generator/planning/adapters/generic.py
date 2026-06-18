@@ -230,6 +230,7 @@ class GenericLabelledPlanningScraper(PlanningScraper):
                     url=absolute_url,
                     date_published=parse_council_date(self._first_date(row_text)),
                     description=self._document_description(row_text, anchor),
+                    source_url=page_url,
                 )
             )
 

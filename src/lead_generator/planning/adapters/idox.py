@@ -146,6 +146,7 @@ class IdoxPublicAccessScraper(PlanningScraper):
                 title=title, url=absolute_url, document_type=metadata.get("document_type"),
                 date_published=parse_council_date(metadata.get("date_published")),
                 file_size=metadata.get("file_size"), description=metadata.get("description"),
+                source_url=page_url,
             ))
         return documents
 
