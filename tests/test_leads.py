@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+import ssl
 import threading
 import tempfile
 import unittest
 from datetime import date
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from pathlib import Path
 from unittest.mock import patch
 
@@ -340,7 +341,7 @@ class LeadSearchTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             opener = FakeOpener()
             with (
-                patch("lead_generator.planning.leads.build_opener", return_value=opener),
+                patch("lead_generator.planning.leads._build_document_opener", return_value=opener),
                 patch("lead_generator.planning.leads.sleep"),
             ):
                 downloaded = download_pdf_documents([document], Path(directory))
@@ -384,10 +385,45 @@ class LeadSearchTest(unittest.TestCase):
             source_url="https://planning.example.gov.uk/online-applications/applicationDetails.do?activeTab=documents&keyVal=ABC123",
         )
 
-        with patch("lead_generator.planning.leads.build_opener", return_value=FakeOpener()):
+        with patch("lead_generator.planning.leads._build_document_opener", return_value=FakeOpener()):
             payload = download_document_bytes(document)
 
         self.assertEqual(payload, b"%PDF-1.4")
+
+    def test_document_download_retries_with_tls_fallback_after_certificate_error(self) -> None:
+        class FakeResponse:
+            headers = {"Content-Type": "application/pdf"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return b"%PDF-1.4"
+
+        class FailingOpener:
+            def open(self, request, timeout):
+                raise URLError(ssl.SSLCertVerificationError("certificate has expired"))
+
+        class SuccessOpener:
+            def open(self, request, timeout):
+                return FakeResponse()
+
+        document = PlanningDocument(
+            title="Decision notice.pdf",
+            url="https://documents.example.gov.uk/PublicAccess_LIVE/Document/ViewDocument?id=ABC123",
+        )
+
+        with patch(
+            "lead_generator.planning.leads._build_document_opener",
+            side_effect=[FailingOpener(), SuccessOpener()],
+        ) as opener_factory:
+            payload = download_document_bytes(document)
+
+        self.assertEqual(payload, b"%PDF-1.4")
+        self.assertEqual(opener_factory.call_count, 2)
 
     def test_document_download_candidates_add_idox_module_download_url(self) -> None:
         candidates = document_download_candidates(
@@ -505,7 +541,7 @@ class LeadSearchTest(unittest.TestCase):
         document = PlanningDocument(title="Viewer", url="https://planning.example.gov.uk/viewer")
         opener = FakeOpener()
 
-        with patch("lead_generator.planning.leads.build_opener", return_value=opener):
+        with patch("lead_generator.planning.leads._build_document_opener", return_value=opener):
             payload = download_document_bytes(document)
 
         self.assertEqual(payload, b"%PDF-1.4")
@@ -579,7 +615,7 @@ class LeadSearchTest(unittest.TestCase):
 
         opener = FakeOpener()
         with (
-            patch("lead_generator.planning.leads.build_opener", return_value=opener),
+            patch("lead_generator.planning.leads._build_document_opener", return_value=opener),
             patch("lead_generator.planning.leads.sleep") as sleep_mock,
         ):
             payload = download_document_bytes(document)

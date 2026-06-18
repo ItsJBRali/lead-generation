@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import re
+import ssl
 import threading
 from collections import deque
 from dataclasses import dataclass
@@ -14,9 +15,9 @@ from importlib import resources
 from pathlib import Path
 from time import sleep
 from typing import Callable, Iterable
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlsplit, urlunsplit
-from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
+from urllib.request import HTTPSHandler, HTTPCookieProcessor, Request, build_opener, urlopen
 
 from lxml import html
 
@@ -333,7 +334,7 @@ def enrich_planit_application(application: PlanningApplication) -> PlanningAppli
 
 
 def fetch_planit_documents(docs_url: str) -> list[PlanningDocument]:
-    opener = build_opener(HTTPCookieProcessor(CookieJar()))
+    opener = _build_document_opener()
     text, page_url = _fetch_html_with_portal_session(docs_url, opener, timeout=45)
     document = html.fromstring(text)
     documents: list[PlanningDocument] = []
@@ -462,7 +463,8 @@ def download_document_bytes(document: PlanningDocument) -> bytes:
 
 def _download_document_file(document: PlanningDocument) -> DownloadedFile:
     last_error: Exception | None = None
-    opener = build_opener(HTTPCookieProcessor(CookieJar()))
+    opener = _build_document_opener()
+    verify_tls = True
     source_candidates: list[str] = []
     if document.source_url:
         source_candidates = source_document_candidates(document, opener)
@@ -503,6 +505,14 @@ def _download_document_file(document: PlanningDocument) -> DownloadedFile:
                 sleep(_retry_delay_seconds(exc, 5.0 * (attempt + 1)))
             except Exception as exc:
                 last_error = exc
+                if verify_tls and _is_tls_certificate_error(exc):
+                    verify_tls = False
+                    opener = _build_document_opener(verify_tls=False)
+                    if document.source_url:
+                        pending.extendleft(reversed(source_document_candidates(document, opener)))
+                    seen.discard(url)
+                    pending.appendleft(url)
+                    break
                 break
     raise last_error or RuntimeError(f"Could not download {document.url}")
 
@@ -924,6 +934,13 @@ def _open_url_with_retry(request: Request, *, timeout: float, opener=None):
     raise RuntimeError(f"Could not fetch {request.full_url}")
 
 
+def _build_document_opener(*, verify_tls: bool = True):
+    handlers = [HTTPCookieProcessor(CookieJar())]
+    if not verify_tls:
+        handlers.append(HTTPSHandler(context=ssl._create_unverified_context()))
+    return build_opener(*handlers)
+
+
 def _fetch_html_with_portal_session(url: str, opener, *, timeout: float) -> tuple[str, str]:
     request = Request(url, headers={"User-Agent": USER_AGENT})
     with _open_url_with_retry(request, timeout=timeout, opener=opener) as response:
@@ -1009,6 +1026,15 @@ def _looks_like_downloadable_document(document: PlanningDocument) -> bool:
             or (document.document_type or "").casefold() in {"pdf", "document", "drawing", "plan", "supporting_document"}
         )
     )
+
+
+def _is_tls_certificate_error(exc: Exception) -> bool:
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        return True
+    if isinstance(exc, URLError):
+        reason = exc.reason
+        return isinstance(reason, ssl.SSLCertVerificationError) or "certificate" in str(reason).casefold()
+    return "certificate" in str(exc).casefold() and "ssl" in str(exc).casefold()
 
 
 def _comparable_title(value: str | None) -> str:
