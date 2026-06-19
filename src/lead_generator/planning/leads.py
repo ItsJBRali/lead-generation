@@ -34,6 +34,7 @@ from lead_generator.planning.adapters import (
     OcellaPlanningScraper,
     PlanningScraper,
 )
+from lead_generator.planning.adapters.civica import fetch_civica_documents_from_raw
 from lead_generator.planning.adapters.generic import GenericCouncilConfig, GenericLabelledPlanningScraper
 from lead_generator.planning.models import PlanningApplication, PlanningDocument
 from lead_generator.planning.parsing import clean_text
@@ -368,10 +369,11 @@ def discover_portal_applications(target: CouncilTarget, start_date: date, end_da
     seen: set[str] = set()
     for stub in discovery.applications:
         application = stub
-        try:
-            application = scraper.fetch_application(stub.uid, stub.url, include_documents=True)
-        except Exception as exc:
-            stub.raw = {**(stub.raw or {}), "detail_fetch_error": str(exc)}
+        if not (stub.raw or {}).get("detail_complete"):
+            try:
+                application = scraper.fetch_application(stub.uid, stub.url, include_documents=False)
+            except Exception as exc:
+                stub.raw = {**(stub.raw or {}), "detail_fetch_error": str(exc)}
         application = with_portal_metadata(application, stub, target, discovery.source_url)
         key = application.reference or application.uid or application.url
         if key in seen:
@@ -506,6 +508,10 @@ def enrich_planit_application(application: PlanningApplication) -> PlanningAppli
 
 def enrich_application_documents(application: PlanningApplication) -> PlanningApplication:
     if application.documents:
+        return application
+    civica_documents = fetch_civica_documents_from_raw(application.raw or {}, source_url=application.url)
+    if civica_documents:
+        application.documents = civica_documents
         return application
     documents: list[PlanningDocument] = []
     seen: set[str] = set()
@@ -766,6 +772,7 @@ def _download_document_file(document: PlanningDocument) -> DownloadedFile:
         request = Request(url, headers=headers)
         for attempt in range(4):
             try:
+                _throttle_request(url)
                 with opener.open(request, timeout=30) as response:
                     payload = response.read()
                     content_type = response.headers.get("Content-Type", "").lower()
@@ -788,6 +795,7 @@ def _download_document_file(document: PlanningDocument) -> DownloadedFile:
                 if exc.code not in RATE_LIMIT_HTTP_CODES or attempt == 3:
                     raise
                 sleep(_retry_delay_seconds(exc, 5.0 * (attempt + 1)))
+                _skip_next_throttle(url)
             except Exception as exc:
                 last_error = exc
                 if not tls_compat and _is_tls_compatibility_error(exc):

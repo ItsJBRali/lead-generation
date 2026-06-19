@@ -87,6 +87,7 @@ class CouncilHttpClient:
             data=encoded,
             headers={
                 "User-Agent": self.user_agent,
+                "Accept": "application/json",
                 "Content-Type": "application/json",
             },
             method="POST",

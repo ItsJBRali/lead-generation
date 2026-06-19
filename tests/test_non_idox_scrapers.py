@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+from datetime import date
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from lead_generator.planning.http import FetchResponse
 from lead_generator.planning.adapters.agile import AgileCouncilConfig, AgilePlanningScraper
-from lead_generator.planning.adapters.civica import CivicaCouncilConfig, CivicaPlanningScraper
+from lead_generator.planning.adapters.civica import (
+    CivicaCouncilConfig,
+    CivicaPlanningScraper,
+    fetch_civica_documents_from_raw,
+)
 from lead_generator.planning.adapters.northgate import (
     NorthgateCouncilConfig,
     NorthgatePlanningScraper,
@@ -20,6 +26,22 @@ class FakeJsonHttpClient:
         self.posted: list[tuple[str, object]] = []
 
     def get(self, url: str, params: dict[str, str] | None = None) -> FetchResponse:
+        if "getsearchcriteria" in url:
+            return FetchResponse(
+                url=url,
+                status_code=200,
+                text="""
+                {
+                  "RefType": "GFPlanning",
+                  "SearchItems": [
+                    {"DataType": "D", "Display": {"FieldName": "SDate5From", "Label": "Date Received (From)", "Value": ""}},
+                    {"DataType": "D", "Display": {"FieldName": "SDate5To", "Label": "Date Received (To)", "Value": ""}},
+                    {"DataType": "D", "Display": {"FieldName": "SDate1From", "Label": "Date Valid (From)", "Value": ""}},
+                    {"DataType": "D", "Display": {"FieldName": "SDate1To", "Label": "Date Valid (To)", "Value": ""}}
+                  ]
+                }
+                """,
+            )
         return FetchResponse(
             url=url,
             status_code=200,
@@ -48,6 +70,57 @@ class FakeJsonHttpClient:
                 "ward_text": "Chew Valley",
                 "parish_text": "Chew Magna"
               }
+            }
+            """,
+        )
+
+
+class FakeCivicaKeyObjectHttpClient:
+    def __init__(self) -> None:
+        self.posted: list[tuple[str, object]] = []
+
+    def get(self, url: str, params: dict[str, str] | None = None) -> FetchResponse:
+        return FetchResponse(
+            url=url,
+            status_code=200,
+            text="""
+            <script>
+              Civica.APIUrl="/w2webparts/Resource/Civica/Handler.ashx/";
+              Civica.KeyObjectViewerUrl="/my-requests/keyobject-viewer/";
+              Civica.PortalSettings={"PlanningApplicationRefType":"GFPlanning"};
+            </script>
+            """,
+        )
+
+    def post_json(self, url: str, data: object) -> FetchResponse:
+        self.posted.append((url, data))
+        return FetchResponse(
+            url=url,
+            status_code=200,
+            text="""
+            {
+              "KeyObjects": [
+                {
+                  "KeyNumber": "549349",
+                  "KeyObjectType": "GFPlanning",
+                  "KeyText": "Subject",
+                  "Items": [
+                    {"FieldName": "SDescription", "Label": "Case No", "Value": "WA/2026/01093"},
+                    {"FieldName": "SText1", "Label": "Applicant Name", "Value": "Jane Applicant"},
+                    {"FieldName": "SText2", "Label": "Agent Name", "Value": "Agent Ltd"},
+                    {"FieldName": "SText9", "Label": "Application Address", "Value": "Sadlers Petworth Road GU8 4UJ"},
+                    {"FieldName": "SText10", "Label": "Proposal", "Value": "Replacement entrance gates"},
+                    {"FieldName": "SDate1", "Label": "Date Valid", "Value": "18/06/2026"},
+                    {"FieldName": "SDate5", "Label": "Date Received", "Value": "18/05/2026"},
+                    {"FieldName": "SPicklist2", "Label": "Decision", "Value": "PENDING"},
+                    {"FieldName": "SPicklist3", "Label": "Case Officer", "Value": "A Planner"},
+                    {"FieldName": "APicklist2", "Label": "Ward", "Value": "Chiddingfold"},
+                    {"FieldName": "APicklist3", "Label": "Parish", "Value": "Chiddingfold"},
+                    {"FieldName": "AText6", "Label": "Postcode", "Value": "GU8 4UJ"}
+                  ]
+                }
+              ],
+              "TotalRows": 1
             }
             """,
         )
@@ -100,6 +173,71 @@ class NonIdoxScraperTest(unittest.TestCase):
         self.assertEqual(application.status, "Pending Consideration")
         self.assertEqual(application.date_received, "2026-05-15")
         self.assertEqual(application.date_validated, "2026-05-21")
+
+    def test_civica_keyobject_json_search_uses_received_dates(self) -> None:
+        http = FakeCivicaKeyObjectHttpClient()
+        scraper = CivicaPlanningScraper(
+            CivicaCouncilConfig("Example Civica Council", "https://planning.example.gov.uk/planning"),
+            http_client=http,
+        )
+
+        discovery = scraper.discover_ids(
+            listing_url="https://planning.example.gov.uk/planning/search-applications",
+            start_date=date(2026, 6, 1),
+            end_date=date(2026, 6, 30),
+        )
+
+        payload = http.posted[0][1]
+        self.assertEqual(http.posted[0][0], "https://planning.example.gov.uk/w2webparts/Resource/Civica/Handler.ashx/keyobject/pagedsearch")
+        self.assertEqual(payload["searchFields"]["SDate5From"], "01/06/2026")
+        self.assertEqual(payload["searchFields"]["SDate5To"], "30/06/2026")
+        application = discovery.applications[0]
+        self.assertEqual(application.uid, "549349")
+        self.assertEqual(application.reference, "WA/2026/01093")
+        self.assertEqual(application.date_received, "2026-05-18")
+        self.assertEqual(application.description, "Replacement entrance gates")
+        self.assertIn("keyobject-viewer", application.url)
+        self.assertTrue(application.raw["detail_complete"])
+
+    def test_civica_documents_from_raw_builds_download_links(self) -> None:
+        class FakeDocumentHttpClient:
+            def post_json(self, url: str, data: object) -> FetchResponse:
+                self.url = url
+                self.data = data
+                return FetchResponse(
+                    url=url,
+                    status_code=200,
+                    text="""
+                    {
+                      "CompleteDocument": [
+                        {
+                          "DocNo": "9510757",
+                          "Title": "Existing and Proposed Gates.pdf",
+                          "DocDesc": "Elevations",
+                          "DocCategory": "Plans",
+                          "DocDate": "2026-06-18T17:00:32.0000000"
+                        }
+                      ]
+                    }
+                    """,
+                )
+
+        fake_http = FakeDocumentHttpClient()
+        with patch("lead_generator.planning.adapters.civica.CouncilHttpClient", return_value=fake_http):
+            documents = fetch_civica_documents_from_raw(
+                {
+                    "civica_api_url": "https://planning.example.gov.uk/w2webparts/Resource/Civica/Handler.ashx/",
+                    "key_number": "549349",
+                    "key_text": "Subject",
+                    "ref_type": "GFPlanning",
+                },
+                source_url="https://planning.example.gov.uk/my-requests/keyobject-viewer/?KeyNo=549349",
+            )
+
+        self.assertEqual(fake_http.data["KeyNumb"], "549349")
+        self.assertEqual(documents[0].title, "Existing and Proposed Gates.pdf")
+        self.assertEqual(documents[0].date_published, "2026-06-18")
+        self.assertIn("Doc/pagestream", documents[0].url)
 
     def test_agile_listing_and_detail(self) -> None:
         scraper = AgilePlanningScraper(
