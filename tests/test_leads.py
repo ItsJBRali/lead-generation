@@ -141,6 +141,24 @@ class LeadSearchTest(unittest.TestCase):
             )
         )
 
+    def test_application_matches_uses_validated_date_when_received_date_missing(self) -> None:
+        application = PlanningApplication(
+            authority="Example",
+            uid="1",
+            url="https://example.test",
+            description="Installation of gates",
+            date_validated="2026-06-12",
+        )
+
+        self.assertTrue(
+            application_matches(
+                application,
+                date(2026, 6, 1),
+                date(2026, 6, 30),
+                ["installation of gates"],
+            )
+        )
+
     def test_application_in_geojson_requires_point_inside_user_boundary(self) -> None:
         user_geojson = {
             "type": "FeatureCollection",

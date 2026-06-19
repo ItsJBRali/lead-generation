@@ -230,7 +230,7 @@ def run_lead_search(
                             "Reference": application.reference or application.uid,
                             "application link": application_link(application),
                             "proposal": application.description or "",
-                            "date received": application.date_received or "",
+                            "date received": application.date_received or application.date_validated or "",
                             "council": target.authority,
                         }
                     )
@@ -379,8 +379,9 @@ def discover_portal_applications(target: CouncilTarget, start_date: date, end_da
         if key in seen:
             continue
         seen.add(key)
-        if application.date_received:
-            received = _parse_iso_date(application.date_received)
+        application_date = application.date_received or application.date_validated
+        if application_date:
+            received = _parse_iso_date(application_date)
             if received is not None and (received < start_date or received > end_date):
                 continue
         applications.append(application)
@@ -643,7 +644,7 @@ def application_matches(
     end_date: date,
     keywords: list[str],
 ) -> bool:
-    received = _parse_iso_date(application.date_received)
+    received = _parse_iso_date(application.date_received or application.date_validated)
     if received is None or received < start_date or received > end_date:
         return False
     raw_text = " ".join(str(value) for value in application.raw.values()) if application.raw else ""

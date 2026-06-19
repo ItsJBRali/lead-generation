@@ -51,6 +51,7 @@ class CouncilHttpClient:
         self.retries = retries
         self.verify_tls = verify_tls
         self.ca_file = ca_file
+        self._tls_compat = False
         self._last_request_at = 0.0
         self._cookies = CookieJar()
 
@@ -116,6 +117,14 @@ class CouncilHttpClient:
                     raise CouncilFetchError(f"HTTP {exc.code} while fetching {url}") from exc
                 last_error = exc
             except URLError as exc:
+                if self.verify_tls and _is_tls_certificate_error(exc):
+                    self.verify_tls = False
+                    last_error = exc
+                    continue
+                if not self._tls_compat and _is_tls_compatibility_error(exc):
+                    self._tls_compat = True
+                    last_error = exc
+                    continue
                 if attempt == self.retries:
                     raise CouncilFetchError(f"Network error while fetching {url}: {exc.reason}") from exc
                 last_error = exc
@@ -136,7 +145,10 @@ class CouncilHttpClient:
         if not self.verify_tls:
             return ssl._create_unverified_context()
         cafile = self.ca_file or certifi.where()
-        return ssl.create_default_context(cafile=cafile)
+        context = ssl.create_default_context(cafile=cafile)
+        if self._tls_compat:
+            context.set_ciphers("DEFAULT:@SECLEVEL=1")
+        return context
 
     def _opener(self):
         handlers = [HTTPCookieProcessor(self._cookies)]
@@ -160,6 +172,31 @@ def _retry_delay_seconds(exc: HTTPError, attempt: int) -> float:
             except (TypeError, ValueError, OverflowError):
                 pass
     return min(2.0 * (attempt + 1), 10.0)
+
+
+def _is_tls_certificate_error(exc: Exception) -> bool:
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        return True
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        return True
+    text = f"{reason or ''} {exc}".casefold()
+    return "certificate" in text and "ssl" in text
+
+
+def _is_tls_compatibility_error(exc: Exception) -> bool:
+    reason = getattr(exc, "reason", None)
+    text = f"{reason or ''} {exc}".casefold()
+    return "ssl" in text and any(
+        token in text
+        for token in (
+            "dh key too small",
+            "legacy sigalg disallowed",
+            "unsafe legacy renegotiation",
+            "tlsv1 alert protocol version",
+            "wrong version number",
+        )
+    )
 
 
 def _disclaimer_accept_url(response: FetchResponse) -> str | None:
