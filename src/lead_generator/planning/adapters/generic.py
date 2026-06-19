@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import date
 from urllib.parse import parse_qs, urljoin, urlsplit
 
 from lxml import html
@@ -33,6 +34,7 @@ GENERIC_LABEL_MAP = {
     "development_address": "address",
     "address": "address",
     "location": "address",
+    "location_address": "address",
     "site_location": "address",
     "location_of_development": "address",
     "proposal": "description",
@@ -46,9 +48,13 @@ GENERIC_LABEL_MAP = {
     "decision": "decision",
     "decision_type": "decision",
     "date_received": "date_received",
+    "application_received": "date_received",
+    "application_received_date": "date_received",
     "received_date": "date_received",
     "received": "date_received",
     "valid_date": "date_validated",
+    "application_valid": "date_validated",
+    "application_valid_date": "date_validated",
     "date_validated": "date_validated",
     "validated_date": "date_validated",
     "validated": "date_validated",
@@ -95,10 +101,12 @@ class GenericLabelledPlanningScraper(PlanningScraper):
         self,
         *,
         listing_url: str,
+        start_date: date | None = None,
+        end_date: date | None = None,
         limit: int | None = None,
         **_: object,
     ) -> DiscoveryResult:
-        response = self.http.get(listing_url)
+        response = self._fetch_listing(listing_url, start_date=start_date, end_date=end_date)
         applications = self.parse_listing(response.text, response.url)
         if limit is not None:
             applications = applications[:limit]
@@ -107,6 +115,32 @@ class GenericLabelledPlanningScraper(PlanningScraper):
             source_url=response.url,
             applications=applications,
         )
+
+    def _fetch_listing(self, listing_url: str, *, start_date: date | None = None, end_date: date | None = None):
+        response = self.http.get(listing_url)
+        if not (start_date or end_date):
+            return response
+        document = html.fromstring(response.text)
+        forms = document.xpath(
+            "//form[.//input[@name='DateReceivedFrom'] or .//input[@name='DateReceivedTo'] "
+            "or .//input[@name='DateValidFrom'] or .//input[@name='DateValidTo']]"
+        )
+        if not forms:
+            return response
+        form = forms[-1]
+        data = self._form_defaults(form)
+        if start_date:
+            data[self._date_field(data, "DateReceivedFrom", "DateValidFrom")] = start_date.strftime("%d/%m/%Y")
+        if end_date:
+            data[self._date_field(data, "DateReceivedTo", "DateValidTo")] = end_date.strftime("%d/%m/%Y")
+        if "SearchPlanning" in data:
+            data["SearchPlanning"] = "true"
+        data["Outstanding"] = data.get("Outstanding") or "false"
+        action = form.get("action") or listing_url
+        return self.http.post_form(urljoin(response.url, action), data)
+
+    def _date_field(self, data: dict[str, str], preferred: str, fallback: str) -> str:
+        return preferred if preferred in data else fallback
 
     def fetch_application(
         self,
@@ -171,7 +205,7 @@ class GenericLabelledPlanningScraper(PlanningScraper):
         for label, value in fields.items():
             raw[label] = value
             model_field = label_map.get(normalize_label(label))
-            if model_field and value:
+            if model_field and value and model_field not in mapped:
                 mapped[model_field] = value
 
         for date_field in ("date_received", "date_validated"):
@@ -239,14 +273,20 @@ class GenericLabelledPlanningScraper(PlanningScraper):
     def _extract_uid(self, url_or_href: str | None) -> str | None:
         if not url_or_href:
             return None
-        query = parse_qs(urlsplit(url_or_href).query)
+        parts = urlsplit(url_or_href)
+        query = parse_qs(parts.query)
         for param in self.config.uid_query_params:
             value = query.get(param)
             if value and value[0]:
                 return value[0]
+        path_match = re.search(r"/(?:planning/)?(?:display|application|details?)/([A-Z0-9][A-Z0-9/.-]{3,})/?$", parts.path, flags=re.IGNORECASE)
+        if path_match:
+            return path_match.group(1)
         return self._extract_reference_from_text(url_or_href)
 
     def _looks_like_application_link(self, href: str | None, anchor: html.HtmlElement) -> bool:
+        if not href or href.startswith("#"):
+            return False
         text = clean_text(" ".join(anchor.itertext())) or ""
         combined = f"{href or ''} {text}".lower()
         if any(marker in combined for marker in self.config.detail_markers):
@@ -270,7 +310,7 @@ class GenericLabelledPlanningScraper(PlanningScraper):
             reference = self._extract_reference_from_text(value)
             if reference:
                 return reference
-        return anchor_text
+        return None
 
     def _extract_reference_from_text(self, value: str | None) -> str | None:
         if not value:
@@ -322,6 +362,27 @@ class GenericLabelledPlanningScraper(PlanningScraper):
 
         self._extract_sequential_text_fields(document, fields)
         return fields
+
+    def _form_defaults(self, form: html.HtmlElement) -> dict[str, str]:
+        data: dict[str, str] = {}
+        for input_node in form.xpath(".//input[@name]"):
+            name = input_node.get("name")
+            input_type = (input_node.get("type") or "text").lower()
+            if input_type in {"submit", "button", "image", "reset"}:
+                continue
+            if input_type in {"radio", "checkbox"} and input_node.get("checked") is None:
+                continue
+            if input_type == "hidden" and name in data and (input_node.get("value") or "").casefold() == "false":
+                continue
+            data[name] = input_node.get("value") or ""
+        for select in form.xpath(".//select[@name]"):
+            chosen = select.xpath(".//option[@selected]") or select.xpath(".//option")[:1]
+            if chosen:
+                option_value = chosen[0].get("value")
+                data[select.get("name")] = option_value if option_value is not None else clean_text(" ".join(chosen[0].itertext())) or ""
+        for textarea in form.xpath(".//textarea[@name]"):
+            data[textarea.get("name")] = clean_text(" ".join(textarea.itertext())) or ""
+        return data
 
     def _extract_sequential_text_fields(
         self,

@@ -18,6 +18,7 @@ from lead_generator.planning.leads import (
     LeadSearchConfig,
     _fetch_json_with_retry,
     application_in_geojson,
+    application_matches_search_area,
     application_matches,
     application_link,
     document_source_url_from_application_url,
@@ -161,6 +162,19 @@ class LeadSearchTest(unittest.TestCase):
         self.assertTrue(application_in_geojson(inside, user_geojson))
         self.assertFalse(application_in_geojson(outside, user_geojson))
 
+    def test_application_matches_search_area_allows_portal_records_without_coordinates(self) -> None:
+        user_geojson = {
+            "type": "FeatureCollection",
+            "features": [polygon_feature("search area", 0, 0, 1, 1)],
+        }
+        application = PlanningApplication(
+            authority="Example",
+            uid="1",
+            url="https://example.test",
+        )
+
+        self.assertTrue(application_matches_search_area(application, user_geojson))
+
     def test_run_lead_search_writes_only_location_matched_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -224,7 +238,7 @@ class LeadSearchTest(unittest.TestCase):
                 ),
             ]
 
-            with patch("lead_generator.planning.leads.discover_planit_applications", return_value=applications):
+            with patch("lead_generator.planning.leads.discover_portal_applications", return_value=applications):
                 result = run_lead_search(config)
 
             self.assertEqual(result.leads_found, 1)
@@ -310,14 +324,15 @@ class LeadSearchTest(unittest.TestCase):
             all_started = threading.Event()
 
             def fake_discover(authority, start_date, end_date):
+                target = authority
                 with lock:
-                    started.append(authority)
+                    started.append(target.authority)
                     if len(started) >= 4:
                         all_started.set()
                 all_started.wait(timeout=1)
                 return []
 
-            with patch("lead_generator.planning.leads.discover_planit_applications", side_effect=fake_discover):
+            with patch("lead_generator.planning.leads.discover_portal_applications", side_effect=fake_discover):
                 result = run_lead_search(config)
 
             self.assertEqual(result.councils_completed, 4)

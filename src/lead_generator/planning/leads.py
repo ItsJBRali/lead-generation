@@ -21,6 +21,20 @@ from urllib.request import HTTPSHandler, HTTPCookieProcessor, Request, build_ope
 
 from lxml import html
 
+from lead_generator.planning.adapters import (
+    AgileCouncilConfig,
+    AgilePlanningScraper,
+    CivicaCouncilConfig,
+    CivicaPlanningScraper,
+    IdoxCouncilConfig,
+    IdoxPublicAccessScraper,
+    NorthgateCouncilConfig,
+    NorthgatePlanningScraper,
+    OcellaCouncilConfig,
+    OcellaPlanningScraper,
+    PlanningScraper,
+)
+from lead_generator.planning.adapters.generic import GenericCouncilConfig, GenericLabelledPlanningScraper
 from lead_generator.planning.models import PlanningApplication, PlanningDocument
 from lead_generator.planning.parsing import clean_text
 
@@ -89,6 +103,7 @@ _LAST_REQUEST_AT: dict[str, float] = {}
 class CouncilTarget:
     authority: str
     portal_family: str
+    scraper_type: str
     base_url: str
     listing_url: str | None
     geometry: dict[str, object]
@@ -195,7 +210,7 @@ def run_lead_search(
 
             _log(log, f"{name}: searching {target.authority} ({target.portal_family})")
             try:
-                applications = discover_planit_applications(target.authority, config.start_date, config.end_date)
+                applications = discover_portal_applications(target, config.start_date, config.end_date)
                 _log(log, f"{target.authority}: found {len(applications)} received applications in the date range")
                 matched_count = 0
                 for application in applications:
@@ -203,9 +218,9 @@ def run_lead_search(
                         break
                     if not application_matches(application, config.start_date, config.end_date, config.keywords):
                         continue
-                    if not application_in_geojson(application, user_geojson):
+                    if not application_matches_search_area(application, user_geojson):
                         continue
-                    application = enrich_planit_application(application)
+                    application = enrich_application_documents(application)
                     matched_count += 1
                     lead_folder = create_lead_folder(output_dir, target.authority, application)
                     download_pdf_documents(application.documents, lead_folder, log=log)
@@ -280,6 +295,7 @@ def select_overlapping_authorities(
             CouncilTarget(
                 authority=str(properties.get("authority") or properties.get("council_name")),
                 portal_family=str(properties.get("portal_family") or "unknown"),
+                scraper_type=str(properties.get("scraper_type") or properties.get("portal_family") or "unknown"),
                 base_url=str(properties.get("base_url") or ""),
                 listing_url=str(properties.get("listing_url") or properties.get("planning_url") or ""),
                 geometry=geometry,
@@ -299,6 +315,7 @@ def councils_to_geojson(targets: list[CouncilTarget]) -> str:
                     "properties": {
                         "authority": target.authority,
                         "portal_family": target.portal_family,
+                        "scraper_type": target.scraper_type,
                         "base_url": target.base_url,
                         "listing_url": target.listing_url,
                         "link_test_ok": target.link_test_ok,
@@ -310,6 +327,154 @@ def councils_to_geojson(targets: list[CouncilTarget]) -> str:
         },
         indent=2,
     )
+
+
+GENERIC_UID_QUERY_PARAMS = (
+    "id",
+    "uid",
+    "ref",
+    "reference",
+    "appNo",
+    "appno",
+    "caseNo",
+    "case",
+    "application",
+    "keyVal",
+    "KEYVAL",
+    "REFVAL",
+    "PARAM0",
+)
+
+GENERIC_DETAIL_MARKERS = (
+    "planning",
+    "application",
+    "details",
+    "detail",
+    "display",
+    "view",
+    "case",
+    "register",
+)
+
+
+def discover_portal_applications(target: CouncilTarget, start_date: date, end_date: date) -> list[PlanningApplication]:
+    scraper = planning_scraper_for_target(target)
+    listing_url = target.listing_url or None
+    if not listing_url and not isinstance(scraper, IdoxPublicAccessScraper):
+        raise ValueError("Council has no portal search URL")
+
+    discovery = scraper.discover_ids(listing_url=listing_url, start_date=start_date, end_date=end_date)
+    applications: list[PlanningApplication] = []
+    seen: set[str] = set()
+    for stub in discovery.applications:
+        application = stub
+        try:
+            application = scraper.fetch_application(stub.uid, stub.url, include_documents=True)
+        except Exception as exc:
+            stub.raw = {**(stub.raw or {}), "detail_fetch_error": str(exc)}
+        application = with_portal_metadata(application, stub, target, discovery.source_url)
+        key = application.reference or application.uid or application.url
+        if key in seen:
+            continue
+        seen.add(key)
+        if application.date_received:
+            received = _parse_iso_date(application.date_received)
+            if received is not None and (received < start_date or received > end_date):
+                continue
+        applications.append(application)
+    return applications
+
+
+def planning_scraper_for_target(target: CouncilTarget) -> PlanningScraper:
+    base_url = target_base_url(target)
+    scraper_type = (target.scraper_type or "").casefold()
+    family = (target.portal_family or "").casefold()
+    portal_key = f"{scraper_type} {family}"
+
+    if "idox" in portal_key:
+        return IdoxPublicAccessScraper(
+            IdoxCouncilConfig(
+                authority=target.authority,
+                base_url=base_url,
+                application_root=idox_application_root(target.listing_url),
+            )
+        )
+    if "ocella" in portal_key:
+        return OcellaPlanningScraper(OcellaCouncilConfig(authority=target.authority, base_url=base_url))
+    if "agile" in portal_key:
+        return AgilePlanningScraper(AgileCouncilConfig(authority=target.authority, base_url=base_url))
+    if "civica" in portal_key:
+        return CivicaPlanningScraper(CivicaCouncilConfig(authority=target.authority, base_url=base_url))
+    if "northgate" in portal_key or "planningexplorer" in portal_key:
+        return NorthgatePlanningScraper(NorthgateCouncilConfig(authority=target.authority, base_url=base_url))
+
+    generic_family = family if family and family != "unknown" else (scraper_type or "generic")
+    return GenericLabelledPlanningScraper(
+        GenericCouncilConfig(
+            authority=target.authority,
+            base_url=base_url,
+            family=generic_family,
+            uid_query_params=GENERIC_UID_QUERY_PARAMS,
+            detail_markers=GENERIC_DETAIL_MARKERS,
+        )
+    )
+
+
+def target_base_url(target: CouncilTarget) -> str:
+    if target.base_url:
+        return target.base_url.rstrip("/")
+    if target.listing_url:
+        parts = urlsplit(target.listing_url)
+        if parts.scheme and parts.netloc:
+            return f"{parts.scheme}://{parts.netloc}"
+    raise ValueError("Council has no portal base URL")
+
+
+def idox_application_root(listing_url: str | None) -> str:
+    if not listing_url:
+        return "/online-applications/"
+    path = urlsplit(listing_url).path
+    marker = "search.do"
+    if marker not in path:
+        return "/online-applications/"
+    root = path[: path.index(marker)]
+    return root if root.startswith("/") and root.endswith("/") else "/online-applications/"
+
+
+def with_portal_metadata(
+    application: PlanningApplication,
+    stub: PlanningApplication,
+    target: CouncilTarget,
+    source_url: str,
+) -> PlanningApplication:
+    for field in (
+        "reference",
+        "address",
+        "description",
+        "status",
+        "decision",
+        "date_received",
+        "date_validated",
+        "applicant_name",
+        "agent_name",
+        "case_officer",
+        "ward",
+        "parish",
+        "postcode",
+    ):
+        if not getattr(application, field) and getattr(stub, field):
+            setattr(application, field, getattr(stub, field))
+    application.raw = {
+        **(stub.raw or {}),
+        **(application.raw or {}),
+        "portal_family": target.portal_family,
+        "scraper_type": target.scraper_type,
+        "portal_url": application.url or stub.url,
+        "source_url": source_url,
+    }
+    if not application.source_url:
+        application.source_url = source_url
+    return application
 
 
 def discover_planit_applications(authority: str, start_date: date, end_date: date) -> list[PlanningApplication]:
@@ -336,9 +501,15 @@ def discover_planit_applications(authority: str, start_date: date, end_date: dat
 
 
 def enrich_planit_application(application: PlanningApplication) -> PlanningApplication:
+    return enrich_application_documents(application)
+
+
+def enrich_application_documents(application: PlanningApplication) -> PlanningApplication:
+    if application.documents:
+        return application
     documents: list[PlanningDocument] = []
     seen: set[str] = set()
-    for docs_url in planit_document_source_urls(application):
+    for docs_url in application_document_source_urls(application):
         try:
             fetched = fetch_planit_documents(docs_url)
         except Exception:
@@ -356,6 +527,10 @@ def enrich_planit_application(application: PlanningApplication) -> PlanningAppli
 
 
 def planit_document_source_urls(application: PlanningApplication) -> list[str]:
+    return application_document_source_urls(application)
+
+
+def application_document_source_urls(application: PlanningApplication) -> list[str]:
     candidates: list[str] = []
 
     def add(value: object, *, allow_listing: bool = False) -> None:
@@ -479,6 +654,12 @@ def application_in_geojson(application: PlanningApplication, user_geojson: dict[
     if not point:
         return False
     return any(point_in_geometry(point, geometry) for geometry in iter_feature_geometries(user_geojson))
+
+
+def application_matches_search_area(application: PlanningApplication, user_geojson: dict[str, object]) -> bool:
+    if not application_point(application):
+        return True
+    return application_in_geojson(application, user_geojson)
 
 
 def application_point(application: PlanningApplication) -> tuple[float, float] | None:

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from http.cookiejar import CookieJar
 from dataclasses import dataclass
 import json
+import re
 import ssl
 from time import monotonic, sleep
+from email.utils import parsedate_to_datetime
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urljoin
 from urllib.request import (
     HTTPCookieProcessor,
     HTTPSHandler,
@@ -57,7 +60,12 @@ class CouncilHttpClient:
             url = f"{url}{separator}{urlencode(params)}"
 
         request = Request(url, headers={"User-Agent": self.user_agent})
-        return self._send(request, url)
+        response = self._send(request, url)
+        accept_url = _disclaimer_accept_url(response)
+        if accept_url:
+            self.post_form(accept_url, {})
+            response = self._send(request, url)
+        return response
 
     def post_form(self, url: str, data: dict[str, str]) -> FetchResponse:
         encoded = urlencode(data).encode("utf-8")
@@ -99,6 +107,10 @@ class CouncilHttpClient:
                         text=body,
                     )
             except HTTPError as exc:
+                if exc.code in {429, 503} and attempt < self.retries:
+                    last_error = exc
+                    sleep(_retry_delay_seconds(exc, attempt))
+                    continue
                 if exc.code < 500 or attempt == self.retries:
                     raise CouncilFetchError(f"HTTP {exc.code} while fetching {url}") from exc
                 last_error = exc
@@ -131,3 +143,28 @@ class CouncilHttpClient:
         if context is not None:
             handlers.append(HTTPSHandler(context=context))
         return build_opener(*handlers)
+
+
+def _retry_delay_seconds(exc: HTTPError, attempt: int) -> float:
+    retry_after = exc.headers.get("Retry-After") if exc.headers else None
+    if retry_after:
+        try:
+            return min(max(float(retry_after), 0.0), 20.0)
+        except ValueError:
+            try:
+                retry_time = parsedate_to_datetime(retry_after)
+                if retry_time.tzinfo is None:
+                    retry_time = retry_time.replace(tzinfo=timezone.utc)
+                return min(max((retry_time - datetime.now(timezone.utc)).total_seconds(), 0.0), 20.0)
+            except (TypeError, ValueError, OverflowError):
+                pass
+    return min(2.0 * (attempt + 1), 10.0)
+
+
+def _disclaimer_accept_url(response: FetchResponse) -> str | None:
+    if "disclaimer" not in response.url.casefold() and "disclaimer" not in response.text[:2000].casefold():
+        return None
+    match = re.search(r"<form[^>]+action=[\"']([^\"']*Disclaimer/Accept[^\"']*)[\"']", response.text, flags=re.IGNORECASE)
+    if not match:
+        return None
+    return urljoin(response.url, match.group(1))

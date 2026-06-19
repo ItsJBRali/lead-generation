@@ -43,7 +43,12 @@ class IdoxPublicAccessScraper(PlanningScraper):
         self.http = http_client or CouncilHttpClient()
 
     def discover_ids(self, *, listing_url: str | None = None, start_date: date | None = None, end_date: date | None = None, limit: int | None = None) -> DiscoveryResult:
-        response = self.http.get(listing_url) if listing_url else self._fetch_weekly_list(start_date=start_date, end_date=end_date)
+        if listing_url and (start_date or end_date):
+            response = self._fetch_advanced_search(listing_url, start_date=start_date, end_date=end_date)
+        elif listing_url:
+            response = self.http.get(listing_url)
+        else:
+            response = self._fetch_weekly_list(start_date=start_date, end_date=end_date)
         applications = self.parse_listing(response.text, response.url)
         if limit is not None:
             applications = applications[:limit]
@@ -161,6 +166,28 @@ class IdoxPublicAccessScraper(PlanningScraper):
         data.setdefault("searchType", "Application")
         data.setdefault("dateType", "DC_Validated")
         return self.http.post_form(urljoin(response.url, form.get("action")), data)
+
+    def _fetch_advanced_search(self, listing_url: str, *, start_date: date | None = None, end_date: date | None = None):
+        response = self.http.get(listing_url)
+        document = html.fromstring(response.text)
+        forms = document.xpath("//form[contains(@action, 'advancedSearchResults.do') or contains(@action, 'searchResults.do')]")
+        if not forms:
+            params = self._advanced_search_dates(start_date=start_date, end_date=end_date)
+            return self.http.get(urljoin(response.url, "advancedSearchResults.do?action=firstPage"), params)
+        form = forms[0]
+        data = self._form_defaults(form)
+        data.update(self._advanced_search_dates(start_date=start_date, end_date=end_date))
+        data.setdefault("searchType", "Application")
+        action = form.get("action") or "advancedSearchResults.do?action=firstPage"
+        return self.http.post_form(urljoin(response.url, action), data)
+
+    def _advanced_search_dates(self, *, start_date: date | None = None, end_date: date | None = None) -> dict[str, str]:
+        data: dict[str, str] = {}
+        if start_date:
+            data["searchCriteria.dateReceivedStart"] = start_date.strftime("%d/%m/%Y")
+        if end_date:
+            data["searchCriteria.dateReceivedEnd"] = end_date.strftime("%d/%m/%Y")
+        return data
 
     def _form_defaults(self, form: html.HtmlElement) -> dict[str, str]:
         data: dict[str, str] = {}
