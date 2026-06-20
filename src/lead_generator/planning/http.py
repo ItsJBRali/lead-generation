@@ -55,12 +55,20 @@ class CouncilHttpClient:
         self._last_request_at = 0.0
         self._cookies = CookieJar()
 
-    def get(self, url: str, params: dict[str, str] | None = None) -> FetchResponse:
+    def get(
+        self,
+        url: str,
+        params: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> FetchResponse:
         if params:
             separator = "&" if "?" in url else "?"
             url = f"{url}{separator}{urlencode(params)}"
 
-        request = Request(url, headers={"User-Agent": self.user_agent})
+        request_headers = {"User-Agent": self.user_agent}
+        if headers:
+            request_headers.update(headers)
+        request = Request(url, headers=request_headers)
         response = self._send(request, url)
         accept_url = _disclaimer_accept_url(response)
         if accept_url:

@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import date
 from urllib.parse import parse_qs, urljoin, urlsplit
 
 from lxml import html
 
 from lead_generator.planning.adapters.base import PlanningScraper
-from lead_generator.planning.http import CouncilHttpClient
+from lead_generator.planning.http import CouncilHttpClient, FetchResponse
 from lead_generator.planning.models import DiscoveryResult, PlanningApplication, PlanningDocument
 from lead_generator.planning.parsing import (
     clean_text,
@@ -54,6 +55,7 @@ class OcellaPlanningScraper(PlanningScraper):
         "date_received": "date_received",
         "received_date": "date_received",
         "received": "date_received",
+        "accepted": "date_validated",
         "valid_date": "date_validated",
         "date_validated": "date_validated",
         "validated": "date_validated",
@@ -80,17 +82,89 @@ class OcellaPlanningScraper(PlanningScraper):
         self,
         *,
         listing_url: str,
+        start_date: date | None = None,
+        end_date: date | None = None,
         limit: int | None = None,
         **_: object,
     ) -> DiscoveryResult:
-        response = self.http.get(listing_url)
+        response = self._fetch_listing(listing_url, start_date=start_date, end_date=end_date)
         applications = self.parse_listing(response.text, response.url)
+        if start_date:
+            for application in applications:
+                if not (application.date_received or application.date_validated):
+                    application.date_received = start_date.isoformat()
+                    application.raw = {
+                        **application.raw,
+                        "date_range_filtered": True,
+                        "date_inferred_from_search_window": True,
+                    }
         if limit is not None:
             applications = applications[:limit]
         return DiscoveryResult(
             authority=self.authority,
             source_url=response.url,
             applications=applications,
+        )
+
+    def _fetch_listing(
+        self,
+        listing_url: str,
+        *,
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ):
+        response = self.http.get(listing_url)
+        if not (start_date or end_date):
+            return response
+        document = html.fromstring(response.text)
+        forms = document.xpath("//form[.//input[@name='receivedFrom'] or .//input[@name='receivedTo']]")
+        if not forms:
+            return self._fetch_aspnet_keyword_listing(
+                response,
+                document,
+                start_date=start_date,
+                end_date=end_date,
+            )
+        form = forms[0]
+        data = self._form_defaults(form)
+        if start_date:
+            data["receivedFrom"] = start_date.strftime("%d-%m-%y")
+        if end_date:
+            data["receivedTo"] = end_date.strftime("%d-%m-%y")
+        data["action"] = "Search"
+        action = form.get("action") or listing_url
+        return self.http.post_form(urljoin(response.url, action), data)
+
+    def _fetch_aspnet_keyword_listing(
+        self,
+        response: FetchResponse,
+        document: html.HtmlElement,
+        *,
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> FetchResponse:
+        forms = document.xpath("//form[.//input[@name='ctl00$BodyPlaceHolder$uxTextSearchKeywords']]")
+        if not forms or not (start_date or end_date):
+            return response
+        form = forms[0]
+        start_year = (start_date or end_date).year
+        end_year = (end_date or start_date).year
+        action = form.get("action") or response.url
+        search_url = urljoin(response.url, action)
+        responses: list[FetchResponse] = []
+        for year in range(start_year, end_year + 1):
+            data = self._form_defaults(form)
+            data["ctl00$BodyPlaceHolder$uxTextSearchKeywords"] = f"P/{year % 100:02d}"
+            submit_name, submit_value = self._first_submit(form)
+            if submit_name:
+                data[submit_name] = submit_value or "Search"
+            responses.append(self.http.post_form(search_url, data))
+        if len(responses) == 1:
+            return responses[0]
+        return FetchResponse(
+            url=responses[-1].url,
+            status_code=responses[-1].status_code,
+            text="<html><body>" + "\n".join(item.text for item in responses) + "</body></html>",
         )
 
     def fetch_application(
@@ -123,16 +197,22 @@ class OcellaPlanningScraper(PlanningScraper):
             seen.add(uid)
 
             row_text = self._nearest_row_text(anchor)
-            reference = self._extract_reference(anchor, row_text) or uid
+            query = parse_qs(urlsplit(href).query)
+            reference = uid if query.get("reference") else self._extract_reference(anchor, row_text) or uid
+            row_data = self._result_row_data(anchor)
             applications.append(
                 PlanningApplication(
                     authority=self.authority,
                     uid=uid,
                     url=urljoin(page_url, href),
                     reference=reference,
-                    address=self._extract_address(row_text, reference),
+                    address=row_data.get("address") or self._extract_address(row_text, reference),
+                    description=row_data.get("description"),
+                    status=row_data.get("status"),
+                    date_received=row_data.get("date_received"),
+                    postcode=extract_postcode(row_data.get("address") or row_text),
                     source_url=page_url,
-                    raw={"listing_text": row_text} if row_text else {},
+                    raw={"portal_family": "ocella", "detail_complete": bool(row_data), "listing_text": row_text},
                 )
             )
 
@@ -213,6 +293,50 @@ class OcellaPlanningScraper(PlanningScraper):
 
         return documents
 
+    def _form_defaults(self, form: html.HtmlElement) -> dict[str, str]:
+        data: dict[str, str] = {}
+        for element in form.xpath(".//input|.//select|.//textarea"):
+            name = element.get("name")
+            if not name:
+                continue
+            tag = element.tag.lower()
+            input_type = (element.get("type") or "").lower()
+            if tag == "select":
+                selected = element.xpath(".//option[@selected]") or element.xpath(".//option")
+                data[name] = selected[0].get("value") or "" if selected else ""
+            elif input_type in {"checkbox", "radio"}:
+                if element.get("checked"):
+                    data[name] = element.get("value") or "on"
+            elif input_type != "submit":
+                data[name] = element.get("value") or ""
+        return data
+
+    def _first_submit(self, form: html.HtmlElement) -> tuple[str | None, str | None]:
+        for element in form.xpath(".//input[@type='submit' and @name]"):
+            return element.get("name"), element.get("value")
+        return None, None
+
+    def _result_row_data(self, anchor: html.HtmlElement) -> dict[str, str]:
+        row = anchor.xpath("ancestor::tr[1]")
+        if not row:
+            return {}
+        cells = [clean_text(" ".join(cell.itertext())) or "" for cell in row[0].xpath("./td")]
+        if len(cells) < 3:
+            return {}
+        data: dict[str, str] = {
+            "address": cells[1],
+            "description": cells[2],
+        }
+        if len(cells) >= 5:
+            data["date_received"] = parse_council_date(cells[3])
+            data["status"] = cells[4]
+        elif len(cells) >= 4:
+            if re.search(r"\d{1,2}[-/]\d{1,2}[-/]\d{2,4}", cells[3]):
+                data["date_received"] = parse_council_date(cells[3])
+            else:
+                data["status"] = cells[3]
+        return {key: value for key, value in data.items() if value}
+
     def _extract_uid(self, url_or_href: str | None) -> str | None:
         if not url_or_href:
             return None
@@ -257,6 +381,20 @@ class OcellaPlanningScraper(PlanningScraper):
 
     def _extract_labelled_fields(self, document: html.HtmlElement) -> dict[str, str]:
         fields: dict[str, str] = {}
+        for row in document.xpath("//*[contains(concat(' ', normalize-space(@class), ' '), ' docGridRow ')]"):
+            label = clean_text(
+                " ".join(
+                    row.xpath(".//*[contains(concat(' ', normalize-space(@class), ' '), ' detailsFieldNames ')]//text()")
+                )
+            )
+            value = clean_text(
+                " ".join(
+                    row.xpath(".//*[contains(concat(' ', normalize-space(@class), ' '), ' detailsValues ')]//text()")
+                )
+            )
+            if label and value:
+                fields[label] = value
+
         for row in document.xpath("//tr[th and td]"):
             label = clean_text(" ".join(row.xpath("./th[1]//text()")))
             value = clean_text(" ".join(row.xpath("./td[1]//text()")))
