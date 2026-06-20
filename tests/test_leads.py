@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import ssl
 import threading
@@ -266,8 +267,153 @@ class LeadSearchTest(unittest.TestCase):
             self.assertIn("https://planning.example.gov.uk/detail/ABC123", csv_text)
             self.assertIn("24/01234/FUL", csv_text)
             self.assertNotIn("24/99999/FUL", csv_text)
+            self.assertTrue(result.failure_csv_path.exists())
             self.assertTrue((result.output_dir / "Example Council" / "24 01234 FUL").exists())
             self.assertTrue((result.output_dir / "selected_councils.geojson").exists())
+
+    def test_run_lead_search_updates_output_csv_when_cancelled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_geojson = root / "search.geojson"
+            user_geojson.write_text(
+                json.dumps(
+                    {
+                        "type": "FeatureCollection",
+                        "features": [polygon_feature("search area", 0, 0, 1, 1)],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            catalogue = root / "catalogue.geojson"
+            catalogue.write_text(
+                json.dumps(
+                    {
+                        "type": "FeatureCollection",
+                        "features": [
+                            {
+                                **polygon_feature("Example Council", 0, 0, 1, 1),
+                                "properties": {
+                                    "authority": "Example Council",
+                                    "portal_family": "idox",
+                                    "base_url": "https://planning.example.gov.uk",
+                                    "listing_url": "https://planning.example.gov.uk/search",
+                                },
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = LeadSearchConfig(
+                geojson_path=user_geojson,
+                output_root=root,
+                start_date=date(2026, 6, 1),
+                end_date=date(2026, 6, 30),
+                keywords=["driveway gates"],
+                catalogue_path=catalogue,
+            )
+            applications = [
+                PlanningApplication(
+                    authority="Example Council",
+                    uid="ABC123",
+                    url="https://planning.example.gov.uk/detail/ABC123",
+                    reference="24/01234/FUL",
+                    description="New driveway gates",
+                    date_received="2026-06-10",
+                ),
+                PlanningApplication(
+                    authority="Example Council",
+                    uid="DEF456",
+                    url="https://planning.example.gov.uk/detail/DEF456",
+                    reference="24/99999/FUL",
+                    description="New driveway gates",
+                    date_received="2026-06-11",
+                ),
+            ]
+            cancel_checks = 0
+
+            def should_cancel() -> bool:
+                nonlocal cancel_checks
+                cancel_checks += 1
+                return cancel_checks >= 3
+
+            with patch("lead_generator.planning.leads.discover_portal_applications", return_value=applications):
+                result = run_lead_search(config, should_cancel=should_cancel)
+
+            csv_text = result.csv_path.read_text(encoding="utf-8")
+            self.assertIn("24/01234/FUL", csv_text)
+            self.assertNotIn("24/99999/FUL", csv_text)
+            self.assertEqual(result.leads_found, 1)
+
+    def test_run_lead_search_writes_failed_council_log(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_geojson = root / "search.geojson"
+            user_geojson.write_text(
+                json.dumps(
+                    {
+                        "type": "FeatureCollection",
+                        "features": [polygon_feature("search area", 0, 0, 2, 1)],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            catalogue = root / "catalogue.geojson"
+            catalogue.write_text(
+                json.dumps(
+                    {
+                        "type": "FeatureCollection",
+                        "features": [
+                            {
+                                **polygon_feature("Broken Council", 0, 0, 1, 1),
+                                "properties": {
+                                    "authority": "Broken Council",
+                                    "portal_family": "idox",
+                                    "scraper_type": "Idox",
+                                    "base_url": "https://broken.example.gov.uk",
+                                    "listing_url": "https://broken.example.gov.uk/search",
+                                },
+                            },
+                            {
+                                **polygon_feature("Working Council", 1, 0, 2, 1),
+                                "properties": {
+                                    "authority": "Working Council",
+                                    "portal_family": "idox",
+                                    "scraper_type": "Idox",
+                                    "base_url": "https://working.example.gov.uk",
+                                    "listing_url": "https://working.example.gov.uk/search",
+                                },
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = LeadSearchConfig(
+                geojson_path=user_geojson,
+                output_root=root,
+                start_date=date(2026, 6, 1),
+                end_date=date(2026, 6, 30),
+                keywords=["driveway gates"],
+                catalogue_path=catalogue,
+            )
+
+            def fake_discover(target, start_date, end_date):
+                if target.authority == "Broken Council":
+                    raise RuntimeError("portal exploded")
+                return []
+
+            with patch("lead_generator.planning.leads.discover_portal_applications", side_effect=fake_discover):
+                result = run_lead_search(config)
+
+            with result.failure_csv_path.open(newline="", encoding="utf-8") as handle:
+                failures = list(csv.DictReader(handle))
+            self.assertEqual(len(failures), 1)
+            self.assertEqual(failures[0]["council"], "Broken Council")
+            self.assertEqual(failures[0]["portal_family"], "idox")
+            self.assertEqual(failures[0]["scraper_type"], "Idox")
+            self.assertEqual(failures[0]["listing_url"], "https://broken.example.gov.uk/search")
+            self.assertEqual(failures[0]["reason"], "portal exploded")
 
     def test_run_lead_search_starts_four_workers_from_both_ends(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

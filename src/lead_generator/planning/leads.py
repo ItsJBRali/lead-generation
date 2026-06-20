@@ -98,6 +98,8 @@ MAX_RETRY_AFTER_SECONDS = 20.0
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 20.0
 REQUEST_THROTTLE_SECONDS = 0.25
 PLANIT_REQUEST_THROTTLE_SECONDS = 0.75
+APPLICATION_CSV_FIELDS = ["Reference", "application link", "proposal", "date received", "council"]
+FAILURE_CSV_FIELDS = ["council", "portal_family", "scraper_type", "listing_url", "reason"]
 _REQUEST_THROTTLE_LOCK = threading.Lock()
 _LAST_REQUEST_AT: dict[str, float] = {}
 
@@ -127,6 +129,7 @@ class LeadSearchConfig:
 class LeadSearchResult:
     output_dir: Path
     csv_path: Path
+    failure_csv_path: Path
     geojson_features: int
     councils_total: int
     councils_completed: int
@@ -169,8 +172,11 @@ def run_lead_search(
     output_dir = config.output_root / date.today().isoformat()
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = output_dir / "applications.csv"
+    failure_csv_path = output_dir / "search_failures.csv"
     selected_path = output_dir / "selected_councils.geojson"
     selected_path.write_text(councils_to_geojson(targets), encoding="utf-8")
+    initialise_csv(csv_path, APPLICATION_CSV_FIELDS)
+    initialise_csv(failure_csv_path, FAILURE_CSV_FIELDS)
 
     rows: list[dict[str, str]] = []
     completed = 0
@@ -201,6 +207,21 @@ def run_lead_search(
     def save_row(row: dict[str, str]) -> None:
         with lock:
             rows.append(row)
+            append_csv_row(csv_path, APPLICATION_CSV_FIELDS, row)
+
+    def save_failure(target: CouncilTarget, reason: str) -> None:
+        with lock:
+            append_csv_row(
+                failure_csv_path,
+                FAILURE_CSV_FIELDS,
+                {
+                    "council": target.authority,
+                    "portal_family": target.portal_family,
+                    "scraper_type": target.scraper_type,
+                    "listing_url": target.listing_url or target.base_url,
+                    "reason": reason,
+                },
+            )
 
     def search_worker(name: str, *, reverse: bool = False) -> None:
         while True:
@@ -240,6 +261,7 @@ def run_lead_search(
                 _log(log, f"{target.authority}: {matched_count} applications matched keywords and location")
             except Exception as exc:  # pragma: no cover - live-site resilience
                 _log(log, f"{target.authority}: failed: {exc}")
+                save_failure(target, str(exc))
             finally:
                 mark_complete()
 
@@ -258,11 +280,12 @@ def run_lead_search(
     for worker in workers:
         worker.join()
 
-    write_csv(csv_path, rows)
     _log(log, f"Finished. Saved {len(rows)} leads to {csv_path}")
+    _log(log, f"Saved failed council log to {failure_csv_path}")
     return LeadSearchResult(
         output_dir=output_dir,
         csv_path=csv_path,
+        failure_csv_path=failure_csv_path,
         geojson_features=feature_count,
         councils_total=len(targets),
         councils_completed=completed,
@@ -726,12 +749,23 @@ def download_pdf_documents(
 
 
 def write_csv(csv_path: Path, rows: list[dict[str, str]]) -> None:
+    initialise_csv(csv_path, APPLICATION_CSV_FIELDS)
+    append_csv_rows(csv_path, APPLICATION_CSV_FIELDS, rows)
+
+
+def initialise_csv(csv_path: Path, fieldnames: list[str]) -> None:
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=["Reference", "application link", "proposal", "date received", "council"],
-        )
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
+
+
+def append_csv_row(csv_path: Path, fieldnames: list[str], row: dict[str, str]) -> None:
+    append_csv_rows(csv_path, fieldnames, [row])
+
+
+def append_csv_rows(csv_path: Path, fieldnames: list[str], rows: list[dict[str, str]]) -> None:
+    with csv_path.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writerows(rows)
 
 
