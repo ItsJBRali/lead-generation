@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 import unittest
 from pathlib import Path
 
@@ -24,6 +25,26 @@ class FakeHttpClient:
     def post_form(self, url: str, data: dict[str, str]) -> FetchResponse:
         self.posts.append((url, data))
         return FetchResponse(url=url, status_code=200, text=(FIXTURES / "idox_listing.html").read_text(encoding="utf-8"))
+
+
+class FakeAdvancedSearchHttpClient(FakeHttpClient):
+    def get(self, url: str) -> FetchResponse:
+        self.gets.append(url)
+        return FetchResponse(
+            url=url,
+            status_code=200,
+            text="""
+            <html><body>
+              <form action="/online-applications/advancedSearchResults.do?action=firstPage" method="post">
+                <input type="hidden" name="_csrf" value="advanced-token">
+                <input name="date(applicationReceivedStart)" value="">
+                <input name="date(applicationReceivedEnd)" value="">
+                <input name="date(applicationValidatedStart)" value="">
+                <input name="date(applicationValidatedEnd)" value="">
+              </form>
+            </body></html>
+            """,
+        )
 
 
 class IdoxPublicAccessScraperTest(unittest.TestCase):
@@ -73,6 +94,24 @@ class IdoxPublicAccessScraperTest(unittest.TestCase):
         self.assertEqual(http.posts[0][1]["searchCriteria.ward"], "")
         self.assertEqual(http.posts[0][1]["week"], "0")
         self.assertEqual(http.posts[0][1]["dateType"], "DC_Validated")
+
+    def test_discover_ids_submits_real_idox_advanced_received_date_fields(self) -> None:
+        http = FakeAdvancedSearchHttpClient()
+        scraper = IdoxPublicAccessScraper(
+            IdoxCouncilConfig(authority="Example Council", base_url="https://planning.example.gov.uk"),
+            http_client=http,
+        )
+
+        scraper.discover_ids(
+            listing_url="https://planning.example.gov.uk/online-applications/search.do?action=advanced",
+            start_date=date(2026, 5, 21),
+            end_date=date(2026, 6, 20),
+        )
+
+        self.assertEqual(http.posts[0][0], "https://planning.example.gov.uk/online-applications/advancedSearchResults.do?action=firstPage")
+        self.assertEqual(http.posts[0][1]["date(applicationReceivedStart)"], "21/05/2026")
+        self.assertEqual(http.posts[0][1]["date(applicationReceivedEnd)"], "20/06/2026")
+        self.assertNotIn("searchCriteria.dateReceivedStart", http.posts[0][1])
 
     def test_parse_weekly_detail_response_as_single_discovery(self) -> None:
         page_html = (FIXTURES / "idox_weekly_detail.html").read_text(encoding="utf-8")

@@ -176,18 +176,37 @@ class IdoxPublicAccessScraper(PlanningScraper):
             return self.http.get(urljoin(response.url, "advancedSearchResults.do?action=firstPage"), params)
         form = forms[0]
         data = self._form_defaults(form)
-        data.update(self._advanced_search_dates(start_date=start_date, end_date=end_date))
+        data.update(self._advanced_search_dates(start_date=start_date, end_date=end_date, form_data=data))
         data.setdefault("searchType", "Application")
         action = form.get("action") or "advancedSearchResults.do?action=firstPage"
         return self.http.post_form(urljoin(response.url, action), data)
 
-    def _advanced_search_dates(self, *, start_date: date | None = None, end_date: date | None = None) -> dict[str, str]:
+    def _advanced_search_dates(
+        self,
+        *,
+        start_date: date | None = None,
+        end_date: date | None = None,
+        form_data: dict[str, str] | None = None,
+    ) -> dict[str, str]:
         data: dict[str, str] = {}
         if start_date:
-            data["searchCriteria.dateReceivedStart"] = start_date.strftime("%d/%m/%Y")
+            data[self._advanced_date_field(form_data, "start")] = start_date.strftime("%d/%m/%Y")
         if end_date:
-            data["searchCriteria.dateReceivedEnd"] = end_date.strftime("%d/%m/%Y")
+            data[self._advanced_date_field(form_data, "end")] = end_date.strftime("%d/%m/%Y")
         return data
+
+    def _advanced_date_field(self, form_data: dict[str, str] | None, which: str) -> str:
+        if not form_data:
+            return "searchCriteria.dateReceivedStart" if which == "start" else "searchCriteria.dateReceivedEnd"
+        candidates = (
+            ("date(applicationReceivedStart)", "searchCriteria.dateReceivedStart", "date(applicationValidatedStart)")
+            if which == "start"
+            else ("date(applicationReceivedEnd)", "searchCriteria.dateReceivedEnd", "date(applicationValidatedEnd)")
+        )
+        for candidate in candidates:
+            if candidate in form_data:
+                return candidate
+        return candidates[1]
 
     def _form_defaults(self, form: html.HtmlElement) -> dict[str, str]:
         data: dict[str, str] = {}
