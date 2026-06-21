@@ -15,6 +15,8 @@ PORTAL_SIGNATURES: tuple[PortalSignature, ...] = (
     PortalSignature("northgate", ("northgate", "planning explorer", "general_search.aspx")),
     PortalSignature("civica", ("civica", "authority public access", "planningexplorer", "webforms/planning/details.html")),
     PortalSignature("agile", ("agile applications", "wphappdetail.displayurl", "/apas/run/")),
+    PortalSignature("achieveforms", ("achieveforms", "fs.formdefinition", "form_uri=sandbox-publish", "/fillform/")),
+    PortalSignature("atrium", ("/search/advanced", "/search/results", "/planning/display/", "list of planning cases - search results")),
 )
 
 

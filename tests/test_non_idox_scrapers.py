@@ -6,7 +6,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from lead_generator.planning.http import FetchResponse
+from lead_generator.planning.adapters.achieveforms import AchieveFormsCouncilConfig, AchieveFormsPlanningScraper
 from lead_generator.planning.adapters.agile import AgileCouncilConfig, AgilePlanningScraper
+from lead_generator.planning.adapters.atrium import AtriumCouncilConfig, AtriumPlanningScraper
 from lead_generator.planning.adapters.civica import (
     CivicaCouncilConfig,
     CivicaPlanningScraper,
@@ -230,7 +232,166 @@ class FakeLegacyAgileHttpClient:
         )
 
 
+class FakeAchieveFormsHttpClient:
+    def __init__(self) -> None:
+        self.lookups: list[tuple[str, object]] = []
+
+    def get(
+        self,
+        url: str,
+        params: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> FetchResponse:
+        if "authapi/isauthenticated" in url:
+            return FetchResponse(url=url, status_code=200, text='{"auth-session":"session-123"}')
+        if params and params.get("api") == "getDocument":
+            import base64
+            import json
+
+            definition = {
+                "formName": "Search Planning Applications",
+                "props": {"id": "AF-Form-example"},
+                "sections": [
+                    {
+                        "fields": [
+                            {"props": {"dataName": "weeklyList", "lookup": "weekly-lookup"}},
+                            {"props": {"dataName": "planningResult", "lookup": "detail-lookup"}},
+                            {"props": {"dataName": "docs", "lookup": "docs-lookup"}},
+                        ]
+                    }
+                ],
+            }
+            content = base64.b64encode(json.dumps(definition).encode()).decode()
+            return FetchResponse(url=url, status_code=200, text=json.dumps({"content": content}))
+        return FetchResponse(
+            url=url,
+            status_code=200,
+            text='<script>FS.FormDefinition={"x":{"metadata":{"publish-uri":"sandbox-publish://definition.json"}}};</script>',
+        )
+
+    def post_json(self, url: str, data: object) -> FetchResponse:
+        self.lookups.append((url, data))
+        if "id=weekly-lookup" in url:
+            return FetchResponse(
+                url=url,
+                status_code=200,
+                text="""
+                {"status":"done","data":"<Responses><RequestResponse><DatabaseResponse><Fields><Field Name=\\"referenceNumber\\" /></Fields><Rows><Row><result column=\\"referenceNumber\\">041761</result><result column=\\"location\\">Bermuda Workingmens Club CV10 7PW</result></Row></Rows></DatabaseResponse></RequestResponse></Responses>"}
+                """,
+            )
+        if "id=detail-lookup" in url:
+            return FetchResponse(
+                url=url,
+                status_code=200,
+                text="""
+                {"status":"done","data":"<Responses><RequestResponse><DatabaseResponse><Rows><Row><result column=\\"referenceNumber\\">041761</result><result column=\\"location\\">Bermuda Workingmens Club CV10 7PW</result><result column=\\"dateReceived\\">04 Jun 2026</result><result column=\\"description\\">Application for approval of details reserved by condition.</result><result column=\\"applicationStatus\\">Received</result><result column=\\"dateAccepted\\">04 Jun 2026</result><result column=\\"officer\\">Kelly Pearson</result><result column=\\"agent\\">Miss Chloe Heales</result></Row></Rows></DatabaseResponse></RequestResponse></Responses>"}
+                """,
+            )
+        return FetchResponse(
+            url=url,
+            status_code=200,
+            text="""
+            {"status":"done","data":"<Responses><RequestResponse><DatabaseResponse><Rows><Row><result column=\\"display\\">Decision notice</result><result column=\\"URL\\">/documents/041761.pdf</result></Row></Rows></DatabaseResponse></RequestResponse></Responses>"}
+            """,
+        )
+
+
+class FakeAtriumHttpClient:
+    def __init__(self) -> None:
+        self.posts: list[tuple[str, dict[str, str]]] = []
+        self.gets: list[str] = []
+
+    def get(
+        self,
+        url: str,
+        params: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> FetchResponse:
+        self.gets.append(url)
+        if "ResultsPage/2" in url:
+            return FetchResponse(
+                url=url,
+                status_code=200,
+                text="""
+                <table><tr>
+                  <td><a href="/Planning/Display/20260844">20260844</a></td><td>VNT9575</td><td>Site Of 18 Spencefield Lane</td>
+                  <td>Approval of details reserved by condition</td><td>13/06/2026</td><td></td><td>Pending decision</td>
+                </tr></table>
+                """,
+            )
+        return FetchResponse(
+            url=url,
+            status_code=200,
+            text="""
+            <form method="post" action="/Search/Results">
+              <input name="DateReceivedFrom" value="">
+              <input name="DateReceivedTo" value="">
+              <input name="SearchPlanning" value="True">
+            </form>
+            """,
+        )
+
+    def post_form(self, url: str, data: dict[str, str]) -> FetchResponse:
+        self.posts.append((url, data))
+        return FetchResponse(
+            url=url,
+            status_code=200,
+            text="""
+            <table><tr>
+              <td><a href="/Planning/Display/20260834">20260834</a></td><td>PIM5249</td><td>15 Yorkshire Road</td>
+              <td>Installation of fascia sign</td><td>13/06/2026</td><td></td><td>Pending decision - Awaiting assessment</td>
+            </tr></table>
+            <a href="/Search/ResultsPage/2?module=PLA&tabOrder=0">2</a>
+            """,
+        )
+
+
 class NonIdoxScraperTest(unittest.TestCase):
+    def test_achieveforms_weekly_lookup_fetches_application_details(self) -> None:
+        http = FakeAchieveFormsHttpClient()
+        scraper = AchieveFormsPlanningScraper(
+            AchieveFormsCouncilConfig("Nuneaton and Bedworth", "https://customer.example.gov.uk"),
+            http_client=http,
+        )
+
+        discovery = scraper.discover_ids(
+            listing_url="https://customer.example.gov.uk/en/AchieveForms/?form_uri=sandbox-publish%3A%2F%2Fdefinition.json",
+            start_date=date(2026, 6, 1),
+            end_date=date(2026, 6, 30),
+        )
+
+        application = discovery.applications[0]
+        self.assertEqual(application.reference, "041761")
+        self.assertEqual(application.date_received, "2026-06-04")
+        self.assertEqual(application.description, "Application for approval of details reserved by condition.")
+        self.assertEqual(application.postcode, "CV10 7PW")
+        self.assertTrue(application.raw["detail_complete"])
+        self.assertEqual(application.documents[0].url, "https://customer.example.gov.uk/documents/041761.pdf")
+        self.assertIn("id=weekly-lookup", http.lookups[0][0])
+        self.assertIn("id=detail-lookup", http.lookups[1][0])
+
+    def test_atrium_search_uses_received_dates_and_follows_pages(self) -> None:
+        http = FakeAtriumHttpClient()
+        scraper = AtriumPlanningScraper(
+            AtriumCouncilConfig("Leicester", "https://planning.leicester.gov.uk"),
+            http_client=http,
+        )
+
+        discovery = scraper.discover_ids(
+            listing_url="https://planning.leicester.gov.uk/Search/Advanced/",
+            start_date=date(2026, 6, 8),
+            end_date=date(2026, 6, 14),
+        )
+
+        payload = http.posts[0][1]
+        self.assertEqual(payload["DateReceivedFrom"], "08/06/2026")
+        self.assertEqual(payload["DateReceivedTo"], "14/06/2026")
+        self.assertEqual(len(discovery.applications), 2)
+        self.assertEqual(discovery.applications[0].reference, "20260834")
+        self.assertEqual(discovery.applications[0].date_validated, "2026-06-13")
+        self.assertEqual(discovery.applications[1].reference, "20260844")
+        self.assertIn("ResultsPage/2", http.gets[-1])
+
     def test_civica_listing_and_detail(self) -> None:
         scraper = CivicaPlanningScraper(
             CivicaCouncilConfig("Example Civica Council", "https://planning.example.gov.uk")

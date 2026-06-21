@@ -13,6 +13,8 @@ class PortalDetectionTest(unittest.TestCase):
             "civica": ("<html>Civica Authority Public Access</html>", "https://example.gov.uk/planning"),
             "agile": ("<html>Agile Applications</html>", "https://example.gov.uk/apas/run/WPHAPPDETAIL.DisplayUrl"),
             "northgate": ("<html>Planning Explorer</html>", "https://example.gov.uk/PlanningExplorer/GeneralSearch.aspx"),
+            "achieveforms": ("<script>FS.FormDefinition={}</script>", "https://example.gov.uk/en/AchieveForms/?form_uri=sandbox-publish%3A%2F%2Fdefinition.json"),
+            "atrium": ("<h1>List of Planning Cases - Search Results</h1>", "https://example.gov.uk/Search/Advanced/"),
         }
 
         for expected, (html, url) in cases.items():

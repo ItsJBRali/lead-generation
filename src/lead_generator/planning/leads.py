@@ -22,10 +22,14 @@ from urllib.request import HTTPSHandler, HTTPCookieProcessor, Request, build_ope
 from lxml import html
 
 from lead_generator.planning.adapters import (
+    AchieveFormsCouncilConfig,
+    AchieveFormsPlanningScraper,
     AgileCouncilConfig,
     AgilePlanningScraper,
     ArcusCouncilConfig,
     ArcusPlanningScraper,
+    AtriumCouncilConfig,
+    AtriumPlanningScraper,
     CivicaCouncilConfig,
     CivicaPlanningScraper,
     IdoxCouncilConfig,
@@ -490,6 +494,10 @@ def planning_scraper_for_target(target: CouncilTarget) -> PlanningScraper:
 
     if "arcus" in portal_key:
         return ArcusPlanningScraper(ArcusCouncilConfig(authority=target.authority, base_url=base_url))
+    if "achieveforms" in portal_key or "achieve forms" in portal_key:
+        return AchieveFormsPlanningScraper(AchieveFormsCouncilConfig(authority=target.authority, base_url=base_url))
+    if "atrium" in portal_key:
+        return AtriumPlanningScraper(AtriumCouncilConfig(authority=target.authority, base_url=base_url))
     if "idox" in portal_key:
         return IdoxPublicAccessScraper(
             IdoxCouncilConfig(
