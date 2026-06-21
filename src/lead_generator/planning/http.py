@@ -40,7 +40,11 @@ class CouncilHttpClient:
         *,
         timeout_seconds: float = 20.0,
         min_delay_seconds: float = 1.0,
-        user_agent: str = "LeadGeneratorPlanningScraper/0.1 (+responsible planning data collection)",
+        user_agent: str = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/126.0 Safari/537.36 LeadGeneratorPlanningScraper/0.1"
+        ),
         retries: int = 2,
         verify_tls: bool = True,
         ca_file: str | None = None,
@@ -111,6 +115,8 @@ class CouncilHttpClient:
                 with self._opener().open(request, timeout=self.timeout_seconds) as response:
                     charset = response.headers.get_content_charset() or "utf-8"
                     body = response.read().decode(charset, errors="replace")
+                    if _looks_like_waf_challenge(body):
+                        raise CouncilFetchError(f"Blocked by web application firewall while fetching {url}")
                     return FetchResponse(
                         url=response.geturl(),
                         status_code=getattr(response, "status", 200),
@@ -195,16 +201,24 @@ def _is_tls_certificate_error(exc: Exception) -> bool:
 def _is_tls_compatibility_error(exc: Exception) -> bool:
     reason = getattr(exc, "reason", None)
     text = f"{reason or ''} {exc}".casefold()
-    return "ssl" in text and any(
-        token in text
-        for token in (
-            "dh key too small",
-            "legacy sigalg disallowed",
-            "unsafe legacy renegotiation",
-            "tlsv1 alert protocol version",
-            "wrong version number",
+    return any(token in text for token in ("forcibly closed", "winerror 10054")) or (
+        "ssl" in text
+        and any(
+            token in text
+            for token in (
+                "dh key too small",
+                "legacy sigalg disallowed",
+                "unsafe legacy renegotiation",
+                "tlsv1 alert protocol version",
+                "wrong version number",
+            )
         )
     )
+
+
+def _looks_like_waf_challenge(text: str) -> bool:
+    lowered = text[:5000].casefold()
+    return "_incapsula_resource" in lowered or "incapsula" in lowered and "noindex,nofollow" in lowered
 
 
 def _disclaimer_accept_url(response: FetchResponse) -> str | None:

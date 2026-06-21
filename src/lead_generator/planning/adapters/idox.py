@@ -8,7 +8,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 from lxml import html
 
 from lead_generator.planning.adapters.base import PlanningScraper
-from lead_generator.planning.http import CouncilHttpClient
+from lead_generator.planning.http import CouncilHttpClient, FetchResponse
 from lead_generator.planning.models import DiscoveryResult, PlanningApplication, PlanningDocument
 from lead_generator.planning.parsing import clean_text, extract_postcode, normalize_label, parse_council_date
 
@@ -22,6 +22,8 @@ class IdoxCouncilConfig:
 
 class IdoxPublicAccessScraper(PlanningScraper):
     """Scraper for councils using Idox PublicAccess planning portals."""
+
+    MAX_PAGED_RESULT_PAGES = 100
 
     _label_map = {
         "reference": "reference", "caseno": "reference", "case_no": "reference",
@@ -49,7 +51,7 @@ class IdoxPublicAccessScraper(PlanningScraper):
             response = self.http.get(listing_url)
         else:
             response = self._fetch_weekly_list(start_date=start_date, end_date=end_date)
-        applications = self.parse_listing(response.text, response.url)
+        applications = self._parse_listing_pages(response, limit=limit)
         if limit is not None:
             applications = applications[:limit]
         return DiscoveryResult(authority=self.authority, source_url=response.url, applications=applications)
@@ -102,6 +104,61 @@ class IdoxPublicAccessScraper(PlanningScraper):
             detail.source_url = page_url
             return [detail]
         return applications
+
+    def _parse_listing_pages(self, response: FetchResponse, *, limit: int | None = None) -> list[PlanningApplication]:
+        applications: list[PlanningApplication] = []
+        seen_uids: set[str] = set()
+        seen_urls: set[str] = {response.url}
+        queued_urls = self._paged_result_urls(response.text, response.url)
+        processed_pages = 1
+
+        def add_page(html_text: str, page_url: str) -> None:
+            for application in self.parse_listing(html_text, page_url):
+                if application.uid in seen_uids:
+                    continue
+                seen_uids.add(application.uid)
+                applications.append(application)
+
+        add_page(response.text, response.url)
+        while queued_urls and (limit is None or len(applications) < limit):
+            if processed_pages >= self.MAX_PAGED_RESULT_PAGES:
+                break
+            page_url = queued_urls.pop(0)
+            if page_url in seen_urls:
+                continue
+            seen_urls.add(page_url)
+            page = self.http.get(page_url)
+            processed_pages += 1
+            add_page(page.text, page.url)
+            for discovered_url in self._paged_result_urls(page.text, page.url):
+                if discovered_url not in seen_urls and discovered_url not in queued_urls:
+                    queued_urls.append(discovered_url)
+            queued_urls.sort(key=self._paged_result_sort_key)
+        return applications
+
+    def _paged_result_urls(self, html_text: str, page_url: str) -> list[str]:
+        document = html.fromstring(html_text)
+        urls: list[str] = []
+        for anchor in document.xpath("//a[@href]"):
+            href = anchor.get("href") or ""
+            parsed = urlsplit(href)
+            query = parse_qs(parsed.query)
+            if query.get("action", [""])[0] != "page":
+                continue
+            if not (query.get("searchCriteria.page") or query.get("page")):
+                continue
+            absolute_url = urljoin(page_url, href)
+            if absolute_url not in urls:
+                urls.append(absolute_url)
+        return sorted(urls, key=self._paged_result_sort_key)
+
+    def _paged_result_sort_key(self, url: str) -> int:
+        query = parse_qs(urlsplit(url).query)
+        for key in ("searchCriteria.page", "page"):
+            values = query.get(key)
+            if values and values[0].isdigit():
+                return int(values[0])
+        return 0
 
     def parse_detail(self, html_text: str, page_url: str, *, fallback_uid: str | None = None) -> PlanningApplication:
         fields = self._extract_labelled_fields(html.fromstring(html_text))

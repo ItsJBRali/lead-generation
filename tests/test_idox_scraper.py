@@ -47,6 +47,49 @@ class FakeAdvancedSearchHttpClient(FakeHttpClient):
         )
 
 
+class FakePagedAdvancedSearchHttpClient(FakeAdvancedSearchHttpClient):
+    def get(self, url: str) -> FetchResponse:
+        self.gets.append(url)
+        if "pagedSearchResults.do" in url:
+            return FetchResponse(
+                url=url,
+                status_code=200,
+                text="""
+                <html><body>
+                  <ul>
+                    <li>
+                      <a href="applicationDetails.do?activeTab=summary&amp;keyVal=PAGE2A">26/00003/FUL</a>
+                      3 Third Street
+                    </li>
+                  </ul>
+                </body></html>
+                """,
+            )
+        return super().get(url)
+
+    def post_form(self, url: str, data: dict[str, str]) -> FetchResponse:
+        self.posts.append((url, data))
+        return FetchResponse(
+            url=url,
+            status_code=200,
+            text="""
+            <html><body>
+              <ul>
+                <li>
+                  <a href="applicationDetails.do?activeTab=summary&amp;keyVal=PAGE1A">26/00001/FUL</a>
+                  1 First Street
+                </li>
+                <li>
+                  <a href="applicationDetails.do?activeTab=summary&amp;keyVal=PAGE1B">26/00002/FUL</a>
+                  2 Second Street
+                </li>
+              </ul>
+              <a href="pagedSearchResults.do?action=page&amp;searchCriteria.page=2">2</a>
+            </body></html>
+            """,
+        )
+
+
 class IdoxPublicAccessScraperTest(unittest.TestCase):
     def setUp(self) -> None:
         self.scraper = IdoxPublicAccessScraper(IdoxCouncilConfig(authority="Example Council", base_url="https://planning.example.gov.uk"))
@@ -112,6 +155,39 @@ class IdoxPublicAccessScraperTest(unittest.TestCase):
         self.assertEqual(http.posts[0][1]["date(applicationReceivedStart)"], "21/05/2026")
         self.assertEqual(http.posts[0][1]["date(applicationReceivedEnd)"], "20/06/2026")
         self.assertNotIn("searchCriteria.dateReceivedStart", http.posts[0][1])
+
+    def test_discover_ids_follows_idox_result_pagination(self) -> None:
+        http = FakePagedAdvancedSearchHttpClient()
+        scraper = IdoxPublicAccessScraper(
+            IdoxCouncilConfig(authority="Example Council", base_url="https://planning.example.gov.uk"),
+            http_client=http,
+        )
+
+        discovery = scraper.discover_ids(
+            listing_url="https://planning.example.gov.uk/online-applications/search.do?action=advanced",
+            start_date=date(2026, 6, 8),
+            end_date=date(2026, 6, 14),
+        )
+
+        self.assertEqual([application.uid for application in discovery.applications], ["PAGE1A", "PAGE1B", "PAGE2A"])
+        self.assertTrue(any("pagedSearchResults.do?action=page" in url for url in http.gets))
+
+    def test_discover_ids_respects_limit_before_fetching_idox_pages(self) -> None:
+        http = FakePagedAdvancedSearchHttpClient()
+        scraper = IdoxPublicAccessScraper(
+            IdoxCouncilConfig(authority="Example Council", base_url="https://planning.example.gov.uk"),
+            http_client=http,
+        )
+
+        discovery = scraper.discover_ids(
+            listing_url="https://planning.example.gov.uk/online-applications/search.do?action=advanced",
+            start_date=date(2026, 6, 8),
+            end_date=date(2026, 6, 14),
+            limit=2,
+        )
+
+        self.assertEqual([application.uid for application in discovery.applications], ["PAGE1A", "PAGE1B"])
+        self.assertFalse(any("pagedSearchResults.do?action=page" in url for url in http.gets))
 
     def test_parse_weekly_detail_response_as_single_discovery(self) -> None:
         page_html = (FIXTURES / "idox_weekly_detail.html").read_text(encoding="utf-8")
