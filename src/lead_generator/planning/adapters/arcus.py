@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlencode, urlsplit, urlunsplit
 
@@ -72,6 +72,81 @@ class ArcusPlanningScraper(PlanningScraper):
         start_date: date | None,
         end_date: date | None,
     ) -> list[dict[str, Any]]:
+        return self._search_records_window(
+            listing_url,
+            context,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+    def _search_records_window(
+        self,
+        listing_url: str,
+        context: dict[str, object],
+        *,
+        start_date: date | None,
+        end_date: date | None,
+    ) -> list[dict[str, Any]]:
+        records, threshold_hit = self._fetch_search_records(
+            listing_url,
+            context,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        if not (threshold_hit and start_date and end_date and start_date < end_date):
+            return records
+
+        midpoint = start_date + timedelta(days=(end_date - start_date).days // 2)
+        next_start = midpoint + timedelta(days=1)
+        left_records, left_threshold = self._fetch_search_records(
+            listing_url,
+            context,
+            start_date=start_date,
+            end_date=midpoint,
+        )
+        right_records, right_threshold = self._fetch_search_records(
+            listing_url,
+            context,
+            start_date=next_start,
+            end_date=end_date,
+        )
+        merged_split_records = self._dedupe_records([*left_records, *right_records])
+        if len(merged_split_records) <= len(self._dedupe_records(records)):
+            return records
+
+        expanded_records: list[dict[str, Any]] = []
+        if left_threshold and start_date < midpoint:
+            expanded_records.extend(
+                self._search_records_window(
+                    listing_url,
+                    context,
+                    start_date=start_date,
+                    end_date=midpoint,
+                )
+            )
+        else:
+            expanded_records.extend(left_records)
+        if right_threshold and next_start < end_date:
+            expanded_records.extend(
+                self._search_records_window(
+                    listing_url,
+                    context,
+                    start_date=next_start,
+                    end_date=end_date,
+                )
+            )
+        else:
+            expanded_records.extend(right_records)
+        return self._dedupe_records(expanded_records)
+
+    def _fetch_search_records(
+        self,
+        listing_url: str,
+        context: dict[str, object],
+        *,
+        start_date: date | None,
+        end_date: date | None,
+    ) -> tuple[list[dict[str, Any]], bool]:
         endpoint = self._aura_endpoint(listing_url)
         page_uri = self._page_uri(listing_url)
         message = {
@@ -113,6 +188,7 @@ class ArcusPlanningScraper(PlanningScraper):
         except json.JSONDecodeError as exc:
             raise CouncilFetchError(f"Invalid Arcus search response from {endpoint}") from exc
         records: list[dict[str, Any]] = []
+        threshold_hit = False
         for action in payload.get("actions", []):
             if not isinstance(action, dict):
                 continue
@@ -121,7 +197,21 @@ class ArcusPlanningScraper(PlanningScraper):
                 inner = return_value.get("returnValue")
                 if isinstance(inner, dict) and isinstance(inner.get("records"), list):
                     records.extend(record for record in inner["records"] if isinstance(record, dict))
-        return records
+                    threshold_hit = threshold_hit or bool(inner.get("thresholdHit"))
+        return records, threshold_hit
+
+    def _dedupe_records(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        seen: set[str] = set()
+        deduped: list[dict[str, Any]] = []
+        for record in records:
+            key = clean_text(str(record.get("Id") or record.get("Name") or ""))
+            if not key:
+                key = json.dumps(record, sort_keys=True, default=str)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(record)
+        return deduped
 
     def _search_filters(self, start_date: date | None, end_date: date | None) -> list[dict[str, str]]:
         return [

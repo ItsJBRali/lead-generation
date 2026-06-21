@@ -53,6 +53,56 @@ class FakeOcellaHttpClient:
         )
 
 
+class FakeCappedOcellaHttpClient(FakeOcellaHttpClient):
+    def post_form(self, url: str, data: dict[str, str]) -> FetchResponse:
+        self.posted.append((url, data))
+        received_from = data["receivedFrom"]
+        received_to = data["receivedTo"]
+        if received_from == "01-06-26" and received_to == "30-06-26":
+            body = """
+            <tr>
+              <td><a href="planningDetails?reference=77047/APP/2026/0000&amp;from=planningSearch">77047/APP/2026/0000</a></td>
+              <td>1 Parent Road UB1 1AA</td>
+              <td>Parent capped row</td>
+              <td>30-06-26</td>
+              <td>Undecided</td>
+            </tr>
+            <p>First 1 results shown, there are 2 in total</p>
+            """
+        elif received_to == "15-06-26":
+            body = """
+            <tr>
+              <td><a href="planningDetails?reference=77047/APP/2026/0001&amp;from=planningSearch">77047/APP/2026/0001</a></td>
+              <td>1 Left Road UB1 1AA</td>
+              <td>Left split row</td>
+              <td>12-06-26</td>
+              <td>Undecided</td>
+            </tr>
+            """
+        else:
+            body = """
+            <tr>
+              <td><a href="planningDetails?reference=77047/APP/2026/0002&amp;from=planningSearch">77047/APP/2026/0002</a></td>
+              <td>2 Right Road UB2 2BB</td>
+              <td>Right split row</td>
+              <td>18-06-26</td>
+              <td>Undecided</td>
+            </tr>
+            """
+        return FetchResponse(
+            url=url,
+            status_code=200,
+            text=f"""
+            <html><body>
+              <table>
+                <tr><th>Reference</th><th>Location</th><th>Proposal</th><th>Received</th><th>Status</th></tr>
+                {body}
+              </table>
+            </body></html>
+            """,
+        )
+
+
 class FakeFarehamHttpClient:
     def __init__(self) -> None:
         self.posted: list[tuple[str, dict[str, str]]] = []
@@ -203,6 +253,25 @@ class OcellaPlanningScraperTest(unittest.TestCase):
         self.assertEqual(application.date_received, "2026-06-15")
         self.assertEqual(application.status, "Undecided")
         self.assertTrue(application.raw["detail_complete"])
+
+    def test_capped_result_search_is_split_by_date_range(self) -> None:
+        http = FakeCappedOcellaHttpClient()
+        scraper = OcellaPlanningScraper(
+            OcellaCouncilConfig("Example Ocella Council", "https://planning.example.gov.uk"),
+            http_client=http,
+        )
+
+        discovery = scraper.discover_ids(
+            listing_url="https://planning.example.gov.uk/OcellaWeb/planningSearch",
+            start_date=date(2026, 6, 1),
+            end_date=date(2026, 6, 30),
+        )
+
+        self.assertEqual(len(http.posted), 3)
+        self.assertEqual(
+            [application.reference for application in discovery.applications],
+            ["77047/APP/2026/0001", "77047/APP/2026/0002"],
+        )
 
     def test_fareham_style_search_uses_application_year_and_detail_grid(self) -> None:
         http = FakeFarehamHttpClient()

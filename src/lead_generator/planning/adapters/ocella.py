@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from urllib.parse import parse_qs, urljoin, urlsplit
 
 from lxml import html
@@ -133,7 +133,79 @@ class OcellaPlanningScraper(PlanningScraper):
             data["receivedTo"] = end_date.strftime("%d-%m-%y")
         data["action"] = "Search"
         action = form.get("action") or listing_url
-        return self.http.post_form(urljoin(response.url, action), data)
+        search_url = urljoin(response.url, action)
+        return self._fetch_received_date_pages(
+            search_url,
+            data,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+    def _fetch_received_date_pages(
+        self,
+        search_url: str,
+        base_data: dict[str, str],
+        *,
+        start_date: date | None,
+        end_date: date | None,
+    ) -> FetchResponse:
+        response = self._post_received_date_search(search_url, base_data, start_date=start_date, end_date=end_date)
+        cap = self._result_cap(response.text)
+        if not (cap and start_date and end_date and start_date < end_date):
+            return response
+
+        shown, total = cap
+        if total <= shown:
+            return response
+
+        midpoint = start_date + timedelta(days=(end_date - start_date).days // 2)
+        next_start = midpoint + timedelta(days=1)
+        left = self._fetch_received_date_pages(
+            search_url,
+            base_data,
+            start_date=start_date,
+            end_date=midpoint,
+        )
+        right = self._fetch_received_date_pages(
+            search_url,
+            base_data,
+            start_date=next_start,
+            end_date=end_date,
+        )
+        return FetchResponse(
+            url=right.url,
+            status_code=right.status_code,
+            text="<html><body>" + left.text + "\n" + right.text + "</body></html>",
+        )
+
+    def _post_received_date_search(
+        self,
+        search_url: str,
+        base_data: dict[str, str],
+        *,
+        start_date: date | None,
+        end_date: date | None,
+    ) -> FetchResponse:
+        data = dict(base_data)
+        if start_date:
+            data["receivedFrom"] = start_date.strftime("%d-%m-%y")
+        if end_date:
+            data["receivedTo"] = end_date.strftime("%d-%m-%y")
+        data["action"] = "Search"
+        return self.http.post_form(search_url, data)
+
+    def _result_cap(self, html_text: str) -> tuple[int, int] | None:
+        text = clean_text(" ".join(html.fromstring(html_text).xpath("//body//text()")))
+        if not text:
+            return None
+        match = re.search(
+            r"\bfirst\s+(\d+)\s+results?\s+shown,\s+there\s+are\s+(\d+)\s+in\s+total\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return None
+        return int(match.group(1)), int(match.group(2))
 
     def _fetch_aspnet_keyword_listing(
         self,

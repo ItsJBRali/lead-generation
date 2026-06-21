@@ -59,6 +59,68 @@ class FakeArcusHttpClient:
         )
 
 
+class FakeCappedArcusHttpClient(FakeArcusHttpClient):
+    def post_form(self, url: str, data: dict[str, str]) -> FetchResponse:
+        self.posted.append((url, data))
+        payload = json.loads(data["message"])
+        request = payload["actions"][0]["params"]["params"]["request"]
+        filters = {item["fieldDeveloperName"]: item["fieldValue"] for item in request["searchFilters"]}
+        start = filters["PA_ADV_DateValidFrom"]
+        end = filters["PA_ADV_DateValidTo"]
+        if start == "2026-06-01" and end == "2026-06-30":
+            threshold = "true"
+            records = """
+            {
+              "Id": "parent",
+              "Name": "26/00000/HPA",
+              "arcusbuiltenv__Received_Date__c": "2026-06-30",
+              "arcusbuiltenv__Site_Address__c": "1 Parent Road BR1 1AA",
+              "arcusbuiltenv__Proposal__c": "Parent capped row"
+            }
+            """
+        elif end == "2026-06-15":
+            threshold = "false"
+            records = """
+            {
+              "Id": "left",
+              "Name": "26/00001/HPA",
+              "arcusbuiltenv__Received_Date__c": "2026-06-12",
+              "arcusbuiltenv__Site_Address__c": "1 Left Road BR1 1AA",
+              "arcusbuiltenv__Proposal__c": "Left split row"
+            }
+            """
+        else:
+            threshold = "false"
+            records = """
+            {
+              "Id": "right",
+              "Name": "26/00002/HPA",
+              "arcusbuiltenv__Received_Date__c": "2026-06-18",
+              "arcusbuiltenv__Site_Address__c": "2 Right Road BR2 2BB",
+              "arcusbuiltenv__Proposal__c": "Right split row"
+            }
+            """
+        return FetchResponse(
+            url=url,
+            status_code=200,
+            text=f"""
+            {{
+              "actions": [
+                {{
+                  "state": "SUCCESS",
+                  "returnValue": {{
+                    "returnValue": {{
+                      "thresholdHit": {threshold},
+                      "records": [{records}]
+                    }}
+                  }}
+                }}
+              ]
+            }}
+            """,
+        )
+
+
 class ArcusPlanningScraperTest(unittest.TestCase):
     def test_discover_ids_uses_arcus_salesforce_search(self) -> None:
         http = FakeArcusHttpClient()
@@ -88,6 +150,22 @@ class ArcusPlanningScraperTest(unittest.TestCase):
             "https://planningaccess.bromley.gov.uk/pr/s/detail/a0lTv000003UuB7IAK",
         )
         self.assertTrue(application.raw["detail_complete"])
+
+    def test_threshold_hit_search_is_split_by_date_range(self) -> None:
+        http = FakeCappedArcusHttpClient()
+        scraper = ArcusPlanningScraper(
+            ArcusCouncilConfig("Bromley", "https://planningaccess.bromley.gov.uk/pr"),
+            http_client=http,
+        )
+
+        discovery = scraper.discover_ids(
+            listing_url="https://planningaccess.bromley.gov.uk/pr/s/register-view?c__r=Arcus_BE_Public_Register",
+            start_date=date(2026, 6, 1),
+            end_date=date(2026, 6, 30),
+        )
+
+        self.assertEqual(len(http.posted), 3)
+        self.assertEqual([application.reference for application in discovery.applications], ["26/00001/HPA", "26/00002/HPA"])
 
 
 if __name__ == "__main__":
