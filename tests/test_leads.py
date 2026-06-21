@@ -15,6 +15,7 @@ from unittest.mock import patch
 from lxml import html
 
 from lead_generator.planning.leads import (
+    CouncilTarget,
     DownloadedFile,
     LeadSearchConfig,
     _fetch_json_with_retry,
@@ -25,6 +26,7 @@ from lead_generator.planning.leads import (
     document_source_url_from_application_url,
     document_filename,
     document_download_candidates,
+    discover_portal_applications,
     download_document_bytes,
     download_pdf_documents,
     enrich_planit_application,
@@ -193,6 +195,104 @@ class LeadSearchTest(unittest.TestCase):
         )
 
         self.assertTrue(application_matches_search_area(application, user_geojson))
+
+    def test_discover_portal_applications_falls_back_to_planit_after_portal_error(self) -> None:
+        class BrokenScraper:
+            def discover_ids(self, **kwargs):
+                raise RuntimeError("portal unavailable")
+
+        target = CouncilTarget(
+            authority="Hampshire",
+            portal_family="unknown",
+            scraper_type="Custom",
+            base_url="https://maps.hants.gov.uk/MwpMapping/",
+            listing_url="https://maps.hants.gov.uk/MwpMapping/",
+            geometry={},
+        )
+        fallback = [
+            PlanningApplication(
+                authority="Hampshire",
+                uid="26/01274/DDTPO",
+                url="https://example.test/app",
+                reference="26/01274/DDTPO",
+                date_received="2026-06-10",
+            )
+        ]
+
+        with (
+            patch("lead_generator.planning.leads.planning_scraper_for_target", return_value=BrokenScraper()),
+            patch("lead_generator.planning.leads.discover_planit_applications", return_value=fallback) as planit,
+        ):
+            applications = discover_portal_applications(target, date(2026, 6, 8), date(2026, 6, 14))
+
+        planit.assert_called_once_with("Hampshire", date(2026, 6, 8), date(2026, 6, 14))
+        self.assertEqual(applications[0].authority, "Hampshire")
+        self.assertEqual(applications[0].raw["source"], "planit_fallback")
+        self.assertIn("portal unavailable", applications[0].raw["portal_fetch_error"])
+
+    def test_discover_portal_applications_uses_planit_alias_before_shared_buckinghamshire_portal(self) -> None:
+        target = CouncilTarget(
+            authority="Wycombe",
+            portal_family="idox",
+            scraper_type="Idox",
+            base_url="https://publicaccess.buckinghamshire.gov.uk",
+            listing_url="https://publicaccess.buckinghamshire.gov.uk/online-applications/search.do?action=advanced",
+            geometry={},
+        )
+        fallback = [
+            PlanningApplication(
+                authority="Buckinghamshire",
+                uid="PL/26/00001/FA",
+                url="https://example.test/app",
+                reference="PL/26/00001/FA",
+                date_received="2026-06-10",
+            )
+        ]
+
+        with (
+            patch("lead_generator.planning.leads.planning_scraper_for_target") as scraper_factory,
+            patch("lead_generator.planning.leads.discover_planit_applications", return_value=fallback) as planit,
+        ):
+            applications = discover_portal_applications(target, date(2026, 6, 8), date(2026, 6, 14))
+
+        scraper_factory.assert_not_called()
+        planit.assert_called_once_with("Buckinghamshire", date(2026, 6, 8), date(2026, 6, 14))
+        self.assertEqual(applications[0].authority, "Wycombe")
+        self.assertEqual(applications[0].raw["source"], "planit_fallback")
+
+    def test_discover_portal_applications_uses_planit_for_known_empty_unreliable_portal(self) -> None:
+        class EmptyScraper:
+            def discover_ids(self, **kwargs):
+                from lead_generator.planning.models import DiscoveryResult
+
+                return DiscoveryResult(authority="Lambeth", source_url="https://planning.lambeth.gov.uk", applications=[])
+
+        target = CouncilTarget(
+            authority="Lambeth",
+            portal_family="idox",
+            scraper_type="Idox",
+            base_url="https://planning.lambeth.gov.uk",
+            listing_url="https://planning.lambeth.gov.uk/online-applications/search.do?action=advanced",
+            geometry={},
+        )
+        fallback = [
+            PlanningApplication(
+                authority="Lambeth",
+                uid="26/01723/NMC",
+                url="https://example.test/app",
+                reference="26/01723/NMC",
+                date_received="2026-06-10",
+            )
+        ]
+
+        with (
+            patch("lead_generator.planning.leads.planning_scraper_for_target", return_value=EmptyScraper()),
+            patch("lead_generator.planning.leads.discover_planit_applications", return_value=fallback),
+        ):
+            applications = discover_portal_applications(target, date(2026, 6, 8), date(2026, 6, 14))
+
+        self.assertEqual([application.reference for application in applications], ["26/01723/NMC"])
+        self.assertEqual(applications[0].raw["source"], "planit_fallback")
 
     def test_run_lead_search_writes_only_location_matched_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

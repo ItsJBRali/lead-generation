@@ -103,6 +103,22 @@ FAILURE_CSV_FIELDS = ["council", "portal_family", "scraper_type", "listing_url",
 _REQUEST_THROTTLE_LOCK = threading.Lock()
 _LAST_REQUEST_AT: dict[str, float] = {}
 
+PLANIT_AUTHORITY_ALIASES = {
+    "Aylesbury Vale": ("Buckinghamshire",),
+    "Chiltern South Bucks": ("Buckinghamshire",),
+    "Wycombe": ("Buckinghamshire",),
+}
+PLANIT_EMPTY_RESULT_FALLBACK_AUTHORITIES = {
+    "Birmingham",
+    "Greater Cambridge",
+    "Hampshire",
+    "Havering",
+    "Lambeth",
+    "Lewisham",
+    "South Cambridgeshire",
+    "Surrey",
+}
+
 
 @dataclass(frozen=True, slots=True)
 class CouncilTarget:
@@ -384,12 +400,23 @@ GENERIC_DETAIL_MARKERS = (
 
 
 def discover_portal_applications(target: CouncilTarget, start_date: date, end_date: date) -> list[PlanningApplication]:
+    if target.authority in PLANIT_AUTHORITY_ALIASES:
+        planit_applications = discover_planit_fallback_applications(target, start_date, end_date)
+        if planit_applications:
+            return planit_applications
+
     scraper = planning_scraper_for_target(target)
     listing_url = target.listing_url or None
     if not listing_url and not isinstance(scraper, IdoxPublicAccessScraper):
         raise ValueError("Council has no portal search URL")
 
-    discovery = scraper.discover_ids(listing_url=listing_url, start_date=start_date, end_date=end_date)
+    try:
+        discovery = scraper.discover_ids(listing_url=listing_url, start_date=start_date, end_date=end_date)
+    except Exception as exc:
+        planit_applications = discover_planit_fallback_applications(target, start_date, end_date, portal_error=exc)
+        if planit_applications:
+            return planit_applications
+        raise
     applications: list[PlanningApplication] = []
     seen: set[str] = set()
     for stub in discovery.applications:
@@ -410,7 +437,49 @@ def discover_portal_applications(target: CouncilTarget, start_date: date, end_da
             if received is not None and (received < start_date or received > end_date):
                 continue
         applications.append(application)
+    if not applications and target.authority in PLANIT_EMPTY_RESULT_FALLBACK_AUTHORITIES:
+        planit_applications = discover_planit_fallback_applications(target, start_date, end_date)
+        if planit_applications:
+            return planit_applications
     return applications
+
+
+def discover_planit_fallback_applications(
+    target: CouncilTarget,
+    start_date: date,
+    end_date: date,
+    *,
+    portal_error: Exception | None = None,
+) -> list[PlanningApplication]:
+    last_error: Exception | None = None
+    for authority in planit_authority_candidates(target.authority):
+        try:
+            applications = discover_planit_applications(authority, start_date, end_date)
+        except Exception as exc:
+            last_error = exc
+            continue
+        if not applications:
+            continue
+        for application in applications:
+            application.authority = target.authority
+            application.raw = {
+                **(application.raw or {}),
+                "portal_family": target.portal_family,
+                "scraper_type": target.scraper_type,
+                "source": "planit_fallback",
+                "planit_authority": authority,
+            }
+            if portal_error:
+                application.raw["portal_fetch_error"] = str(portal_error)
+        return applications
+    if portal_error and last_error:
+        portal_error.add_note(f"Public planning metadata fallback also failed: {last_error}")
+    return []
+
+
+def planit_authority_candidates(authority: str) -> tuple[str, ...]:
+    aliases = PLANIT_AUTHORITY_ALIASES.get(authority, ())
+    return (*aliases, authority)
 
 
 def planning_scraper_for_target(target: CouncilTarget) -> PlanningScraper:

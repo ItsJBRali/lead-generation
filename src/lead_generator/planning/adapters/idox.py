@@ -8,7 +8,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 from lxml import html
 
 from lead_generator.planning.adapters.base import PlanningScraper
-from lead_generator.planning.http import CouncilHttpClient, FetchResponse
+from lead_generator.planning.http import CouncilFetchError, CouncilHttpClient, FetchResponse
 from lead_generator.planning.models import DiscoveryResult, PlanningApplication, PlanningDocument
 from lead_generator.planning.parsing import clean_text, extract_postcode, normalize_label, parse_council_date
 
@@ -42,7 +42,7 @@ class IdoxPublicAccessScraper(PlanningScraper):
     def __init__(self, config: IdoxCouncilConfig, *, http_client: CouncilHttpClient | None = None) -> None:
         super().__init__(config.authority)
         self.config = config
-        self.http = http_client or CouncilHttpClient()
+        self.http = http_client or CouncilHttpClient(timeout_seconds=30.0, min_delay_seconds=1.5, retries=4)
 
     def discover_ids(self, *, listing_url: str | None = None, start_date: date | None = None, end_date: date | None = None, limit: int | None = None) -> DiscoveryResult:
         if listing_url and (start_date or end_date):
@@ -225,18 +225,23 @@ class IdoxPublicAccessScraper(PlanningScraper):
         return self.http.post_form(urljoin(response.url, form.get("action")), data)
 
     def _fetch_advanced_search(self, listing_url: str, *, start_date: date | None = None, end_date: date | None = None):
-        response = self.http.get(listing_url)
-        document = html.fromstring(response.text)
-        forms = document.xpath("//form[contains(@action, 'advancedSearchResults.do') or contains(@action, 'searchResults.do')]")
-        if not forms:
-            params = self._advanced_search_dates(start_date=start_date, end_date=end_date)
-            return self.http.get(urljoin(response.url, "advancedSearchResults.do?action=firstPage"), params)
-        form = forms[0]
-        data = self._form_defaults(form)
-        data.update(self._advanced_search_dates(start_date=start_date, end_date=end_date, form_data=data))
-        data.setdefault("searchType", "Application")
-        action = form.get("action") or "advancedSearchResults.do?action=firstPage"
-        return self.http.post_form(urljoin(response.url, action), data)
+        try:
+            response = self.http.get(listing_url)
+            document = html.fromstring(response.text)
+            forms = document.xpath("//form[contains(@action, 'advancedSearchResults.do') or contains(@action, 'searchResults.do')]")
+            if not forms:
+                params = self._advanced_search_dates(start_date=start_date, end_date=end_date)
+                return self.http.get(urljoin(response.url, "advancedSearchResults.do?action=firstPage"), params)
+            form = forms[0]
+            data = self._form_defaults(form)
+            data.update(self._advanced_search_dates(start_date=start_date, end_date=end_date, form_data=data))
+            data.setdefault("searchType", "Application")
+            action = form.get("action") or "advancedSearchResults.do?action=firstPage"
+            return self.http.post_form(urljoin(response.url, action), data)
+        except CouncilFetchError:
+            if start_date or end_date:
+                return self._fetch_weekly_list(start_date=start_date, end_date=end_date)
+            raise
 
     def _advanced_search_dates(
         self,

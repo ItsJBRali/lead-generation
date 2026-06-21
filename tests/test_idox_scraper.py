@@ -4,7 +4,7 @@ from datetime import date
 import unittest
 from pathlib import Path
 
-from lead_generator.planning.http import FetchResponse
+from lead_generator.planning.http import CouncilFetchError, FetchResponse
 from lead_generator.planning.adapters.idox import IdoxCouncilConfig, IdoxPublicAccessScraper
 
 
@@ -90,6 +90,14 @@ class FakePagedAdvancedSearchHttpClient(FakeAdvancedSearchHttpClient):
         )
 
 
+class FakeAdvancedSearchFailureHttpClient(FakeHttpClient):
+    def get(self, url: str) -> FetchResponse:
+        if "action=advanced" in url:
+            self.gets.append(url)
+            raise CouncilFetchError("HTTP 500 while fetching advanced search")
+        return super().get(url)
+
+
 class IdoxPublicAccessScraperTest(unittest.TestCase):
     def setUp(self) -> None:
         self.scraper = IdoxPublicAccessScraper(IdoxCouncilConfig(authority="Example Council", base_url="https://planning.example.gov.uk"))
@@ -155,6 +163,24 @@ class IdoxPublicAccessScraperTest(unittest.TestCase):
         self.assertEqual(http.posts[0][1]["date(applicationReceivedStart)"], "21/05/2026")
         self.assertEqual(http.posts[0][1]["date(applicationReceivedEnd)"], "20/06/2026")
         self.assertNotIn("searchCriteria.dateReceivedStart", http.posts[0][1])
+
+    def test_advanced_search_failure_falls_back_to_weekly_list(self) -> None:
+        http = FakeAdvancedSearchFailureHttpClient()
+        scraper = IdoxPublicAccessScraper(
+            IdoxCouncilConfig(authority="Example Council", base_url="https://planning.example.gov.uk"),
+            http_client=http,
+        )
+
+        discovery = scraper.discover_ids(
+            listing_url="https://planning.example.gov.uk/online-applications/search.do?action=advanced",
+            start_date=date(2026, 6, 8),
+            end_date=date(2026, 6, 14),
+            limit=1,
+        )
+
+        self.assertEqual(len(discovery.applications), 1)
+        self.assertIn("search.do?action=weeklyList", http.gets[1])
+        self.assertEqual(http.posts[0][0], "https://planning.example.gov.uk/online-applications/weeklyListResults.do?action=firstPage")
 
     def test_discover_ids_follows_idox_result_pagination(self) -> None:
         http = FakePagedAdvancedSearchHttpClient()
