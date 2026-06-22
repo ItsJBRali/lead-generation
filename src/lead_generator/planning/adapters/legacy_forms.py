@@ -25,9 +25,15 @@ LABEL_MAP = {
     "application_ref": "reference",
     "application_number": "reference",
     "reference_number": "reference",
+    "reference": "reference",
+    "application": "reference",
+    "application_no": "reference",
+    "application_id": "reference",
+    "name": "reference",
     "app_no": "reference",
     "app_number": "reference",
     "case_reference": "reference",
+    "development_address": "address",
     "site_location": "address",
     "site_address": "address",
     "location": "address",
@@ -36,11 +42,17 @@ LABEL_MAP = {
     "proposed_development": "description",
     "proposal": "description",
     "description": "description",
+    "development_description": "description",
+    "summary": "description",
     "development": "description",
     "received_date": "date_received",
     "date_received": "date_received",
+    "receiveddate": "date_received",
     "registered": "date_received",
     "registered_date": "date_received",
+    "valid_from_date": "date_validated",
+    "valid_from": "date_validated",
+    "validfrom": "date_validated",
     "valid_date": "date_validated",
     "date_valid": "date_validated",
     "decision": "decision",
@@ -50,7 +62,10 @@ LABEL_MAP = {
     "parish": "parish",
 }
 
-REFERENCE_RE = re.compile(r"\b(?:[A-Z]{1,4}/)?\d{2,4}[/.-][A-Z0-9/.-]+\b", re.IGNORECASE)
+REFERENCE_RE = re.compile(
+    r"\b(?:[A-Z]{1,6}/\d{2,4}/[A-Z0-9/.-]+|[A-Z]{1,6}\d{2,4}/\d{3,6}[A-Z/.-]*|\d{2,4}/\d{3,6}/[A-Z0-9.-]+|\d{2,4}/\d{4,6})\b",
+    re.IGNORECASE,
+)
 
 
 class NativeListingScraper(PlanningScraper):
@@ -192,7 +207,18 @@ class EnterpriseStorePlanningScraper(NativeListingScraper):
         document = html.fromstring(response.text)
         form = first(document.xpath("//form[@id='frmOnlinePlanningSearch'] | //form[.//input[@name='SearchFor']]"))
         if form is None:
-            return []
+            link = first(
+                urljoin(response.url, anchor.get("href"))
+                for anchor in document.xpath("//a[@href]")
+                if "onlineplanningsearch" in (anchor.get("href") or "").casefold()
+            )
+            if not link:
+                return []
+            response = self.http.get(link)
+            document = html.fromstring(response.text)
+            form = first(document.xpath("//form[@id='frmOnlinePlanningSearch'] | //form[.//input[@name='SearchFor']]"))
+            if form is None:
+                return []
         data = self._form_defaults(form)
         result_path = data.get("urlOnlinePlanningSearchResult") or "/ES/Presentation/Planning/OnlinePlanning/OnlinePlanningSearchResults"
         data.update(
@@ -214,7 +240,6 @@ class EnterpriseStorePlanningScraper(NativeListingScraper):
             headers={"X-Requested-With": "XMLHttpRequest"},
         )
         applications = self.parse_cards(response.text, response.url)
-        applications = filter_by_date(applications, start_date, end_date)
         return applications[:limit] if limit is not None else applications
 
     def parse_cards(self, html_text: str, page_url: str) -> list[PlanningApplication]:
@@ -517,8 +542,16 @@ class AstunPlanningScraper(NativeListingScraper):
         data = self._form_defaults(form)
         if start_date:
             data["DATEAPRECV:FROM:DATE"] = start_date.strftime("%d/%m/%Y")
+            for key in list(data):
+                normalized = normalize_label(key)
+                if ("daterec" in normalized or "dateaprecv" in normalized) and ("from" in normalized or "start" in normalized):
+                    data[key] = start_date.strftime("%d/%m/%Y")
         if end_date:
             data["DATEAPRECV:TO:DATE"] = end_date.strftime("%d/%m/%Y")
+            for key in list(data):
+                normalized = normalize_label(key)
+                if ("daterec" in normalized or "dateaprecv" in normalized) and ("to" in normalized or "end" in normalized):
+                    data[key] = end_date.strftime("%d/%m/%Y")
         action = self._absolute_action(response.url, form)
         method = (form.get("method") or "get").lower()
         response = self.http.post_form(action, data) if method == "post" else self.http.get(action, data)
@@ -552,6 +585,240 @@ class AstunPlanningScraper(NativeListingScraper):
                 )
             )
         return applications
+
+
+class StatMapPlanningScraper(NativeListingScraper):
+    family = "statmap"
+
+    def search(
+        self,
+        listing_url: str,
+        *,
+        start_date: date | None,
+        end_date: date | None,
+        limit: int | None,
+    ) -> list[PlanningApplication]:
+        base = self._spa_base_url(listing_url)
+        api_url = urljoin(base + "/", "api/publicportal/planningApplications/pageRequest")
+        payload = {
+            "pagination": {"page": 0, "pageSize": limit or 50},
+            "filter": {
+                "receivedDateFrom": start_date.isoformat() if start_date else "",
+                "receivedDateTo": end_date.isoformat() if end_date else "",
+            },
+        }
+        response = self.http.post_json(api_url, payload)
+        records = json.loads(response.text).get("records") or []
+        applications = [self._from_record(record, base) for record in records[: limit or len(records)]]
+        return filter_by_date(applications, start_date, end_date)
+
+    def _spa_base_url(self, listing_url: str) -> str:
+        parts = urlsplit(listing_url)
+        path = parts.path.rstrip("/")
+        lowered = path.casefold()
+        marker = "/horizonext"
+        if marker not in lowered:
+            marker = "/horizonext"
+        index = lowered.find(marker)
+        base_path = path[: index + len(marker)] if index >= 0 else "/horizoNext"
+        return f"{parts.scheme}://{parts.netloc}{base_path}"
+
+    def _from_record(self, record: dict[str, object], base: str) -> PlanningApplication:
+        reference = string_value(record.get("name") or record.get("reference") or record.get("appRef"))
+        uid = string_value(record.get("id") or reference) or base
+        address = string_value(record.get("address"))
+        return PlanningApplication(
+            authority=self.authority,
+            uid=uid,
+            url=urljoin(base + "/", f"publicportal/planningapplications/{uid}"),
+            reference=reference,
+            address=address,
+            description=string_value(record.get("proposal")),
+            status=string_value(record.get("status")),
+            decision=string_value(record.get("decision")),
+            date_received=parse_portal_date(string_value(record.get("receivedDate"))),
+            date_validated=parse_portal_date(string_value(record.get("validatedDate") or record.get("registeredDate"))),
+            postcode=extract_postcode(address),
+            source_url=base,
+            raw={"portal_family": self.family, "detail_complete": True, "record": record},
+        )
+
+
+class SocrataPlanningScraper(NativeListingScraper):
+    family = "socrata"
+
+    def search(
+        self,
+        listing_url: str,
+        *,
+        start_date: date | None,
+        end_date: date | None,
+        limit: int | None,
+    ) -> list[PlanningApplication]:
+        dataset_match = re.search(r"/([a-z0-9]{4}-[a-z0-9]{4})(?:/|$)", listing_url, re.IGNORECASE)
+        dataset = dataset_match.group(1) if dataset_match else "2eiu-s2cw"
+        parts = urlsplit(listing_url)
+        api_url = f"{parts.scheme}://{parts.netloc}/resource/{dataset}.json"
+        params = {"$limit": str(limit or 100), "$order": "registered_date DESC"}
+        where: list[str] = []
+        if start_date:
+            where.append(f"registered_date >= '{start_date.isoformat()}T00:00:00'")
+        if end_date:
+            where.append(f"registered_date <= '{end_date.isoformat()}T23:59:59'")
+        if where:
+            params["$where"] = " AND ".join(where)
+        response = self.http.get(api_url, params)
+        rows = json.loads(response.text)
+        return filter_by_date([self._from_row(row, api_url) for row in rows], start_date, end_date)
+
+    def _from_row(self, row: dict[str, object], source_url: str) -> PlanningApplication:
+        reference = string_value(row.get("application_number"))
+        address = string_value(row.get("development_address"))
+        return PlanningApplication(
+            authority=self.authority,
+            uid=string_value(row.get("pk") or reference) or source_url,
+            url=source_url,
+            reference=reference,
+            address=address,
+            description=string_value(row.get("development_description")),
+            status=string_value(row.get("system_status")),
+            decision=string_value(row.get("decision_type")),
+            date_received=parse_portal_date(string_value(row.get("registered_date"))),
+            date_validated=parse_portal_date(string_value(row.get("valid_from_date"))),
+            applicant_name=string_value(row.get("applicant_name")),
+            ward=string_value(row.get("ward")),
+            postcode=extract_postcode(address),
+            source_url=source_url,
+            raw={"portal_family": self.family, "detail_complete": True, "row": row},
+        )
+
+
+class HtmlListPlanningScraper(NativeListingScraper):
+    family = "html_list"
+
+    def search(
+        self,
+        listing_url: str,
+        *,
+        start_date: date | None,
+        end_date: date | None,
+        limit: int | None,
+    ) -> list[PlanningApplication]:
+        response = self.http.get(self._search_url(listing_url, start_date, end_date))
+        applications = self.parse_listing(response.text, response.url)
+        if not applications and response.url != listing_url:
+            response = self.http.get(listing_url)
+            applications = self.parse_listing(response.text, response.url)
+        return applications[:limit] if limit is not None else applications
+
+    def _search_url(self, listing_url: str, start_date: date | None, end_date: date | None) -> str:
+        if "copeland.gov.uk/planning/application-search" in listing_url and (start_date or end_date):
+            params = {
+                "field_plan_app_date_received_value[min][date]": start_date.isoformat() if start_date else "",
+                "field_plan_app_date_received_value[max][date]": end_date.isoformat() if end_date else "",
+            }
+            return listing_url + ("&" if "?" in listing_url else "?") + urlencode(params)
+        return listing_url
+
+    def parse_listing(self, html_text: str, page_url: str) -> list[PlanningApplication]:
+        document = html.fromstring(html_text)
+        applications: list[PlanningApplication] = []
+        seen: set[str] = set()
+        for anchor in document.xpath("//a[@href]"):
+            href = anchor.get("href") or ""
+            text = clean_text(" ".join(anchor.itertext())) or ""
+            reference = extract_reference(f"{text} {href}")
+            if not reference:
+                continue
+            if not any(token in href.casefold() for token in ("planning", "application", "/application/", "eplanning")):
+                continue
+            key = reference.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            container = clean_text(" ".join((anchor.xpath("ancestor::article[1] | ancestor::li[1] | ancestor::div[1]") or [anchor])[0].itertext()))
+            applications.append(
+                PlanningApplication(
+                    authority=self.authority,
+                    uid=reference,
+                    url=urljoin(page_url, href),
+                    reference=reference,
+                    address=trim_text((container or "").replace(reference, " "), 240),
+                    description=trim_text(container, 500),
+                    date_received=parse_council_date(first_date(container)),
+                    postcode=extract_postcode(container),
+                    source_url=page_url,
+                    raw={"portal_family": self.family, "detail_complete": True, "listing_text": container},
+                )
+            )
+        return applications
+
+
+class QueryFormPlanningScraper(NativeListingScraper):
+    family = "query_form"
+
+    def search(
+        self,
+        listing_url: str,
+        *,
+        start_date: date | None,
+        end_date: date | None,
+        limit: int | None,
+    ) -> list[PlanningApplication]:
+        response = self.http.get(listing_url)
+        document = html.fromstring(response.text)
+        form = self._pick_form(document)
+        if form is None:
+            return HtmlListPlanningScraper(self.config, http_client=self.http).parse_listing(response.text, response.url)[: limit or 100]
+        data = self._form_defaults(form)
+        self._set_dates(data, start_date, end_date)
+        submit = first(node.get("name") for node in form.xpath(".//input[@type='submit' and @name]"))
+        if submit and submit not in data:
+            data[submit] = first(node.get("value") for node in form.xpath(f".//input[@name='{submit}']")) or "Search"
+        action = self._absolute_action(response.url, form)
+        method = (form.get("method") or "get").lower()
+        result = self.http.post_form(action, data) if method == "post" else self.http.get(action, data)
+        applications = parse_header_tables(result.text, result.url, self.authority, self.family)
+        if not applications:
+            applications = HtmlListPlanningScraper(self.config, http_client=self.http).parse_listing(result.text, result.url)
+        applications = filter_by_date(applications, start_date, end_date)
+        return applications[:limit] if limit is not None else applications
+
+    def _pick_form(self, document: html.HtmlElement) -> html.HtmlElement | None:
+        forms = document.xpath(
+            "//form[.//input[contains(translate(@name,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'date')] "
+            "or .//input[contains(translate(@name,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'regdate')] "
+            "or .//input[contains(translate(@name,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'search')] "
+            "or .//input[contains(translate(@name,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'proposal')]]"
+        )
+        return forms[-1] if forms else first(document.xpath("//form"))
+
+    def _set_dates(self, data: dict[str, str], start_date: date | None, end_date: date | None) -> None:
+        for key in list(data):
+            normalized = normalize_label(key)
+            if start_date and any(token in normalized for token in ("from", "start", "min", "regdate1", "date1")):
+                if "date" in normalized or "regdate" in normalized:
+                    data[key] = start_date.strftime("%d/%m/%Y")
+            if end_date and any(token in normalized for token in ("to", "end", "max", "regdate2", "date2")):
+                if "date" in normalized or "regdate" in normalized:
+                    data[key] = end_date.strftime("%d/%m/%Y")
+
+
+class WebFormsPlanningScraper(QueryFormPlanningScraper):
+    family = "webforms"
+
+
+class NorthLincsPlanningScraper(HtmlListPlanningScraper):
+    family = "northlincs"
+
+    def _search_url(self, listing_url: str, start_date: date | None, end_date: date | None) -> str:
+        parts = urlsplit(listing_url)
+        params = {"status": "2", "dateType": "valid"}
+        if start_date:
+            params["startDate"] = start_date.isoformat()
+        if end_date:
+            params["endDate"] = end_date.isoformat()
+        return f"{parts.scheme}://{parts.netloc}/search?" + urlencode(params)
 
 
 def parse_header_tables(html_text: str, page_url: str, authority: str, family: str) -> list[PlanningApplication]:
@@ -672,6 +939,35 @@ def labelled_values_from_text(text: str) -> dict[str, str]:
         if match:
             fields[label.rstrip(":")] = clean_text(match.group(1)) or ""
     return fields
+
+
+def string_value(value: object) -> str | None:
+    if value is None:
+        return None
+    return clean_text(str(value))
+
+
+def parse_portal_date(value: str | None) -> str | None:
+    if value and "T" in value:
+        value = value.split("T", 1)[0]
+    return parse_council_date(value)
+
+
+def first_date(text: str | None) -> str | None:
+    if not text:
+        return None
+    match = re.search(
+        r"\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{1,2}\s+[A-Z][a-z]+\s+\d{4}|[A-Z][a-z]{2}\s+\d{1,2},?\s+\d{4})\b",
+        text,
+    )
+    return match.group(0) if match else None
+
+
+def trim_text(text: str | None, limit: int) -> str | None:
+    cleaned = clean_text(text)
+    if not cleaned:
+        return None
+    return cleaned[:limit]
 
 
 def nearest_table_text(anchor: html.HtmlElement) -> str | None:

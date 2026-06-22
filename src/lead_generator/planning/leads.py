@@ -37,15 +37,21 @@ from lead_generator.planning.adapters import (
     CivicaPlanningScraper,
     EnterpriseStorePlanningScraper,
     FastwebPlanningScraper,
+    HtmlListPlanningScraper,
     IdoxCouncilConfig,
     IdoxPublicAccessScraper,
     LegacyFormsCouncilConfig,
     NorthgateCouncilConfig,
+    NorthLincsPlanningScraper,
     NorthgatePlanningScraper,
     OcellaCouncilConfig,
     OcellaPlanningScraper,
     PlanningScraper,
+    QueryFormPlanningScraper,
+    SocrataPlanningScraper,
+    StatMapPlanningScraper,
     TascomiPlanningScraper,
+    WebFormsPlanningScraper,
 )
 from lead_generator.planning.adapters.civica import fetch_civica_documents_from_raw
 from lead_generator.planning.adapters.generic import GenericCouncilConfig, GenericLabelledPlanningScraper
@@ -498,6 +504,7 @@ def planning_scraper_for_target(target: CouncilTarget) -> PlanningScraper:
     scraper_type = (target.scraper_type or "").casefold()
     family = (target.portal_family or "").casefold()
     portal_key = f"{scraper_type} {family}"
+    authority_key = target.authority.casefold()
 
     if "arcus" in portal_key:
         return ArcusPlanningScraper(ArcusCouncilConfig(authority=target.authority, base_url=base_url))
@@ -516,8 +523,46 @@ def planning_scraper_for_target(target: CouncilTarget) -> PlanningScraper:
         return FastwebPlanningScraper(LegacyFormsCouncilConfig(authority=target.authority, base_url=base_url))
     if "cced" in portal_key:
         return CcedPlanningScraper(LegacyFormsCouncilConfig(authority=target.authority, base_url=base_url))
-    if "astun" in portal_key or "developmentcontrol.aspx" in portal_key:
+    if "astun" in portal_key or "developmentcontrol.aspx" in portal_key or "advancedsearchtab.tmplt" in listing_key:
         return AstunPlanningScraper(LegacyFormsCouncilConfig(authority=target.authority, base_url=base_url))
+    if "socrata" in portal_key or "opendata.camden.gov.uk" in listing_key or authority_key == "camden":
+        return SocrataPlanningScraper(LegacyFormsCouncilConfig(authority=target.authority, base_url=base_url))
+    if "statmap" in portal_key or "horizonext" in listing_key or "horizonext" in listing_key:
+        return StatMapPlanningScraper(LegacyFormsCouncilConfig(authority=target.authority, base_url=base_url))
+    if authority_key in {"eastleigh", "wiltshire"}:
+        return ArcusPlanningScraper(ArcusCouncilConfig(authority=target.authority, base_url=base_url))
+    if authority_key == "peak district":
+        return EnterpriseStorePlanningScraper(
+            LegacyFormsCouncilConfig(authority=target.authority, base_url="https://planning.peakdistrict.gov.uk")
+        )
+    if authority_key == "north lincs":
+        return NorthLincsPlanningScraper(LegacyFormsCouncilConfig(authority=target.authority, base_url=base_url))
+    if authority_key in {
+        "copeland",
+        "scilly isles",
+        "south derbyshire",
+        "amber valley",
+        "stratford on avon",
+        "cumberland",
+    }:
+        return HtmlListPlanningScraper(LegacyFormsCouncilConfig(authority=target.authority, base_url=base_url))
+    if authority_key in {
+        "east sussex",
+        "kirklees",
+        "nottinghamshire",
+        "preston",
+        "tandridge",
+        "boston",
+        "barrow",
+        "central bedfordshire",
+        "hampshire",
+        "herefordshire",
+        "ipswich",
+        "ribble valley",
+        "sedgemoor",
+        "taunton deane",
+    }:
+        return QueryFormPlanningScraper(LegacyFormsCouncilConfig(authority=target.authority, base_url=base_url))
     if "idox" in portal_key:
         return IdoxPublicAccessScraper(
             IdoxCouncilConfig(

@@ -20,7 +20,11 @@ from lead_generator.planning.adapters.legacy_forms import (
     CcedPlanningScraper,
     EnterpriseStorePlanningScraper,
     FastwebPlanningScraper,
+    HtmlListPlanningScraper,
     LegacyFormsCouncilConfig,
+    QueryFormPlanningScraper,
+    SocrataPlanningScraper,
+    StatMapPlanningScraper,
     TascomiPlanningScraper,
 )
 from lead_generator.planning.adapters.northgate import (
@@ -382,6 +386,10 @@ class FakeLegacyFormsHttpClient:
         self.posts.append((url, data))
         return FetchResponse(url=url, status_code=200, text=self.pages.get("post:" + url, self.pages.get("post", "")))
 
+    def post_json(self, url: str, data: object) -> FetchResponse:
+        self.posts.append((url, data))
+        return FetchResponse(url=url, status_code=200, text=self.pages.get("post:" + url, self.pages.get("post", "")))
+
 
 class NonIdoxScraperTest(unittest.TestCase):
     def test_achieveforms_weekly_lookup_fetches_application_details(self) -> None:
@@ -613,6 +621,80 @@ class NonIdoxScraperTest(unittest.TestCase):
 
         self.assertEqual(http.gets[1][1]["DATEAPRECV:FROM:DATE"], "08/06/2026")
         self.assertEqual(discovery.applications[0].reference, "26/00456/FUL")
+
+    def test_statmap_posts_page_request(self) -> None:
+        http = FakeLegacyFormsHttpClient({"post": '{"records":[{"id":"130473","name":"MO/2026/00790","address":"25 Cleardene RH4 2BY","proposal":"Rear extension","receivedDate":"2026-06-11T05:55:13","status":"Live"}]}'})
+        scraper = StatMapPlanningScraper(LegacyFormsCouncilConfig("Mole Valley", "https://molevalley.example"), http_client=http)
+
+        discovery = scraper.discover_ids(
+            listing_url="https://molevalley.example/horizoNext/",
+            start_date=date(2026, 6, 8),
+            end_date=date(2026, 6, 14),
+        )
+
+        self.assertIn("/api/publicportal/planningApplications/pageRequest", http.posts[0][0])
+        self.assertEqual(discovery.applications[0].reference, "MO/2026/00790")
+        self.assertEqual(discovery.applications[0].date_received, "2026-06-11")
+
+    def test_socrata_uses_dataset_api(self) -> None:
+        http = FakeLegacyFormsHttpClient(
+            {
+                "get:results": '[{"pk":"213154","application_number":"2026/1234/P","development_address":"1 Camden Road NW1 1AA","development_description":"New gates","registered_date":"2026-06-10T00:00:00.000"}]'
+            }
+        )
+        scraper = SocrataPlanningScraper(LegacyFormsCouncilConfig("Camden", "https://opendata.camden.gov.uk"), http_client=http)
+
+        discovery = scraper.discover_ids(
+            listing_url="https://opendata.camden.gov.uk/Environment/Planning-Applications/2eiu-s2cw/about_data",
+            start_date=date(2026, 6, 8),
+            end_date=date(2026, 6, 14),
+        )
+
+        self.assertIn("/resource/2eiu-s2cw.json", http.gets[0][0])
+        self.assertEqual(discovery.applications[0].reference, "2026/1234/P")
+
+    def test_html_list_parses_application_links(self) -> None:
+        http = FakeLegacyFormsHttpClient(
+            {
+                "get": """
+                <article><a href="/planning-application/planning-application-p26049cou">Planning application: P/26/049/COU</a>
+                <p>Received 10/06/2026. Replacement boundary gates at Hugh Town TR21 0AA</p></article>
+                """
+            }
+        )
+        scraper = HtmlListPlanningScraper(LegacyFormsCouncilConfig("Scilly Isles", "https://www.scilly.gov.uk"), http_client=http)
+
+        discovery = scraper.discover_ids(
+            listing_url="https://www.scilly.gov.uk/planning-development/planning-applications",
+            start_date=date(2026, 6, 8),
+            end_date=date(2026, 6, 14),
+        )
+
+        self.assertEqual(discovery.applications[0].reference, "P/26/049/COU")
+        self.assertEqual(discovery.applications[0].postcode, "TR21 0AA")
+
+    def test_query_form_submits_date_fields(self) -> None:
+        http = FakeLegacyFormsHttpClient(
+            {
+                "get": """
+                <form method="get" action="/results"><input name="regdate1"><input name="regdate2"><input name="proposal"></form>
+                """,
+                "get:results": """
+                <table><tr><th>Reference</th><th>Location</th><th>Proposal</th><th>Received Date</th></tr>
+                <tr><td>26/00123/FUL</td><td>1 High Street AB1 2CD</td><td>Install gates</td><td>09/06/2026</td></tr></table>
+                """,
+            }
+        )
+        scraper = QueryFormPlanningScraper(LegacyFormsCouncilConfig("Classic", "https://planning.example.gov.uk"), http_client=http)
+
+        discovery = scraper.discover_ids(
+            listing_url="https://planning.example.gov.uk/search",
+            start_date=date(2026, 6, 8),
+            end_date=date(2026, 6, 14),
+        )
+
+        self.assertEqual(http.gets[1][1]["regdate1"], "08/06/2026")
+        self.assertEqual(discovery.applications[0].reference, "26/00123/FUL")
 
     def test_civica_listing_and_detail(self) -> None:
         scraper = CivicaPlanningScraper(
