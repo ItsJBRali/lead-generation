@@ -80,15 +80,23 @@ class CouncilHttpClient:
             response = self._send(request, url)
         return response
 
-    def post_form(self, url: str, data: dict[str, str]) -> FetchResponse:
+    def post_form(
+        self,
+        url: str,
+        data: dict[str, str],
+        headers: dict[str, str] | None = None,
+    ) -> FetchResponse:
         encoded = urlencode(data).encode("utf-8")
+        request_headers = {
+            "User-Agent": self.user_agent,
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+        if headers:
+            request_headers.update(headers)
         request = Request(
             url,
             data=encoded,
-            headers={
-                "User-Agent": self.user_agent,
-                "Content-Type": "application/x-www-form-urlencoded",
-            },
+            headers=request_headers,
             method="POST",
         )
         return self._send(request, url)

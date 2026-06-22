@@ -17,6 +17,12 @@ PORTAL_SIGNATURES: tuple[PortalSignature, ...] = (
     PortalSignature("agile", ("agile applications", "wphappdetail.displayurl", "/apas/run/")),
     PortalSignature("achieveforms", ("achieveforms", "fs.formdefinition", "form_uri=sandbox-publish", "/fillform/")),
     PortalSignature("atrium", ("/search/advanced", "/search/results", "/planning/display/", "list of planning cases - search results")),
+    PortalSignature("tascomi", ("tascomi", "fa=getapplication", "fa=search", "received_date_from")),
+    PortalSignature("enterprisestore", ("onlineplanningsearch", "onlineplanningoverview", "urlonlineplanningsearchresult")),
+    PortalSignature("appsearchserv", ("applicationsearchservlet", "appsearchform", "validdatefrom")),
+    PortalSignature("fastweb", ("fastweb", "datereceivedstart", "detail.asp?altref")),
+    PortalSignature("cced", ("cced", "dorsetcouncil.gov.uk/advsearch", "txtdatereceivedfrom")),
+    PortalSignature("astun", ("developmentcontrol.aspx", "developmentcontroladvancedsearch.tmplt", "dateaprecv:from:date")),
 )
 
 

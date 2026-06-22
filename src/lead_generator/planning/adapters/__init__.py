@@ -7,6 +7,15 @@ from .arcus import ArcusCouncilConfig, ArcusPlanningScraper
 from .atrium import AtriumCouncilConfig, AtriumPlanningScraper
 from .civica import CivicaCouncilConfig, CivicaPlanningScraper
 from .idox import IdoxCouncilConfig, IdoxPublicAccessScraper
+from .legacy_forms import (
+    AppSearchServPlanningScraper,
+    AstunPlanningScraper,
+    CcedPlanningScraper,
+    EnterpriseStorePlanningScraper,
+    FastwebPlanningScraper,
+    LegacyFormsCouncilConfig,
+    TascomiPlanningScraper,
+)
 from .northgate import NorthgateCouncilConfig, NorthgatePlanningScraper
 from .ocella import OcellaCouncilConfig, OcellaPlanningScraper
 
@@ -24,6 +33,13 @@ __all__ = [
     "CivicaPlanningScraper",
     "IdoxCouncilConfig",
     "IdoxPublicAccessScraper",
+    "AppSearchServPlanningScraper",
+    "AstunPlanningScraper",
+    "CcedPlanningScraper",
+    "EnterpriseStorePlanningScraper",
+    "FastwebPlanningScraper",
+    "LegacyFormsCouncilConfig",
+    "TascomiPlanningScraper",
     "NorthgateCouncilConfig",
     "NorthgatePlanningScraper",
     "OcellaCouncilConfig",

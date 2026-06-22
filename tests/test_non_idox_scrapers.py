@@ -14,6 +14,15 @@ from lead_generator.planning.adapters.civica import (
     CivicaPlanningScraper,
     fetch_civica_documents_from_raw,
 )
+from lead_generator.planning.adapters.legacy_forms import (
+    AppSearchServPlanningScraper,
+    AstunPlanningScraper,
+    CcedPlanningScraper,
+    EnterpriseStorePlanningScraper,
+    FastwebPlanningScraper,
+    LegacyFormsCouncilConfig,
+    TascomiPlanningScraper,
+)
 from lead_generator.planning.adapters.northgate import (
     NorthgateCouncilConfig,
     NorthgatePlanningScraper,
@@ -346,6 +355,34 @@ class FakeAtriumHttpClient:
         )
 
 
+class FakeLegacyFormsHttpClient:
+    def __init__(self, pages: dict[str, str]) -> None:
+        self.pages = pages
+        self.posts: list[tuple[str, dict[str, str]]] = []
+        self.gets: list[tuple[str, dict[str, str] | None]] = []
+
+    def get(
+        self,
+        url: str,
+        params: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> FetchResponse:
+        self.gets.append((url, params))
+        key = "get:" + url
+        if params:
+            key = "get:results"
+        return FetchResponse(url=url, status_code=200, text=self.pages.get(key, self.pages.get("get", "")))
+
+    def post_form(
+        self,
+        url: str,
+        data: dict[str, str],
+        headers: dict[str, str] | None = None,
+    ) -> FetchResponse:
+        self.posts.append((url, data))
+        return FetchResponse(url=url, status_code=200, text=self.pages.get("post:" + url, self.pages.get("post", "")))
+
+
 class NonIdoxScraperTest(unittest.TestCase):
     def test_achieveforms_weekly_lookup_fetches_application_details(self) -> None:
         http = FakeAchieveFormsHttpClient()
@@ -391,6 +428,191 @@ class NonIdoxScraperTest(unittest.TestCase):
         self.assertEqual(discovery.applications[0].date_validated, "2026-06-13")
         self.assertEqual(discovery.applications[1].reference, "20260844")
         self.assertIn("ResultsPage/2", http.gets[-1])
+
+    def test_tascomi_search_uses_received_dates(self) -> None:
+        http = FakeLegacyFormsHttpClient(
+            {
+                "get": """
+                <form method="post" action="/planning/index.html">
+                  <input name="fa" value="search"><input name="received_date_from"><input name="received_date_to">
+                </form>
+                """,
+                "post": """
+                <table>
+                  <tr><th>Application Reference</th><th>Location Details</th><th>Proposal</th><th>View</th></tr>
+                  <tr><td>PL/1674/26</td><td>1 High Street HA1 1AA</td><td>Install entrance gates</td><td><a href="/planning/index.html?fa=getApplication&id=233493">View</a></td></tr>
+                </table>
+                """,
+            }
+        )
+        scraper = TascomiPlanningScraper(LegacyFormsCouncilConfig("Harrow", "https://planning.example.gov.uk"), http_client=http)
+
+        discovery = scraper.discover_ids(
+            listing_url="https://planning.example.gov.uk/planning/index.html?fa=search",
+            start_date=date(2026, 6, 8),
+            end_date=date(2026, 6, 14),
+        )
+
+        self.assertEqual(http.posts[0][1]["received_date_from"], "08-06-2026")
+        self.assertEqual(discovery.applications[0].reference, "PL/1674/26")
+        self.assertEqual(discovery.applications[0].description, "Install entrance gates")
+        self.assertTrue(discovery.applications[0].raw["detail_complete"])
+
+    def test_enterprisestore_search_uses_ajax_result_path(self) -> None:
+        http = FakeLegacyFormsHttpClient(
+            {
+                "get": """
+                <form id="frmOnlinePlanningSearch">
+                  <input name="urlOnlinePlanningSearchResult" value="/NECSWS/ES/Presentation/Planning/OnlinePlanning/OnlinePlanningSearchResults">
+                  <input name="FromDate"><input name="ToDate">
+                </form>
+                """,
+                "post": """
+                <a href="/NECSWS/ES/Presentation/Planning/OnlinePlanning/OnlinePlanningOverview?applicationNumber=P%2F2026%2F01498%2FDET&guid=abc">10 King Street W6 9XY</a>
+                <a href="/NECSWS/ES/Presentation/Planning/OnlinePlanning/OnlinePlanningOverview?applicationNumber=P%2F2026%2F01498%2FDET&guid=abc">Details reserved</a>
+                <a href="/NECSWS/ES/Presentation/Planning/OnlinePlanning/OnlinePlanningOverview?applicationNumber=P%2F2026%2F01498%2FDET&guid=abc">New automated gates</a>
+                <a href="/NECSWS/ES/Presentation/Planning/OnlinePlanning/OnlinePlanningOverview?applicationNumber=P%2F2026%2F01498%2FDET&guid=abc">Application No: P/2026/01498/DET | Registered : 12 June 2026</a>
+                """,
+            }
+        )
+        scraper = EnterpriseStorePlanningScraper(
+            LegacyFormsCouncilConfig("Hammersmith and Fulham", "https://property.example.gov.uk"),
+            http_client=http,
+        )
+
+        discovery = scraper.discover_ids(
+            listing_url="https://property.example.gov.uk/NECSWS/ES/Presentation/Planning/OnlinePlanning/OnlinePlanningSearch",
+            start_date=date(2026, 6, 8),
+            end_date=date(2026, 6, 14),
+        )
+
+        payload = http.posts[0][1]
+        self.assertEqual(payload["FromDate"], "08/06/2026")
+        self.assertEqual(payload["ToDate"], "14/06/2026")
+        self.assertIn("OnlinePlanningSearchResults", http.posts[0][0])
+        self.assertEqual(discovery.applications[0].reference, "P/2026/01498/DET")
+        self.assertEqual(discovery.applications[0].date_received, "2026-06-12")
+
+    def test_appsearchserv_uses_received_or_valid_dates(self) -> None:
+        http = FakeLegacyFormsHttpClient(
+            {
+                "get": """
+                <form name="AppSearchForm" action="../servlets/ApplicationSearchServlet" method="post">
+                  <input name="ReceivedDateFrom"><input name="ReceivedDateTo">
+                </form>
+                """,
+                "post": """
+                <table>
+                  <tr><th>Application number</th><th>Received date</th><th>Site location</th><th>Proposal</th></tr>
+                  <tr><td><a href="../servlets/ApplicationSearchServlet?PKID=169307">H/2026/0141</a></td><td>10/06/2026</td><td>12 Marina Way TS24 0AA</td><td>Replacement gates</td></tr>
+                </table>
+                """,
+            }
+        )
+        scraper = AppSearchServPlanningScraper(LegacyFormsCouncilConfig("Hartlepool", "https://planning.example.gov.uk"), http_client=http)
+
+        discovery = scraper.discover_ids(
+            listing_url="https://planning.example.gov.uk/portal/servlets/ApplicationSearchServlet",
+            start_date=date(2026, 6, 8),
+            end_date=date(2026, 6, 14),
+        )
+
+        self.assertEqual(http.posts[0][1]["ReceivedDateFrom"], "08/06/2026")
+        self.assertEqual(discovery.applications[0].reference, "H/2026/0141")
+        self.assertEqual(discovery.applications[0].date_received, "2026-06-10")
+
+    def test_fastweb_search_follows_next_page(self) -> None:
+        first_page = """
+        <html><body>
+          <table><tr><td><a href="detail.asp?AltRef=RB2026/0808">Details</a></td></tr>
+          <tr><td>App. No.: RB2026/0808 Site Address: 1 Main Road S60 1AA Description: New access gates Received Date: 10/06/2026 Decision Sent Date:</td></tr></table>
+          <a href="results.asp?Scroll=2">Next</a>
+        </body></html>
+        """
+        second_page = """
+        <html><body><table><tr><td><a href="detail.asp?AltRef=RB2026/0810">Details</a></td></tr>
+        <tr><td>App. No.: RB2026/0810 Site Address: 2 Main Road S60 1AB Description: Boundary wall Received Date: 11/06/2026 Decision Sent Date:</td></tr></table></body></html>
+        """
+        http = FakeLegacyFormsHttpClient(
+            {
+                "get": """
+                <form name="SearchForm" action="results.asp" method="post">
+                  <input name="DateReceivedStart"><input name="DateReceivedEnd">
+                </form>
+                """,
+                "post": first_page,
+                "get:https://planning.example.gov.uk/fastweblive/results.asp?Scroll=2": second_page,
+            }
+        )
+        scraper = FastwebPlanningScraper(LegacyFormsCouncilConfig("Rotherham", "https://planning.example.gov.uk"), http_client=http)
+
+        discovery = scraper.discover_ids(
+            listing_url="https://planning.example.gov.uk/fastweblive/search.asp",
+            start_date=date(2026, 6, 8),
+            end_date=date(2026, 6, 14),
+        )
+
+        self.assertEqual(http.posts[0][1]["DateReceivedStart"], "08/06/2026")
+        self.assertEqual([app.reference for app in discovery.applications], ["RB2026/0808", "RB2026/0810"])
+
+    def test_cced_accepts_disclaimer_and_parses_result_cards(self) -> None:
+        http = FakeLegacyFormsHttpClient(
+            {
+                "get": """
+                <form id="aspnetForm" action="./disclaimer.aspx" method="post">
+                  <input name="__VIEWSTATE" value="x"><input type="submit" name="ctl00$ContentPlaceHolder1$btnAccept" value="Accept">
+                </form>
+                """,
+                "post": """
+                <form id="aspnetForm" action="./advsearch.aspx" method="post">
+                  <input name="ctl00$ContentPlaceHolder1$txtDateReceivedFrom"><input name="ctl00$ContentPlaceHolder1$txtDateReceivedTo">
+                  <input type="submit" name="ctl00$ContentPlaceHolder1$btnSearch3" value="Search">
+                </form>
+                """,
+                "post:https://planning.example.gov.uk/advsearch.aspx": """
+                P/HOU/2026/03140 Location: 22 St Leonards Avenue DT11 7NY Proposal: Erect wall and gates Decision: Decision Date: View this application
+                """,
+            }
+        )
+        scraper = CcedPlanningScraper(LegacyFormsCouncilConfig("Dorset", "https://planning.example.gov.uk"), http_client=http)
+
+        discovery = scraper.discover_ids(
+            listing_url="https://planning.example.gov.uk/advsearch.aspx",
+            start_date=date(2026, 6, 8),
+            end_date=date(2026, 6, 14),
+        )
+
+        self.assertEqual(http.posts[0][1]["ctl00$ContentPlaceHolder1$btnAccept"], "Accept")
+        self.assertEqual(http.posts[1][1]["ctl00$ContentPlaceHolder1$txtDateReceivedFrom"], "08/06/2026")
+        self.assertEqual(discovery.applications[0].reference, "P/HOU/2026/03140")
+
+    def test_astun_submits_get_search_dates(self) -> None:
+        http = FakeLegacyFormsHttpClient(
+            {
+                "get": """
+                <form id="atParentContainer" method="GET" action="https://maps.example.gov.uk/DevelopmentControl.aspx">
+                  <input name="template" value="DevelopmentControlResults.tmplt"><input name="requestType" value="parseTemplate">
+                  <input name="DATEAPRECV:FROM:DATE"><input name="DATEAPRECV:TO:DATE">
+                </form>
+                """,
+                "get:results": """
+                <table>
+                  <tr><th>Reference</th><th>Location</th><th>Proposal</th><th>Received Date</th></tr>
+                  <tr><td>26/00456/FUL</td><td>1 South Street SS4 1AA</td><td>Install access gate</td><td>09/06/2026</td></tr>
+                </table>
+                """,
+            }
+        )
+        scraper = AstunPlanningScraper(LegacyFormsCouncilConfig("Rochford", "https://maps.example.gov.uk"), http_client=http)
+
+        discovery = scraper.discover_ids(
+            listing_url="https://maps.example.gov.uk/DevelopmentControl.aspx?RequestType=ParseTemplate&template=DevelopmentControlAdvancedSearch.tmplt",
+            start_date=date(2026, 6, 8),
+            end_date=date(2026, 6, 14),
+        )
+
+        self.assertEqual(http.gets[1][1]["DATEAPRECV:FROM:DATE"], "08/06/2026")
+        self.assertEqual(discovery.applications[0].reference, "26/00456/FUL")
 
     def test_civica_listing_and_detail(self) -> None:
         scraper = CivicaPlanningScraper(

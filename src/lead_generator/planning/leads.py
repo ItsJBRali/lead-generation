@@ -26,19 +26,26 @@ from lead_generator.planning.adapters import (
     AchieveFormsPlanningScraper,
     AgileCouncilConfig,
     AgilePlanningScraper,
+    AppSearchServPlanningScraper,
     ArcusCouncilConfig,
     ArcusPlanningScraper,
+    AstunPlanningScraper,
     AtriumCouncilConfig,
     AtriumPlanningScraper,
+    CcedPlanningScraper,
     CivicaCouncilConfig,
     CivicaPlanningScraper,
+    EnterpriseStorePlanningScraper,
+    FastwebPlanningScraper,
     IdoxCouncilConfig,
     IdoxPublicAccessScraper,
+    LegacyFormsCouncilConfig,
     NorthgateCouncilConfig,
     NorthgatePlanningScraper,
     OcellaCouncilConfig,
     OcellaPlanningScraper,
     PlanningScraper,
+    TascomiPlanningScraper,
 )
 from lead_generator.planning.adapters.civica import fetch_civica_documents_from_raw
 from lead_generator.planning.adapters.generic import GenericCouncilConfig, GenericLabelledPlanningScraper
@@ -498,6 +505,19 @@ def planning_scraper_for_target(target: CouncilTarget) -> PlanningScraper:
         return AchieveFormsPlanningScraper(AchieveFormsCouncilConfig(authority=target.authority, base_url=base_url))
     if "atrium" in portal_key:
         return AtriumPlanningScraper(AtriumCouncilConfig(authority=target.authority, base_url=base_url))
+    listing_key = (target.listing_url or "").casefold()
+    if "tascomi" in portal_key and ("tascomi" in listing_key or "/planning/index.html" in listing_key):
+        return TascomiPlanningScraper(LegacyFormsCouncilConfig(authority=target.authority, base_url=base_url))
+    if "enterprisestore" in portal_key or "enterprise store" in portal_key:
+        return EnterpriseStorePlanningScraper(LegacyFormsCouncilConfig(authority=target.authority, base_url=base_url))
+    if "appsearchserv" in portal_key or "applicationsearchservlet" in portal_key:
+        return AppSearchServPlanningScraper(LegacyFormsCouncilConfig(authority=target.authority, base_url=base_url))
+    if "fastweb" in portal_key:
+        return FastwebPlanningScraper(LegacyFormsCouncilConfig(authority=target.authority, base_url=base_url))
+    if "cced" in portal_key:
+        return CcedPlanningScraper(LegacyFormsCouncilConfig(authority=target.authority, base_url=base_url))
+    if "astun" in portal_key or "developmentcontrol.aspx" in portal_key:
+        return AstunPlanningScraper(LegacyFormsCouncilConfig(authority=target.authority, base_url=base_url))
     if "idox" in portal_key:
         return IdoxPublicAccessScraper(
             IdoxCouncilConfig(
