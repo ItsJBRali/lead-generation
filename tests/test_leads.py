@@ -728,6 +728,65 @@ class LeadSearchTest(unittest.TestCase):
         fetch_documents.assert_called_once_with("https://planning.bcpcouncil.gov.uk/Planning/Display/P/26/02835/HOU")
         self.assertEqual(enriched.documents, documents)
 
+    def test_enrich_application_documents_merges_documents_from_every_source(self) -> None:
+        application = PlanningApplication(
+            authority="Example",
+            uid="ABC123",
+            url="https://planning.example.gov.uk/online-applications/applicationDetails.do?activeTab=summary&keyVal=ABC123",
+            raw={
+                "docs_url": "https://documents.example.gov.uk/PublicAccess_LIVE/SearchResult/RunThirdPartySearch?FileSystemId=PL",
+                "portal_url": "https://planning.example.gov.uk/online-applications/applicationDetails.do?activeTab=summary&keyVal=ABC123",
+            },
+        )
+
+        def fake_fetch(url: str) -> list[PlanningDocument]:
+            if "SearchResult" in url:
+                return [
+                    PlanningDocument(title="Application form.pdf", url="https://documents.example.gov.uk/document/form.pdf"),
+                    PlanningDocument(title="Site plan.pdf", url="https://documents.example.gov.uk/document/plan.pdf"),
+                ]
+            if "activeTab=documents" in url:
+                return [
+                    PlanningDocument(title="Site plan.pdf", url="https://documents.example.gov.uk/document/plan.pdf"),
+                    PlanningDocument(title="Decision notice.pdf", url="https://planning.example.gov.uk/document/decision.pdf"),
+                ]
+            if "activeTab=summary" in url:
+                return [PlanningDocument(title="Proposed elevations.dwg", url="https://planning.example.gov.uk/document/elevations.dwg")]
+            return []
+
+        with patch("lead_generator.planning.leads.fetch_planit_documents", side_effect=fake_fetch) as fetch_documents:
+            enriched = enrich_planit_application(application)
+
+        self.assertGreaterEqual(fetch_documents.call_count, 3)
+        self.assertEqual(
+            [document.title for document in enriched.documents],
+            ["Application form.pdf", "Site plan.pdf", "Decision notice.pdf", "Proposed elevations.dwg"],
+        )
+
+    def test_download_pdf_documents_skips_exe_and_existing_only_files(self) -> None:
+        documents = [
+            PlanningDocument(title="Existing elevations.pdf", url="https://planning.example.gov.uk/docs/existing-elevations.pdf"),
+            PlanningDocument(title="Existing and proposed elevations.pdf", url="https://planning.example.gov.uk/docs/existing-proposed-elevations.pdf"),
+            PlanningDocument(title="Viewer.exe", url="https://planning.example.gov.uk/docs/viewer.exe"),
+        ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch(
+                "lead_generator.planning.leads.download_document_file",
+                return_value=DownloadedFile(
+                    payload=b"%PDF-1.4",
+                    final_url="https://planning.example.gov.uk/docs/existing-proposed-elevations.pdf",
+                    content_type="application/pdf",
+                ),
+            ) as download_file:
+                downloaded = download_pdf_documents(documents, Path(directory))
+
+            self.assertEqual(downloaded, 1)
+            download_file.assert_called_once_with(documents[1])
+            self.assertTrue((Path(directory) / "Existing and proposed elevations.pdf").exists())
+            self.assertFalse((Path(directory) / "Existing elevations.pdf").exists())
+            self.assertFalse((Path(directory) / "Viewer.exe").exists())
+
     def test_document_download_retries_viewer_url_as_download_url(self) -> None:
         class FakeResponse:
             headers = {"Content-Type": "application/pdf"}
@@ -929,6 +988,31 @@ class LeadSearchTest(unittest.TestCase):
                 (
                     "/Document/Download?module=PLA&recordNumber=1&fileName=ApplicationFormRedacted.pdf",
                     "ApplicationFormRedacted.pdf",
+                )
+            ],
+        )
+
+    def test_iter_document_links_reads_get_download_forms(self) -> None:
+        document = html.fromstring(
+            """
+            <html><body>
+              <form method="get" action="/Document/Download">
+                <input type="hidden" name="module" value="PLA">
+                <input type="hidden" name="id" value="ABC123">
+                <button>Download Proposed plan.pdf</button>
+              </form>
+            </body></html>
+            """
+        )
+
+        links = list(iter_document_links(document, "https://planning.example.gov.uk/Planning/Display/ABC123"))
+
+        self.assertEqual(
+            links,
+            [
+                (
+                    "https://planning.example.gov.uk/Document/Download?module=PLA&id=ABC123",
+                    "Download Proposed plan.pdf",
                 )
             ],
         )

@@ -703,8 +703,6 @@ def enrich_application_documents(application: PlanningApplication) -> PlanningAp
                 continue
             seen.add(document.url)
             documents.append(document)
-        if documents:
-            break
     if documents:
         application.documents = documents
     return application
@@ -879,6 +877,7 @@ def download_pdf_documents(
     downloaded = 0
     for index, document in enumerate(documents, start=1):
         if not _looks_like_downloadable_document(document):
+            _log(log, f"Skipped excluded document link: {document.title}")
             continue
         try:
             downloaded_file = download_document_file(document)
@@ -1032,6 +1031,8 @@ def source_document_candidates(document: PlanningDocument, opener) -> list[str]:
             for href, title in iter_document_links(page, page_url)
         )
     candidates.extend(fetch_publisher_document_list(text, page_url, opener))
+    candidates.extend(fetch_arcus_salesforce_document_list(text, page_url, opener))
+    candidates.extend(fetch_arcus_public_register_file_list(text, page_url, opener))
     wanted = _comparable_title(document.title)
     matching = [
         candidate.url
@@ -1068,6 +1069,11 @@ def document_download_candidates(url: str) -> list[str]:
         candidates.append(_with_query_items(parts._replace(path=download_path), query_items))
         if not has_module:
             candidates.append(_with_query_items(parts._replace(path=download_path), [("module", "planning"), *query_items]))
+    if "download" not in parts.path.casefold():
+        query = dict(query_items)
+        file_id = query.get("id") or query.get("documentId") or query.get("documentid") or query.get("docid")
+        if file_id and any(token in parts.path.casefold() for token in ("viewdocument", "view", "document")):
+            candidates.append(urljoin(normalized, f"../DownloadDocument?{urlencode({'id': file_id})}"))
     return list(dict.fromkeys(candidates))
 
 
@@ -1097,12 +1103,31 @@ def iter_document_links(document: html.HtmlElement, page_url: str) -> Iterable[t
             yield href, title or document_title_from_url(absolute_url)
     for element in document.xpath("//*[@onclick]"):
         onclick = element.get("onclick") or ""
-        for href in re.findall(r"['\"]([^'\"]+(?:document|download|attachment|viewDocument|showDocuments)[^'\"]*)['\"]", onclick, flags=re.IGNORECASE):
+        for href in re.findall(r"['\"]([^'\"]+(?:document|download|attachment|viewDocument|showDocuments|displaymedia|displaysearchdocument|file)[^'\"]*)['\"]", onclick, flags=re.IGNORECASE):
             absolute_url = urljoin(page_url, href)
             title = clean_text(" ".join(element.itertext())) or document_title_from_url(absolute_url)
             if _is_generic_site_document(href, title):
                 continue
             yield href, title
+    for form in document.xpath("//form[@action]"):
+        action = form.get("action") or ""
+        if not _is_document_href(action):
+            continue
+        method = (form.get("method") or "get").casefold()
+        if method != "get":
+            continue
+        query_items: list[tuple[str, str]] = []
+        for input_node in form.xpath(".//input[@name]"):
+            input_type = (input_node.get("type") or "hidden").casefold()
+            if input_type in {"submit", "button", "image", "reset"}:
+                continue
+            query_items.append((input_node.get("name") or "", input_node.get("value") or ""))
+        parts = urlsplit(urljoin(page_url, action))
+        href = _with_query_items(parts, [*parse_qsl(parts.query, keep_blank_values=True), *query_items])
+        title = clean_text(" ".join(form.itertext())) or document_title_from_url(href)
+        if _is_generic_site_document(href, title):
+            continue
+        yield href, title
     for element in document.xpath("//iframe[@src] | //embed[@src] | //object[@data]"):
         href = element.get("src") or element.get("data")
         if not _is_document_href(href):
@@ -1421,6 +1446,8 @@ def _document_links_from_html(payload: bytes, page_url: str) -> list[str]:
         match = re.search(r"url\s*=\s*([^;]+)", content, flags=re.IGNORECASE)
         if match:
             links.append(urljoin(page_url, match.group(1).strip(" '\"")))
+    for href in re.findall(r"(?:window\.)?location(?:\.href)?\s*=\s*['\"]([^'\"]+)['\"]", text, flags=re.IGNORECASE):
+        links.append(urljoin(page_url, href))
     return list(dict.fromkeys(normalize_url(link) for link in links))
 
 
@@ -1446,21 +1473,35 @@ def _is_document_href(href: str | None) -> bool:
             "doclist",
             "showdocuments",
             "viewdocument",
+            "displaysearchdocument",
             "wphappdocs",
             "wchdisplaymedia",
             "displaymedia",
             "showimage",
+            "filedownload",
+            "getfile",
             ".pdf",
             ".doc",
             ".docx",
             ".xls",
             ".xlsx",
+            ".ppt",
+            ".pptx",
+            ".odt",
+            ".ods",
+            ".zip",
+            ".dwg",
+            ".dxf",
             ".jpg",
             ".jpeg",
             ".png",
+            ".gif",
+            ".bmp",
+            ".webp",
             ".tif",
             ".tiff",
             ".rtf",
+            ".txt",
         )
     )
 
@@ -1810,15 +1851,42 @@ def _parse_iso_date(value: str | None) -> date | None:
 
 
 def _looks_like_downloadable_document(document: PlanningDocument) -> bool:
-    text = f"{document.title} {urlsplit(document.url).path}".lower()
+    if _is_excluded_document(document):
+        return False
+    text = _document_filter_text(document)
     return (
         bool(document.url)
         and (
             _is_document_href(document.url)
-            or any(extension in text for extension in (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".rtf"))
-            or (document.document_type or "").casefold() in {"pdf", "document", "drawing", "plan", "supporting_document"}
+            or any(extension in text for extension in _known_file_extensions())
+            or (document.document_type or "").casefold() in {"pdf", "document", "drawing", "plan", "supporting_document", "image"}
         )
     )
+
+
+def _is_excluded_document(document: PlanningDocument) -> bool:
+    text = _document_filter_text(document)
+    if ".exe" in text or _path_suffix(document.url) == ".exe":
+        return True
+    return "existing" in text and "proposed" not in text
+
+
+def _document_filter_text(document: PlanningDocument) -> str:
+    values = [
+        document.title,
+        document.url,
+        document.description,
+        document.document_type,
+        document.source_url,
+        document_title_from_url(document.url) if document.url else "",
+    ]
+    return " ".join(unquote(str(value).replace("+", " ")) for value in values if value).casefold()
+
+
+def _path_suffix(url: str | None) -> str:
+    if not url:
+        return ""
+    return Path(unquote(urlsplit(url).path).replace("\\", "/")).suffix.casefold()
 
 
 def _is_tls_certificate_error(exc: Exception) -> bool:
@@ -1870,7 +1938,32 @@ def _downloaded_extension(downloaded_file: DownloadedFile) -> str:
 
 
 def _known_file_extensions() -> set[str]:
-    return {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".rtf", ".txt"}
+    return {
+        ".pdf",
+        ".doc",
+        ".docx",
+        ".xls",
+        ".xlsx",
+        ".ppt",
+        ".pptx",
+        ".odt",
+        ".ods",
+        ".rtf",
+        ".txt",
+        ".csv",
+        ".zip",
+        ".dwg",
+        ".dxf",
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".gif",
+        ".bmp",
+        ".webp",
+        ".tif",
+        ".tiff",
+        ".heic",
+    }
 
 
 def _extension_from_content_type(content_type: str) -> str | None:
@@ -1881,12 +1974,31 @@ def _extension_from_content_type(content_type: str) -> str | None:
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
         "application/vnd.ms-excel": ".xls",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+        "application/vnd.ms-powerpoint": ".ppt",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+        "application/vnd.oasis.opendocument.text": ".odt",
+        "application/vnd.oasis.opendocument.spreadsheet": ".ods",
+        "application/zip": ".zip",
+        "application/x-zip-compressed": ".zip",
+        "application/acad": ".dwg",
+        "application/x-acad": ".dwg",
+        "application/autocad_dwg": ".dwg",
+        "image/vnd.dwg": ".dwg",
+        "image/x-dwg": ".dwg",
+        "application/dxf": ".dxf",
+        "application/x-dxf": ".dxf",
+        "image/vnd.dxf": ".dxf",
         "image/jpeg": ".jpg",
         "image/png": ".png",
+        "image/gif": ".gif",
+        "image/bmp": ".bmp",
+        "image/webp": ".webp",
         "image/tiff": ".tif",
+        "image/heic": ".heic",
         "application/rtf": ".rtf",
         "text/rtf": ".rtf",
         "text/plain": ".txt",
+        "text/csv": ".csv",
     }.get(content_type)
 
 
@@ -1900,6 +2012,8 @@ def _extension_from_signature(payload: bytes) -> str | None:
         return ".jpg"
     if start.startswith(b"\x89PNG\r\n\x1a\n"):
         return ".png"
+    if start[:6] in (b"GIF87a", b"GIF89a"):
+        return ".gif"
     if start[:4] in (b"II*\x00", b"MM\x00*"):
         return ".tif"
     if start.startswith(b"{\\rtf"):
@@ -1912,8 +2026,17 @@ def _extension_from_signature(payload: bytes) -> str | None:
 def _is_downloaded_file(payload: bytes, content_type: str, final_url: str) -> bool:
     if not payload:
         return False
+    if payload[:2] == b"MZ" or _path_suffix(final_url) == ".exe":
+        return False
     normalized_content_type = content_type.split(";", 1)[0].strip().lower()
-    if normalized_content_type in {"application/json", "text/json", "application/javascript", "text/javascript"}:
+    if normalized_content_type in {
+        "application/json",
+        "text/json",
+        "application/javascript",
+        "text/javascript",
+        "application/x-msdownload",
+        "application/vnd.microsoft.portable-executable",
+    }:
         return False
     if _extension_from_signature(payload):
         return True
