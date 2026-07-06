@@ -144,6 +144,82 @@ class LeadSearchTest(unittest.TestCase):
             )
         )
 
+    def test_application_matches_excludes_admin_proposal_phrases(self) -> None:
+        excluded_proposals = [
+            "Variation of condition 2 to allow automated gates",
+            "Discharge of condition 4 relating to boundary treatment",
+            "Details required by condition 3 for entrance gates",
+            "Request for EIA screening opinion for access works",
+            "Compliance with condition 5 for gate details",
+            "Details of reserved matters including access",
+            "Submission of details for new access",
+            "Details pursuant to condition 6 for driveway gates",
+            "Section 73 application for gates",
+            "Application to vary approved access condition",
+            "Submission of material samples for gate pillars",
+            "Submission of surface water details by front gate",
+            "EDC Consultation for new gates",
+            "Removal of condition 2 for boundary gates",
+            "Partial approval of details for entrance gates",
+        ]
+
+        for proposal in excluded_proposals:
+            with self.subTest(proposal=proposal):
+                application = PlanningApplication(
+                    authority="Example",
+                    uid="1",
+                    url="https://example.test",
+                    description=proposal,
+                    date_received="2026-06-12",
+                )
+
+                self.assertFalse(
+                    application_matches(
+                        application,
+                        date(2026, 6, 1),
+                        date(2026, 6, 30),
+                        ["gates", "access", "boundary"],
+                    )
+                )
+
+    def test_application_matches_excludes_retrospective_unless_part_retrospective(self) -> None:
+        retrospective = PlanningApplication(
+            authority="Example",
+            uid="1",
+            url="https://example.test",
+            description="Retrospective installation of automated gates",
+            date_received="2026-06-12",
+        )
+        part_retrospective = PlanningApplication(
+            authority="Example",
+            uid="2",
+            url="https://example.test",
+            description="Part retrospective installation of automated gates",
+            date_received="2026-06-12",
+        )
+        apartment = PlanningApplication(
+            authority="Example",
+            uid="3",
+            url="https://example.test",
+            description="Retrospective installation of gates to apartment entrance",
+            date_received="2026-06-12",
+        )
+
+        self.assertFalse(application_matches(retrospective, date(2026, 6, 1), date(2026, 6, 30), ["gates"]))
+        self.assertTrue(application_matches(part_retrospective, date(2026, 6, 1), date(2026, 6, 30), ["gates"]))
+        self.assertFalse(application_matches(apartment, date(2026, 6, 1), date(2026, 6, 30), ["gates"]))
+
+    def test_application_matches_excludes_proposals_starting_with_t1(self) -> None:
+        application = PlanningApplication(
+            authority="Example",
+            uid="1",
+            url="https://example.test",
+            description="T1 Oak - install replacement boundary gates",
+            date_received="2026-06-12",
+        )
+
+        self.assertFalse(application_matches(application, date(2026, 6, 1), date(2026, 6, 30), ["gates"]))
+
     def test_application_matches_uses_validated_date_when_received_date_missing(self) -> None:
         application = PlanningApplication(
             authority="Example",

@@ -101,6 +101,24 @@ DEFAULT_KEYWORDS = [
     "entrance walls and gates",
 ]
 
+EXCLUDED_PROPOSAL_PHRASES = (
+    "variation of condition",
+    "discharge of condition",
+    "details required by",
+    "request for eia",
+    "compliance with",
+    "details of reserved matters",
+    "submission of details",
+    "details pursuant to",
+    "section 73",
+    "application to vary",
+    "submission of material",
+    "submission of surface",
+    "edc consultation",
+    "removal of condition",
+    "partial approval of",
+)
+
 
 LogCallback = Callable[[str], None]
 ProgressCallback = Callable[[int, int], None]
@@ -822,6 +840,8 @@ def application_matches(
     received = _parse_iso_date(application.date_received or application.date_validated)
     if received is None or received < start_date or received > end_date:
         return False
+    if proposal_is_excluded(application.description):
+        return False
     raw_text = " ".join(str(value) for value in application.raw.values()) if application.raw else ""
     haystack = " ".join(
         value
@@ -829,6 +849,17 @@ def application_matches(
         if value
     ).casefold()
     return any(keyword.casefold() in haystack for keyword in keywords)
+
+
+def proposal_is_excluded(proposal: str | None) -> bool:
+    if not proposal:
+        return False
+    normalized = re.sub(r"\s+", " ", proposal).strip().casefold()
+    if normalized.startswith("t1"):
+        return True
+    if "retrospective" in normalized and not re.search(r"\bpart\b", normalized):
+        return True
+    return any(phrase in normalized for phrase in EXCLUDED_PROPOSAL_PHRASES)
 
 
 def application_in_geojson(application: PlanningApplication, user_geojson: dict[str, object]) -> bool:
