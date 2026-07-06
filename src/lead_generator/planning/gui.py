@@ -4,7 +4,7 @@ import queue
 import threading
 from datetime import date, timedelta
 from pathlib import Path
-from tkinter import filedialog, messagebox
+from tkinter import BooleanVar, filedialog, messagebox
 
 import customtkinter as ctk
 
@@ -56,6 +56,7 @@ class LeadGeneratorApp(ctk.CTk):
         self.messages: queue.Queue[tuple[str, object]] = queue.Queue()
         self.worker: threading.Thread | None = None
         self.cancel_requested = False
+        self.download_files_var = BooleanVar(value=True)
 
         self._build_layout()
         self.after(100, self._poll_messages)
@@ -114,6 +115,15 @@ class LeadGeneratorApp(ctk.CTk):
         self.end_selector = DateSelector(controls, "End date", default_end)
         self.start_selector.grid(row=0, column=0, padx=16, pady=16, sticky="ew")
         self.end_selector.grid(row=0, column=1, padx=16, pady=16, sticky="ew")
+        self.download_files_checkbox = ctk.CTkCheckBox(
+            controls,
+            text="Download application files",
+            variable=self.download_files_var,
+            onvalue=True,
+            offvalue=False,
+            text_color="#e5e7eb",
+        )
+        self.download_files_checkbox.grid(row=1, column=0, columnspan=2, padx=16, pady=(0, 16), sticky="w")
 
         keyword_panel = ctk.CTkFrame(shell, corner_radius=20, fg_color="#172033")
         keyword_panel.grid(row=3, column=0, padx=26, pady=12, sticky="nsew")
@@ -262,6 +272,7 @@ class LeadGeneratorApp(ctk.CTk):
             start_date=start_date,
             end_date=end_date,
             keywords=keywords,
+            download_application_files=bool(self.download_files_var.get()),
         )
 
     def _run_worker(self, config: LeadSearchConfig) -> None:

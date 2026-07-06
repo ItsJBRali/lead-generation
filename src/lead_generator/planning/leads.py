@@ -115,7 +115,7 @@ MAX_RETRY_AFTER_SECONDS = 20.0
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 20.0
 REQUEST_THROTTLE_SECONDS = 0.25
 PLANIT_REQUEST_THROTTLE_SECONDS = 0.75
-APPLICATION_CSV_FIELDS = ["Reference", "application link", "proposal", "date received", "council"]
+APPLICATION_CSV_FIELDS = ["Reference", "address", "application link", "proposal", "date received", "council"]
 FAILURE_CSV_FIELDS = ["council", "portal_family", "scraper_type", "listing_url", "reason"]
 _REQUEST_THROTTLE_LOCK = threading.Lock()
 _LAST_REQUEST_AT: dict[str, float] = {}
@@ -156,6 +156,7 @@ class LeadSearchConfig:
     end_date: date
     keywords: list[str]
     catalogue_path: Path | None = None
+    download_application_files: bool = True
 
 
 @dataclass(slots=True)
@@ -277,20 +278,27 @@ def run_lead_search(
                         continue
                     if not application_matches_search_area(application, user_geojson):
                         continue
-                    application = enrich_application_documents(application)
                     matched_count += 1
-                    lead_folder = create_lead_folder(output_dir, target.authority, application)
-                    download_pdf_documents(application.documents, lead_folder, log=log)
+                    if config.download_application_files:
+                        application = enrich_application_documents(application)
+                        lead_folder = create_lead_folder(output_dir, target.authority, application)
+                        downloaded_count = download_pdf_documents(application.documents, lead_folder, log=log)
+                    else:
+                        downloaded_count = 0
                     save_row(
                         {
                             "Reference": application.reference or application.uid,
+                            "address": application.address or "",
                             "application link": application_link(application),
                             "proposal": application.description or "",
                             "date received": application.date_received or application.date_validated or "",
                             "council": target.authority,
                         }
                     )
-                    _log(log, f"{target.authority}: saved {application.reference or application.uid}")
+                    if config.download_application_files:
+                        _log(log, f"{target.authority}: saved {application.reference or application.uid} ({downloaded_count} documents downloaded)")
+                    else:
+                        _log(log, f"{target.authority}: saved {application.reference or application.uid} (file downloads not requested)")
                 _log(log, f"{target.authority}: {matched_count} applications matched keywords and location")
             except Exception as exc:  # pragma: no cover - live-site resilience
                 _log(log, f"{target.authority}: failed: {exc}")

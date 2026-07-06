@@ -342,6 +342,7 @@ class LeadSearchTest(unittest.TestCase):
                     uid="ABC123",
                     url="https://planning.example.gov.uk/detail/ABC123",
                     reference="24/01234/FUL",
+                    address="1 Example Street",
                     description="New driveway gates and boundary wall",
                     date_received="2026-06-10",
                     raw={"location": {"type": "Point", "coordinates": [0.5, 0.5]}},
@@ -363,13 +364,81 @@ class LeadSearchTest(unittest.TestCase):
             self.assertEqual(result.leads_found, 1)
             self.assertTrue(result.csv_path.exists())
             csv_text = result.csv_path.read_text(encoding="utf-8")
+            self.assertTrue(csv_text.startswith("Reference,address,application link"))
             self.assertIn("application link", csv_text)
+            self.assertIn("1 Example Street", csv_text)
             self.assertIn("https://planning.example.gov.uk/detail/ABC123", csv_text)
             self.assertIn("24/01234/FUL", csv_text)
             self.assertNotIn("24/99999/FUL", csv_text)
             self.assertTrue(result.failure_csv_path.exists())
             self.assertTrue((result.output_dir / "Example Council" / "24 01234 FUL").exists())
             self.assertTrue((result.output_dir / "selected_councils.geojson").exists())
+
+    def test_run_lead_search_can_write_csv_without_downloading_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_geojson = root / "search.geojson"
+            user_geojson.write_text(
+                json.dumps(
+                    {
+                        "type": "FeatureCollection",
+                        "features": [polygon_feature("search area", 0, 0, 1, 1)],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            catalogue = root / "catalogue.geojson"
+            catalogue.write_text(
+                json.dumps(
+                    {
+                        "type": "FeatureCollection",
+                        "features": [
+                            {
+                                **polygon_feature("Example Council", 0, 0, 1, 1),
+                                "properties": {
+                                    "authority": "Example Council",
+                                    "portal_family": "idox",
+                                    "base_url": "https://planning.example.gov.uk",
+                                    "listing_url": "https://planning.example.gov.uk/search",
+                                },
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = LeadSearchConfig(
+                geojson_path=user_geojson,
+                output_root=root,
+                start_date=date(2026, 6, 1),
+                end_date=date(2026, 6, 30),
+                keywords=["driveway gates"],
+                catalogue_path=catalogue,
+                download_application_files=False,
+            )
+            application = PlanningApplication(
+                authority="Example Council",
+                uid="ABC123",
+                url="https://planning.example.gov.uk/detail/ABC123",
+                reference="24/01234/FUL",
+                address="1 Example Street",
+                description="New driveway gates and boundary wall",
+                date_received="2026-06-10",
+                raw={"location": {"type": "Point", "coordinates": [0.5, 0.5]}},
+            )
+
+            with (
+                patch("lead_generator.planning.leads.discover_portal_applications", return_value=[application]),
+                patch("lead_generator.planning.leads.enrich_application_documents", side_effect=AssertionError("Documents should not be enriched")),
+                patch("lead_generator.planning.leads.download_pdf_documents", side_effect=AssertionError("Documents should not be downloaded")),
+            ):
+                result = run_lead_search(config)
+
+            self.assertEqual(result.leads_found, 1)
+            csv_text = result.csv_path.read_text(encoding="utf-8")
+            self.assertTrue(csv_text.startswith("Reference,address,application link"))
+            self.assertIn("24/01234/FUL,1 Example Street,https://planning.example.gov.uk/detail/ABC123", csv_text)
+            self.assertFalse((result.output_dir / "Example Council").exists())
 
     def test_run_lead_search_updates_output_csv_when_cancelled(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

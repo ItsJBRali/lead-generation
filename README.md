@@ -23,9 +23,19 @@ HTTP boundary, offline parser tests, and no dependency on the legacy GPL source.
 | Civica / Authority Public Access | Live-tested | Parses common labelled listing/detail/document patterns and JavaScript-backed `details.html?refval=...` pages that expose a public planning-data API. Live-tested against Bath & North East Somerset. |
 | Agile Applications / APAS | Implemented | Parses common APAS listing/detail/document patterns; fixture-covered. Current live council examples were not confirmed in the latest smoke test. |
 | Northgate Planning Explorer | Live-tested | Parses common listing/detail/document patterns and live-tested against Wandsworth Northgate detail pages. ASP.NET search-form submission is not automated yet. |
+| NEC/Assure OnlinePlanningSearch | Live-tested | Submits date-bounded `OnlinePlanningSearch` forms, parses `OnlinePlanningOverview` results, loads AJAX document tabs, and downloads browser-gated `DisplaySearchDocument` PDFs. Live-tested against Broxbourne. |
+| FastWeb / PlanPortal | Live-tested | Submits received-date searches against `search.asp`, parses `detail.asp?AltRef=...` application pages, follows `View Plans & Documents` bridges, reads PlanPortal Ext Direct document rows, and downloads `view.aspx` PDFs. Live-tested against Rotherham. |
+| Form-backed council registers | Implemented | Submits council date-search forms for BCP-style `/Search/Advanced`, Tascomi, and Uniform-style `index.html?fa=search` portals, then parses returned application links/details directly from the council website. |
+| Arcus / Salesforce public registers | Implemented | Submits the Arcus advanced planning search through the council's Salesforce public-register endpoint, parses returned applications, and hands detail pages to the Arcus document downloader. |
 
-Attachment support currently returns document metadata and URLs. It does not
-download or store the files themselves yet.
+The lead-search GUI downloads discovered document files into each saved
+application folder. The downloader verifies that responses are real files,
+follows viewer/redirect pages, accepts common document-disclaimer sessions, and
+prefers links whose title matches the intended document when a portal returns
+multiple PDFs from an intermediate page.
+Users can untick the download option to produce only the application CSV. The
+CSV includes each matched application's reference, address, application link,
+proposal, received date, and council.
 
 ## Run Tests
 
@@ -59,6 +69,7 @@ The Windows GUI is available as `dist/PlanningLeadGenerator.exe`. It lets a user
 - choose a GeoJSON file containing the search boundary
 - choose an output folder
 - select a received-date range
+- choose whether to download application files as well as the CSV
 - edit the default lead keywords
 - run the search with council progress and a live log
 
@@ -69,10 +80,11 @@ URLs. At the start of a run it intersects the uploaded boundary with that
 catalogue, saves the matched authorities to `selected_councils.geojson`, and
 then searches only those authorities.
 
-Application results are filtered twice: first by the selected received-date
-range and proposal keywords, then by the application point location. A lead is
-saved only when its latitude/longitude falls inside the uploaded GeoJSON
-boundary.
+Application results are filtered by the selected received/validated date range
+and proposal keywords. When a council portal provides application coordinates,
+the app also checks that the point falls inside the uploaded GeoJSON boundary;
+when the portal does not publish coordinates, the council-overlap selection is
+used as the location filter.
 
 To run from source:
 
