@@ -154,20 +154,13 @@ _LAST_REQUEST_AT: dict[str, float] = {}
 
 PLANIT_AUTHORITY_ALIASES = {
     "Aylesbury Vale": ("Buckinghamshire",),
+    "Brighton and Hove": ("Brighton",),
     "Chiltern South Bucks": ("Buckinghamshire",),
+    "Taunton Deane": ("Somerset",),
+    "West Somerset": ("Somerset",),
+    "Windsor and Maidenhead": ("Windsor",),
     "Wycombe": ("Buckinghamshire",),
 }
-PLANIT_EMPTY_RESULT_FALLBACK_AUTHORITIES = {
-    "Birmingham",
-    "Greater Cambridge",
-    "Hampshire",
-    "Havering",
-    "Lambeth",
-    "Lewisham",
-    "South Cambridgeshire",
-    "Surrey",
-}
-
 
 @dataclass(frozen=True, slots=True)
 class CouncilTarget:
@@ -564,7 +557,7 @@ def discover_portal_applications(target: CouncilTarget, start_date: date, end_da
             if received is not None and (received < start_date or received > end_date):
                 continue
         applications.append(application)
-    if not applications and target.authority in PLANIT_EMPTY_RESULT_FALLBACK_AUTHORITIES:
+    if not applications:
         planit_applications = discover_planit_fallback_applications(target, start_date, end_date)
         if planit_applications:
             return planit_applications
@@ -924,6 +917,8 @@ def application_matches(
     received = _parse_iso_date(application.date_received or application.date_validated)
     if received is None or received < start_date or received > end_date:
         return False
+    if reference_is_excluded(application.reference or application.uid):
+        return False
     if proposal_is_excluded(application.description):
         return False
     raw_text = " ".join(str(value) for value in application.raw.values()) if application.raw else ""
@@ -933,6 +928,10 @@ def application_matches(
         if value
     ).casefold()
     return any(keyword.casefold() in haystack for keyword in keywords)
+
+
+def reference_is_excluded(reference: str | None) -> bool:
+    return bool(reference and reference.strip().casefold().startswith("old"))
 
 
 def proposal_is_excluded(proposal: str | None) -> bool:
@@ -1927,7 +1926,7 @@ def _disclaimer_accept_url(text: str, page_url: str) -> str | None:
 
 
 def _fetch_json_with_retry(url: str) -> dict[str, object]:
-    attempts = 2 if "planit.org.uk" in urlsplit(url).netloc.casefold() else 4
+    attempts = 4
     for attempt in range(attempts):
         request = Request(url, headers={"User-Agent": USER_AGENT})
         try:
@@ -1939,7 +1938,28 @@ def _fetch_json_with_retry(url: str) -> dict[str, object]:
                 raise
             sleep(min(_retry_delay_seconds(exc, 2.0 * (attempt + 1)), 8.0))
             _skip_next_throttle(url)
+        except URLError as exc:
+            if not _should_retry_json_without_tls_verification(url, exc) or attempt == attempts - 1:
+                raise
+            _skip_next_throttle(url)
+            request = Request(url, headers={"User-Agent": USER_AGENT})
+            opener = build_opener(HTTPSHandler(context=ssl._create_unverified_context()))
+            try:
+                with opener.open(request, timeout=DEFAULT_REQUEST_TIMEOUT_SECONDS) as response:
+                    return json.loads(response.read().decode("utf-8", errors="replace"))
+            except HTTPError as retry_exc:
+                if retry_exc.code not in RATE_LIMIT_HTTP_CODES or attempt == attempts - 1:
+                    raise
+                sleep(min(_retry_delay_seconds(retry_exc, 2.0 * (attempt + 1)), 8.0))
+                _skip_next_throttle(url)
     raise RuntimeError(f"Could not fetch public planning metadata: {url}")
+
+
+def _should_retry_json_without_tls_verification(url: str, exc: URLError) -> bool:
+    if not urlsplit(url).netloc.casefold().endswith("planit.org.uk"):
+        return False
+    reason = getattr(exc, "reason", None)
+    return isinstance(reason, ssl.SSLCertVerificationError)
 
 
 def _throttle_request(url: str) -> None:

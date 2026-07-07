@@ -220,6 +220,18 @@ class LeadSearchTest(unittest.TestCase):
 
         self.assertFalse(application_matches(application, date(2026, 6, 1), date(2026, 6, 30), ["gates"]))
 
+    def test_application_matches_excludes_old_references(self) -> None:
+        application = PlanningApplication(
+            authority="Example",
+            uid="OLD-2026-001",
+            url="https://example.test",
+            reference="OLD/2026/001",
+            description="Installation of automated gates",
+            date_received="2026-06-12",
+        )
+
+        self.assertFalse(application_matches(application, date(2026, 6, 1), date(2026, 6, 30), ["gates"]))
+
     def test_application_matches_uses_validated_date_when_received_date_missing(self) -> None:
         application = PlanningApplication(
             authority="Example",
@@ -336,24 +348,24 @@ class LeadSearchTest(unittest.TestCase):
         self.assertEqual(applications[0].authority, "Wycombe")
         self.assertEqual(applications[0].raw["source"], "planit_fallback")
 
-    def test_discover_portal_applications_uses_planit_for_known_empty_unreliable_portal(self) -> None:
+    def test_discover_portal_applications_uses_planit_for_empty_portal_result(self) -> None:
         class EmptyScraper:
             def discover_ids(self, **kwargs):
                 from lead_generator.planning.models import DiscoveryResult
 
-                return DiscoveryResult(authority="Lambeth", source_url="https://planning.lambeth.gov.uk", applications=[])
+                return DiscoveryResult(authority="Example", source_url="https://planning.example.gov.uk", applications=[])
 
         target = CouncilTarget(
-            authority="Lambeth",
+            authority="Example",
             portal_family="idox",
             scraper_type="Idox",
-            base_url="https://planning.lambeth.gov.uk",
-            listing_url="https://planning.lambeth.gov.uk/online-applications/search.do?action=advanced",
+            base_url="https://planning.example.gov.uk",
+            listing_url="https://planning.example.gov.uk/online-applications/search.do?action=advanced",
             geometry={},
         )
         fallback = [
             PlanningApplication(
-                authority="Lambeth",
+                authority="Example",
                 uid="26/01723/NMC",
                 url="https://example.test/app",
                 reference="26/01723/NMC",
@@ -363,10 +375,11 @@ class LeadSearchTest(unittest.TestCase):
 
         with (
             patch("lead_generator.planning.leads.planning_scraper_for_target", return_value=EmptyScraper()),
-            patch("lead_generator.planning.leads.discover_planit_applications", return_value=fallback),
+            patch("lead_generator.planning.leads.discover_planit_applications", return_value=fallback) as planit,
         ):
             applications = discover_portal_applications(target, date(2026, 6, 8), date(2026, 6, 14))
 
+        planit.assert_called_once_with("Example", date(2026, 6, 8), date(2026, 6, 14))
         self.assertEqual([application.reference for application in applications], ["26/01723/NMC"])
         self.assertEqual(applications[0].raw["source"], "planit_fallback")
 
@@ -1531,6 +1544,71 @@ class LeadSearchTest(unittest.TestCase):
 
         self.assertEqual(payload, {"records": []})
         sleep_mock.assert_called_once_with(3.0)
+
+    def test_fetch_json_retries_planit_tls_verification_failure_with_compat_opener(self) -> None:
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return b'{"records": [{"uid": "26/0001"}]}'
+
+        class FakeOpener:
+            def open(self, request, timeout):
+                return FakeResponse()
+
+        tls_error = ssl.SSLCertVerificationError("certificate verify failed")
+
+        with (
+            patch("lead_generator.planning.leads.urlopen", side_effect=URLError(tls_error)),
+            patch("lead_generator.planning.leads.build_opener", return_value=FakeOpener()) as build_opener_mock,
+            patch("lead_generator.planning.leads._throttle_request"),
+            patch("lead_generator.planning.leads._skip_next_throttle"),
+        ):
+            payload = _fetch_json_with_retry("https://www.planit.org.uk/api/applics/json")
+
+        self.assertEqual(payload, {"records": [{"uid": "26/0001"}]})
+        build_opener_mock.assert_called_once()
+
+    def test_fetch_json_retries_rate_limit_after_planit_tls_compat_retry(self) -> None:
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return b'{"records": [{"uid": "26/0002"}]}'
+
+        class FakeOpener:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def open(self, request, timeout):
+                self.calls += 1
+                if self.calls == 1:
+                    raise HTTPError(request.full_url, 429, "Too Many Requests", {"Retry-After": "2"}, None)
+                return FakeResponse()
+
+        tls_error = ssl.SSLCertVerificationError("certificate verify failed")
+        opener = FakeOpener()
+
+        with (
+            patch("lead_generator.planning.leads.urlopen", side_effect=URLError(tls_error)),
+            patch("lead_generator.planning.leads.build_opener", return_value=opener),
+            patch("lead_generator.planning.leads._throttle_request"),
+            patch("lead_generator.planning.leads._skip_next_throttle"),
+            patch("lead_generator.planning.leads.sleep") as sleep_mock,
+        ):
+            payload = _fetch_json_with_retry("https://www.planit.org.uk/api/applics/json")
+
+        self.assertEqual(payload, {"records": [{"uid": "26/0002"}]})
+        self.assertEqual(opener.calls, 2)
+        sleep_mock.assert_called_once_with(2.0)
 
     def test_document_download_waits_and_retries_after_rate_limit(self) -> None:
         class FakeResponse:
