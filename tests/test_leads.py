@@ -660,6 +660,131 @@ class LeadSearchTest(unittest.TestCase):
             self.assertEqual(failures[0]["listing_url"], "https://broken.example.gov.uk/search")
             self.assertEqual(failures[0]["reason"], "portal exploded")
 
+    def test_run_lead_search_appends_persistent_history_row(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_geojson = root / "search.geojson"
+            user_geojson.write_text(
+                json.dumps(
+                    {
+                        "type": "FeatureCollection",
+                        "features": [polygon_feature("search area", 0, 0, 3, 1)],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            catalogue = root / "catalogue.geojson"
+            catalogue.write_text(
+                json.dumps(
+                    {
+                        "type": "FeatureCollection",
+                        "features": [
+                            {
+                                **polygon_feature("Application Council", 0, 0, 1, 1),
+                                "properties": {
+                                    "authority": "Application Council",
+                                    "portal_family": "idox",
+                                    "base_url": "https://applications.example.gov.uk",
+                                    "listing_url": "https://applications.example.gov.uk/search",
+                                },
+                            },
+                            {
+                                **polygon_feature("Empty Council", 1, 0, 2, 1),
+                                "properties": {
+                                    "authority": "Empty Council",
+                                    "portal_family": "idox",
+                                    "base_url": "https://empty.example.gov.uk",
+                                    "listing_url": "https://empty.example.gov.uk/search",
+                                },
+                            },
+                            {
+                                **polygon_feature("Broken Council", 2, 0, 3, 1),
+                                "properties": {
+                                    "authority": "Broken Council",
+                                    "portal_family": "idox",
+                                    "base_url": "https://broken.example.gov.uk",
+                                    "listing_url": "https://broken.example.gov.uk/search",
+                                },
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            history_path = root / "archive" / "search_history.csv"
+            config = LeadSearchConfig(
+                geojson_path=user_geojson,
+                output_root=root,
+                start_date=date(2026, 6, 1),
+                end_date=date(2026, 6, 30),
+                keywords=["gates"],
+                catalogue_path=catalogue,
+                history_csv_path=history_path,
+                worker_count=1,
+            )
+
+            def fake_discover(target, start_date, end_date):
+                if target.authority == "Broken Council":
+                    raise RuntimeError("portal exploded")
+                if target.authority == "Empty Council":
+                    return []
+                return [
+                    PlanningApplication(
+                        authority=target.authority,
+                        uid="ABC123",
+                        url="https://applications.example.gov.uk/detail/ABC123",
+                        reference="24/01234/FUL",
+                        description="Install driveway gates",
+                        date_received="2026-06-10",
+                    ),
+                    PlanningApplication(
+                        authority=target.authority,
+                        uid="DEF456",
+                        url="https://applications.example.gov.uk/detail/DEF456",
+                        reference="24/99999/FUL",
+                        description="Build rear extension",
+                        date_received="2026-06-10",
+                    ),
+                ]
+
+            def fake_enrich(application):
+                application.documents = [
+                    PlanningDocument(
+                        title="Proposed plan.pdf",
+                        url="https://applications.example.gov.uk/document/proposed.pdf",
+                    )
+                ]
+                return application
+
+            captured_counts: list[int] = []
+            with (
+                patch("lead_generator.planning.leads.discover_portal_applications", side_effect=fake_discover),
+                patch("lead_generator.planning.leads.enrich_application_documents", side_effect=fake_enrich),
+                patch("lead_generator.planning.leads.download_pdf_documents", return_value=1),
+            ):
+                result = run_lead_search(config, captured=captured_counts.append)
+
+            self.assertEqual(result.total_applications, 2)
+            self.assertEqual(result.leads_found, 1)
+            self.assertEqual(result.captured_documents, 1)
+            self.assertEqual(result.failed_councils, ["Broken Council"])
+            self.assertEqual(result.no_application_councils, ["Empty Council"])
+            self.assertEqual(result.completion, "Failed")
+            self.assertEqual(captured_counts, [1])
+
+            with history_path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["Keyword Set"], "Bespoke")
+            self.assertEqual(rows[0]["Total Applications"], "2")
+            self.assertEqual(rows[0]["Relevant Captured Applications"], "1")
+            self.assertEqual(rows[0]["% Relevant"], "50.00%")
+            self.assertEqual(rows[0]["List of failed councils"], "Broken Council")
+            self.assertEqual(rows[0]["List of councils with no applications"], "Empty Council")
+            self.assertEqual(rows[0]["Completion"], "Failed")
+            self.assertEqual(rows[0]["Captured Documents"], "1")
+
     def test_run_lead_search_starts_four_workers_from_both_ends(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

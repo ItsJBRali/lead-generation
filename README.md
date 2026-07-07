@@ -72,7 +72,7 @@ The Windows GUI is available as `dist/PlanningLeadGenerator.exe`. It lets a user
 - choose whether to download application files as well as the CSV
 - choose how many councils to search concurrently, from 1 to 8
 - edit the default lead keywords
-- run the search with council progress and a live log
+- run the search with council progress, captured-lead count, and a live log
 
 The uploaded GeoJSON no longer needs council names or portal fields. The app
 bundles `planning_authorities.geojson`, a stored catalogue of planning
@@ -86,6 +86,9 @@ and proposal keywords. When a council portal provides application coordinates,
 the app also checks that the point falls inside the uploaded GeoJSON boundary;
 when the portal does not publish coordinates, the council-overlap selection is
 used as the location filter.
+
+Each GUI run appends a summary row to `search_history.csv` beside the executable
+so past searches remain available across output folders.
 
 To run from source:
 

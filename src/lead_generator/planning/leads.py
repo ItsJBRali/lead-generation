@@ -6,7 +6,7 @@ import re
 import ssl
 import threading
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from email.utils import parsedate_to_datetime
 from http.cookiejar import CookieJar
@@ -122,6 +122,7 @@ EXCLUDED_PROPOSAL_PHRASES = (
 
 LogCallback = Callable[[str], None]
 ProgressCallback = Callable[[int, int], None]
+CapturedCallback = Callable[[int], None]
 CancelCallback = Callable[[], bool]
 
 USER_AGENT = "Mozilla/5.0 LeadGeneratorPlanningScraper/0.1 (+responsible planning data collection)"
@@ -136,6 +137,18 @@ REQUEST_THROTTLE_SECONDS = 0.25
 PLANIT_REQUEST_THROTTLE_SECONDS = 0.75
 APPLICATION_CSV_FIELDS = ["Reference", "address", "application link", "proposal", "date received", "council"]
 FAILURE_CSV_FIELDS = ["council", "portal_family", "scraper_type", "listing_url", "reason"]
+HISTORY_CSV_FIELDS = [
+    "Search Date",
+    "Search Time",
+    "Keyword Set",
+    "Total Applications",
+    "Relevant Captured Applications",
+    "% Relevant",
+    "List of failed councils",
+    "List of councils with no applications",
+    "Completion",
+    "Captured Documents",
+]
 _REQUEST_THROTTLE_LOCK = threading.Lock()
 _LAST_REQUEST_AT: dict[str, float] = {}
 
@@ -177,6 +190,7 @@ class LeadSearchConfig:
     catalogue_path: Path | None = None
     download_application_files: bool = True
     worker_count: int = DEFAULT_SEARCH_WORKER_COUNT
+    history_csv_path: Path | None = None
 
 
 @dataclass(slots=True)
@@ -188,6 +202,12 @@ class LeadSearchResult:
     councils_total: int
     councils_completed: int
     leads_found: int
+    total_applications: int = 0
+    captured_documents: int = 0
+    failed_councils: list[str] = field(default_factory=list)
+    no_application_councils: list[str] = field(default_factory=list)
+    completion: str = "Completed"
+    history_csv_path: Path | None = None
 
 
 @dataclass(slots=True)
@@ -218,8 +238,10 @@ def run_lead_search(
     *,
     log: LogCallback | None = None,
     progress: ProgressCallback | None = None,
+    captured: CapturedCallback | None = None,
     should_cancel: CancelCallback | None = None,
 ) -> LeadSearchResult:
+    started_at = datetime.now()
     user_geojson = load_geojson(config.geojson_path)
     catalogue = load_authority_catalogue(config.catalogue_path)
     targets = select_overlapping_authorities(user_geojson, catalogue)
@@ -233,6 +255,12 @@ def run_lead_search(
     initialise_csv(failure_csv_path, FAILURE_CSV_FIELDS)
 
     rows: list[dict[str, str]] = []
+    total_applications = 0
+    captured_documents = 0
+    failed_councils: list[str] = []
+    no_application_councils: list[str] = []
+    had_error = False
+    cancelled = False
     completed = 0
     feature_count = len(user_geojson.get("features", []))
     _log(log, f"Read {feature_count} user GeoJSON features from {config.geojson_path.name}")
@@ -258,13 +286,41 @@ def run_lead_search(
             current = completed
         _progress(progress, current, len(targets))
 
+    def cancellation_requested() -> bool:
+        nonlocal cancelled
+        if should_cancel and should_cancel():
+            cancelled = True
+            return True
+        return False
+
     def save_row(row: dict[str, str]) -> None:
+        current = 0
         with lock:
             rows.append(row)
             append_csv_row(csv_path, APPLICATION_CSV_FIELDS, row)
+            current = len(rows)
+        _captured(captured, current)
 
-    def save_failure(target: CouncilTarget, reason: str) -> None:
+    def add_total_applications(count: int) -> None:
+        nonlocal total_applications
         with lock:
+            total_applications += count
+
+    def add_captured_document_application() -> None:
+        nonlocal captured_documents
+        with lock:
+            captured_documents += 1
+
+    def add_no_application_council(target: CouncilTarget) -> None:
+        with lock:
+            no_application_councils.append(target.authority)
+
+    def save_failure(target: CouncilTarget, reason: str, *, no_applications_returned: bool = True) -> None:
+        nonlocal had_error
+        with lock:
+            had_error = True
+            if no_applications_returned:
+                failed_councils.append(target.authority)
             append_csv_row(
                 failure_csv_path,
                 FAILURE_CSV_FIELDS,
@@ -279,7 +335,7 @@ def run_lead_search(
 
     def search_worker(name: str, *, reverse: bool = False) -> None:
         while True:
-            if should_cancel and should_cancel():
+            if cancellation_requested():
                 _log(log, f"{name}: cancelled.")
                 return
             target = next_target(reverse)
@@ -287,12 +343,16 @@ def run_lead_search(
                 return
 
             _log(log, f"{name}: searching {target.authority} ({target.portal_family})")
+            applications: list[PlanningApplication] = []
             try:
                 applications = discover_portal_applications(target, config.start_date, config.end_date)
+                add_total_applications(len(applications))
+                if not applications:
+                    add_no_application_council(target)
                 _log(log, f"{target.authority}: found {len(applications)} received applications in the date range")
                 matched_count = 0
                 for application in applications:
-                    if should_cancel and should_cancel():
+                    if cancellation_requested():
                         break
                     if not application_matches(application, config.start_date, config.end_date, config.keywords):
                         continue
@@ -301,6 +361,8 @@ def run_lead_search(
                     matched_count += 1
                     if config.download_application_files:
                         application = enrich_application_documents(application)
+                        if application.documents:
+                            add_captured_document_application()
                         lead_folder = create_lead_folder(output_dir, target.authority, application)
                         downloaded_count = download_pdf_documents(application.documents, lead_folder, log=log)
                     else:
@@ -322,7 +384,7 @@ def run_lead_search(
                 _log(log, f"{target.authority}: {matched_count} applications matched keywords and location")
             except Exception as exc:  # pragma: no cover - live-site resilience
                 _log(log, f"{target.authority}: failed: {exc}")
-                save_failure(target, str(exc))
+                save_failure(target, str(exc), no_applications_returned=not applications)
             finally:
                 mark_complete()
 
@@ -342,9 +404,15 @@ def run_lead_search(
     for worker in workers:
         worker.join()
 
+    if cancelled:
+        completion = "Cancelled"
+    elif had_error:
+        completion = "Failed"
+    else:
+        completion = "Completed"
     _log(log, f"Finished. Saved {len(rows)} leads to {csv_path}")
     _log(log, f"Saved failed council log to {failure_csv_path}")
-    return LeadSearchResult(
+    result = LeadSearchResult(
         output_dir=output_dir,
         csv_path=csv_path,
         failure_csv_path=failure_csv_path,
@@ -352,7 +420,20 @@ def run_lead_search(
         councils_total=len(targets),
         councils_completed=completed,
         leads_found=len(rows),
+        total_applications=total_applications,
+        captured_documents=captured_documents,
+        failed_councils=failed_councils,
+        no_application_councils=no_application_councils,
+        completion=completion,
+        history_csv_path=config.history_csv_path,
     )
+    if config.history_csv_path:
+        try:
+            append_search_history(config.history_csv_path, result, config.keywords, started_at)
+            _log(log, f"Saved search history to {config.history_csv_path}")
+        except Exception as exc:  # pragma: no cover - history should not break a completed scrape
+            _log(log, f"Could not save search history: {exc}")
+    return result
 
 
 def load_geojson(path: Path) -> dict[str, object]:
@@ -934,6 +1015,42 @@ def download_pdf_documents(
 def write_csv(csv_path: Path, rows: list[dict[str, str]]) -> None:
     initialise_csv(csv_path, APPLICATION_CSV_FIELDS)
     append_csv_rows(csv_path, APPLICATION_CSV_FIELDS, rows)
+
+
+def append_search_history(
+    history_csv_path: Path,
+    result: LeadSearchResult,
+    keywords: list[str],
+    started_at: datetime,
+) -> None:
+    history_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    relevant_percent = 0 if result.total_applications == 0 else (result.leads_found / result.total_applications) * 100
+    row = {
+        "Search Date": started_at.strftime("%Y-%m-%d"),
+        "Search Time": started_at.strftime("%H:%M:%S"),
+        "Keyword Set": keyword_set_name(keywords),
+        "Total Applications": str(result.total_applications),
+        "Relevant Captured Applications": str(result.leads_found),
+        "% Relevant": f"{relevant_percent:.2f}%",
+        "List of failed councils": "; ".join(result.failed_councils),
+        "List of councils with no applications": "; ".join(result.no_application_councils),
+        "Completion": result.completion,
+        "Captured Documents": str(result.captured_documents),
+    }
+    file_exists = history_csv_path.exists() and history_csv_path.stat().st_size > 0
+    with history_csv_path.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=HISTORY_CSV_FIELDS)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def keyword_set_name(keywords: list[str]) -> str:
+    return "Standard" if _normalized_keyword_list(keywords) == _normalized_keyword_list(DEFAULT_KEYWORDS) else "Bespoke"
+
+
+def _normalized_keyword_list(keywords: list[str]) -> list[str]:
+    return [keyword.strip().casefold() for keyword in keywords if keyword.strip()]
 
 
 def initialise_csv(csv_path: Path, fieldnames: list[str]) -> None:
@@ -2110,3 +2227,8 @@ def _log(callback: LogCallback | None, message: str) -> None:
 def _progress(callback: ProgressCallback | None, completed: int, total: int) -> None:
     if callback:
         callback(completed, total)
+
+
+def _captured(callback: CapturedCallback | None, count: int) -> None:
+    if callback:
+        callback(count)

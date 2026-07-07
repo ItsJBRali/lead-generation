@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import queue
+import sys
 import threading
 from datetime import date, timedelta
 from pathlib import Path
@@ -166,8 +167,13 @@ class LeadGeneratorApp(ctk.CTk):
         status_panel = ctk.CTkFrame(shell, corner_radius=20, fg_color="#172033")
         status_panel.grid(row=4, column=0, padx=26, pady=12, sticky="ew")
         status_panel.grid_columnconfigure(0, weight=1)
-        self.progress_label = ctk.CTkLabel(status_panel, text="0 complete / 0 councils", text_color="#cbd5e1")
-        self.progress_label.grid(row=0, column=0, padx=16, pady=(14, 6), sticky="w")
+        progress_text_row = ctk.CTkFrame(status_panel, fg_color="transparent")
+        progress_text_row.grid(row=0, column=0, padx=16, pady=(14, 6), sticky="ew")
+        progress_text_row.grid_columnconfigure((0, 1), weight=1)
+        self.progress_label = ctk.CTkLabel(progress_text_row, text="0 complete / 0 councils", text_color="#cbd5e1")
+        self.progress_label.grid(row=0, column=0, sticky="w")
+        self.captured_label = ctk.CTkLabel(progress_text_row, text="0 relevant applications captured", text_color="#cbd5e1")
+        self.captured_label.grid(row=0, column=1, sticky="e")
         self.progress_bar = ctk.CTkProgressBar(status_panel, height=14, corner_radius=10)
         self.progress_bar.grid(row=1, column=0, padx=16, pady=(0, 16), sticky="ew")
         self.progress_bar.set(0)
@@ -262,6 +268,7 @@ class LeadGeneratorApp(ctk.CTk):
         self.run_button.configure(state="disabled")
         self.cancel_button.configure(state="normal")
         self.progress_bar.set(0)
+        self._set_captured(0)
         self._clear_log()
         self._append_log("Starting search...")
 
@@ -290,6 +297,7 @@ class LeadGeneratorApp(ctk.CTk):
             keywords=keywords,
             download_application_files=bool(self.download_files_var.get()),
             worker_count=int(self.worker_count_menu.get()),
+            history_csv_path=history_csv_path(),
         )
 
     def _run_worker(self, config: LeadSearchConfig) -> None:
@@ -298,6 +306,7 @@ class LeadGeneratorApp(ctk.CTk):
                 config,
                 log=lambda message: self.messages.put(("log", message)),
                 progress=lambda complete, total: self.messages.put(("progress", (complete, total))),
+                captured=lambda count: self.messages.put(("captured", count)),
                 should_cancel=lambda: self.cancel_requested,
             )
             self.messages.put(("done", result))
@@ -320,9 +329,13 @@ class LeadGeneratorApp(ctk.CTk):
             elif kind == "progress":
                 completed, total = payload
                 self._set_progress(int(completed), int(total))
+            elif kind == "captured":
+                self._set_captured(int(payload))
             elif kind == "done":
                 self._finish_run()
                 self._append_log(f"Output folder: {payload.output_dir}")
+                if payload.history_csv_path:
+                    self._append_log(f"Search history: {payload.history_csv_path}")
                 messagebox.showinfo("Search complete", f"Saved {payload.leads_found} leads.")
             elif kind == "error":
                 self._finish_run()
@@ -333,6 +346,9 @@ class LeadGeneratorApp(ctk.CTk):
     def _set_progress(self, completed: int, total: int) -> None:
         self.progress_label.configure(text=f"{completed} complete / {total} councils")
         self.progress_bar.set(0 if total == 0 else completed / total)
+
+    def _set_captured(self, captured: int) -> None:
+        self.captured_label.configure(text=f"{captured} relevant applications captured")
 
     def _finish_run(self) -> None:
         self.run_button.configure(state="normal")
@@ -353,6 +369,12 @@ class LeadGeneratorApp(ctk.CTk):
 def main() -> None:
     app = LeadGeneratorApp()
     app.mainloop()
+
+
+def history_csv_path() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent / "search_history.csv"
+    return Path.cwd() / "search_history.csv"
 
 
 if __name__ == "__main__":
