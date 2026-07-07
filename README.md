@@ -70,6 +70,7 @@ The Windows GUI is available as `dist/PlanningLeadGenerator.exe`. It lets a user
 - choose an output folder
 - select a received-date range
 - choose whether to download application files as well as the CSV
+- choose how many councils to search concurrently, from 1 to 8
 - edit the default lead keywords
 - run the search with council progress and a live log
 

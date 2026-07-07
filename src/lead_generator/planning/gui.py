@@ -8,7 +8,7 @@ from tkinter import BooleanVar, filedialog, messagebox
 
 import customtkinter as ctk
 
-from lead_generator.planning.leads import DEFAULT_KEYWORDS, LeadSearchConfig, parse_keywords, run_lead_search
+from lead_generator.planning.leads import DEFAULT_KEYWORDS, DEFAULT_SEARCH_WORKER_COUNT, MAX_SEARCH_WORKER_COUNT, LeadSearchConfig, parse_keywords, run_lead_search
 
 
 class DateSelector(ctk.CTkFrame):
@@ -57,6 +57,7 @@ class LeadGeneratorApp(ctk.CTk):
         self.worker: threading.Thread | None = None
         self.cancel_requested = False
         self.download_files_var = BooleanVar(value=True)
+        self.worker_count_values = [str(value) for value in range(1, MAX_SEARCH_WORKER_COUNT + 1)]
 
         self._build_layout()
         self.after(100, self._poll_messages)
@@ -123,7 +124,22 @@ class LeadGeneratorApp(ctk.CTk):
             offvalue=False,
             text_color="#e5e7eb",
         )
-        self.download_files_checkbox.grid(row=1, column=0, columnspan=2, padx=16, pady=(0, 16), sticky="w")
+        self.download_files_checkbox.grid(row=1, column=0, padx=16, pady=(0, 16), sticky="w")
+        worker_count_row = ctk.CTkFrame(controls, fg_color="transparent")
+        worker_count_row.grid(row=1, column=1, padx=16, pady=(0, 16), sticky="e")
+        ctk.CTkLabel(
+            worker_count_row,
+            text="Concurrent councils",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color="#e5e7eb",
+        ).grid(row=0, column=0, padx=(0, 10), sticky="e")
+        self.worker_count_menu = ctk.CTkOptionMenu(
+            worker_count_row,
+            values=self.worker_count_values,
+            width=78,
+        )
+        self.worker_count_menu.set(str(DEFAULT_SEARCH_WORKER_COUNT))
+        self.worker_count_menu.grid(row=0, column=1, sticky="e")
 
         keyword_panel = ctk.CTkFrame(shell, corner_radius=20, fg_color="#172033")
         keyword_panel.grid(row=3, column=0, padx=26, pady=12, sticky="nsew")
@@ -273,6 +289,7 @@ class LeadGeneratorApp(ctk.CTk):
             end_date=end_date,
             keywords=keywords,
             download_application_files=bool(self.download_files_var.get()),
+            worker_count=int(self.worker_count_menu.get()),
         )
 
     def _run_worker(self, config: LeadSearchConfig) -> None:

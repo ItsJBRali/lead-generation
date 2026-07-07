@@ -747,6 +747,82 @@ class LeadSearchTest(unittest.TestCase):
             self.assertEqual(result.councils_completed, 4)
             self.assertEqual(set(started[:4]), {"Council A", "Council B", "Council C", "Council D"})
 
+    def test_run_lead_search_caps_configured_worker_count_at_eight(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_geojson = root / "search.geojson"
+            user_geojson.write_text(
+                json.dumps(
+                    {
+                        "type": "FeatureCollection",
+                        "features": [polygon_feature("search area", 0, 0, 1, 1)],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            catalogue = root / "catalogue.geojson"
+            catalogue.write_text(
+                json.dumps(
+                    {
+                        "type": "FeatureCollection",
+                        "features": [
+                            {
+                                **polygon_feature(f"Council {index}", 0, 0, 1, 1),
+                                "properties": {
+                                    "authority": f"Council {index}",
+                                    "portal_family": "idox",
+                                    "base_url": f"https://{index}.example.gov.uk",
+                                    "listing_url": f"https://{index}.example.gov.uk/search",
+                                },
+                            }
+                            for index in range(10)
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = LeadSearchConfig(
+                geojson_path=user_geojson,
+                output_root=root,
+                start_date=date(2026, 6, 1),
+                end_date=date(2026, 6, 30),
+                keywords=["driveway gates"],
+                catalogue_path=catalogue,
+                worker_count=99,
+            )
+            started: list[str] = []
+            active = 0
+            max_active = 0
+            lock = threading.Lock()
+            first_batch_ready = threading.Event()
+            release_workers = threading.Event()
+
+            def fake_discover(target, start_date, end_date):
+                nonlocal active, max_active
+                with lock:
+                    started.append(target.authority)
+                    active += 1
+                    max_active = max(max_active, active)
+                    if active >= 8:
+                        first_batch_ready.set()
+                release_workers.wait(timeout=1)
+                with lock:
+                    active -= 1
+                return []
+
+            def release_after_first_batch() -> None:
+                first_batch_ready.wait(timeout=1)
+                release_workers.set()
+
+            releaser = threading.Thread(target=release_after_first_batch, daemon=True)
+            releaser.start()
+            with patch("lead_generator.planning.leads.discover_portal_applications", side_effect=fake_discover):
+                result = run_lead_search(config)
+            releaser.join(timeout=1)
+
+            self.assertEqual(result.councils_completed, 10)
+            self.assertEqual(max_active, 8)
+
     def test_document_source_url_from_idox_summary_url_uses_documents_tab(self) -> None:
         self.assertEqual(
             document_source_url_from_application_url(

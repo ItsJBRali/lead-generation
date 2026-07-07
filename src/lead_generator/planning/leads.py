@@ -126,7 +126,8 @@ CancelCallback = Callable[[], bool]
 
 USER_AGENT = "Mozilla/5.0 LeadGeneratorPlanningScraper/0.1 (+responsible planning data collection)"
 PLANIT_PAGE_SIZE = 100
-SEARCH_WORKER_COUNT = 4
+DEFAULT_SEARCH_WORKER_COUNT = 4
+MAX_SEARCH_WORKER_COUNT = 8
 DOCUMENT_DOWNLOAD_DELAY_SECONDS = 0.0
 RATE_LIMIT_HTTP_CODES = {429, 503}
 MAX_RETRY_AFTER_SECONDS = 20.0
@@ -175,6 +176,7 @@ class LeadSearchConfig:
     keywords: list[str]
     catalogue_path: Path | None = None
     download_application_files: bool = True
+    worker_count: int = DEFAULT_SEARCH_WORKER_COUNT
 
 
 @dataclass(slots=True)
@@ -324,7 +326,8 @@ def run_lead_search(
             finally:
                 mark_complete()
 
-    worker_count = min(SEARCH_WORKER_COUNT, len(targets))
+    configured_worker_count = min(max(config.worker_count, 1), MAX_SEARCH_WORKER_COUNT)
+    worker_count = min(configured_worker_count, len(targets))
     workers = [
         threading.Thread(
             target=search_worker,
