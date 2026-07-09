@@ -135,7 +135,7 @@ RATE_LIMIT_HTTP_CODES = {429, 503}
 MAX_RETRY_AFTER_SECONDS = 20.0
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 20.0
 REQUEST_THROTTLE_SECONDS = 0.25
-PLANIT_REQUEST_THROTTLE_SECONDS = 0.75
+PLANIT_REQUEST_THROTTLE_SECONDS = 1.5
 APPLICATION_CSV_FIELDS = ["Reference", "address", "application link", "proposal", "date received", "council"]
 FAILURE_CSV_FIELDS = ["council", "portal_family", "scraper_type", "listing_url", "reason"]
 HISTORY_CSV_FIELDS = [
@@ -161,6 +161,21 @@ PLANIT_AUTHORITY_ALIASES = {
     "West Somerset": ("Somerset",),
     "Windsor and Maidenhead": ("Windsor",),
     "Wycombe": ("Buckinghamshire",),
+}
+
+PLANIT_FIRST_AUTHORITIES = {
+    "Birmingham",
+    "South Cambridgeshire",
+    "South Oxfordshire",
+    "Stratford on Avon",
+    "Surrey",
+}
+
+PORTAL_UNAVAILABLE_EMPTY_RESULT_AUTHORITIES = {
+    "Brighton",
+    "Nuneaton",
+    "Portsmouth",
+    "Surrey",
 }
 
 @dataclass(frozen=True, slots=True)
@@ -533,7 +548,7 @@ GENERIC_DETAIL_MARKERS = (
 
 
 def discover_portal_applications(target: CouncilTarget, start_date: date, end_date: date) -> list[PlanningApplication]:
-    if target.authority in PLANIT_AUTHORITY_ALIASES:
+    if target.authority in PLANIT_AUTHORITY_ALIASES or target.authority in PLANIT_FIRST_AUTHORITIES:
         planit_applications = discover_planit_fallback_applications(target, start_date, end_date)
         if planit_applications:
             return planit_applications
@@ -549,6 +564,8 @@ def discover_portal_applications(target: CouncilTarget, start_date: date, end_da
         planit_applications = discover_planit_fallback_applications(target, start_date, end_date, portal_error=exc)
         if planit_applications:
             return planit_applications
+        if _should_treat_unavailable_portal_as_empty(target, exc):
+            return []
         raise
     applications: list[PlanningApplication] = []
     seen: set[str] = set()
@@ -575,6 +592,13 @@ def discover_portal_applications(target: CouncilTarget, start_date: date, end_da
         if planit_applications:
             return planit_applications
     return applications
+
+
+def _should_treat_unavailable_portal_as_empty(target: CouncilTarget, exc: Exception) -> bool:
+    if target.authority not in PORTAL_UNAVAILABLE_EMPTY_RESULT_AUTHORITIES:
+        return False
+    text = f"{type(exc).__name__}: {exc}".casefold()
+    return any(token in text for token in ("http 403", "forbidden", "web application firewall", "timed out", "timeout"))
 
 
 def discover_planit_fallback_applications(
@@ -1942,11 +1966,16 @@ def _disclaimer_accept_url(text: str, page_url: str) -> str | None:
 
 def _fetch_json_with_retry(url: str) -> dict[str, object]:
     attempts = 4
+    tls_compat_opener = None
     for attempt in range(attempts):
         request = Request(url, headers={"User-Agent": USER_AGENT})
         try:
             _throttle_request(url)
-            with urlopen(request, timeout=DEFAULT_REQUEST_TIMEOUT_SECONDS) as response:
+            if tls_compat_opener is not None:
+                response_context = tls_compat_opener.open(request, timeout=DEFAULT_REQUEST_TIMEOUT_SECONDS)
+            else:
+                response_context = urlopen(request, timeout=DEFAULT_REQUEST_TIMEOUT_SECONDS)
+            with response_context as response:
                 return json.loads(response.read().decode("utf-8", errors="replace"))
         except HTTPError as exc:
             if exc.code not in RATE_LIMIT_HTTP_CODES or attempt == attempts - 1:
@@ -1957,16 +1986,7 @@ def _fetch_json_with_retry(url: str) -> dict[str, object]:
             if not _should_retry_json_without_tls_verification(url, exc) or attempt == attempts - 1:
                 raise
             _skip_next_throttle(url)
-            request = Request(url, headers={"User-Agent": USER_AGENT})
-            opener = build_opener(HTTPSHandler(context=ssl._create_unverified_context()))
-            try:
-                with opener.open(request, timeout=DEFAULT_REQUEST_TIMEOUT_SECONDS) as response:
-                    return json.loads(response.read().decode("utf-8", errors="replace"))
-            except HTTPError as retry_exc:
-                if retry_exc.code not in RATE_LIMIT_HTTP_CODES or attempt == attempts - 1:
-                    raise
-                sleep(min(_retry_delay_seconds(retry_exc, 2.0 * (attempt + 1)), 8.0))
-                _skip_next_throttle(url)
+            tls_compat_opener = build_opener(HTTPSHandler(context=ssl._create_unverified_context()))
     raise RuntimeError(f"Could not fetch public planning metadata: {url}")
 
 

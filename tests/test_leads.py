@@ -360,6 +360,58 @@ class LeadSearchTest(unittest.TestCase):
         self.assertEqual(applications[0].authority, "Wycombe")
         self.assertEqual(applications[0].raw["source"], "planit_fallback")
 
+    def test_discover_portal_applications_uses_planit_first_for_problem_portals(self) -> None:
+        target = CouncilTarget(
+            authority="Surrey",
+            portal_family="unknown",
+            scraper_type="Atrium",
+            base_url="https://planning.surreycc.gov.uk/",
+            listing_url="https://planning.surreycc.gov.uk/planappsearch.aspx",
+            geometry={},
+        )
+        fallback = [
+            PlanningApplication(
+                authority="Surrey",
+                uid="PLAN/2026/0498",
+                url="https://example.test/app",
+                reference="PLAN/2026/0498",
+                date_received="2026-06-10",
+            )
+        ]
+
+        with (
+            patch("lead_generator.planning.leads.planning_scraper_for_target") as scraper_factory,
+            patch("lead_generator.planning.leads.discover_planit_applications", return_value=fallback) as planit,
+        ):
+            applications = discover_portal_applications(target, date(2026, 6, 8), date(2026, 6, 14))
+
+        scraper_factory.assert_not_called()
+        planit.assert_called_once_with("Surrey", date(2026, 6, 8), date(2026, 6, 14))
+        self.assertEqual([application.reference for application in applications], ["PLAN/2026/0498"])
+        self.assertEqual(applications[0].raw["source"], "planit_fallback")
+
+    def test_discover_portal_applications_treats_known_blocked_portal_as_empty_after_failed_fallback(self) -> None:
+        class BlockedScraper:
+            def discover_ids(self, **kwargs):
+                raise RuntimeError("HTTP 403 while fetching https://publicaccess.portsmouth.gov.uk")
+
+        target = CouncilTarget(
+            authority="Portsmouth",
+            portal_family="idox",
+            scraper_type="Idox",
+            base_url="https://publicaccess.portsmouth.gov.uk",
+            listing_url="https://publicaccess.portsmouth.gov.uk/online-applications/search.do?action=advanced",
+            geometry={},
+        )
+
+        with (
+            patch("lead_generator.planning.leads.planning_scraper_for_target", return_value=BlockedScraper()),
+            patch("lead_generator.planning.leads.discover_planit_applications", return_value=[]),
+        ):
+            applications = discover_portal_applications(target, date(2026, 6, 8), date(2026, 6, 14))
+
+        self.assertEqual(applications, [])
+
     def test_discover_portal_applications_uses_planit_for_empty_portal_result(self) -> None:
         class EmptyScraper:
             def discover_ids(self, **kwargs):
