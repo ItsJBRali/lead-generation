@@ -117,6 +117,7 @@ EXCLUDED_PROPOSAL_PHRASES = (
     "edc consultation",
     "removal of condition",
     "partial approval of",
+    "noise assessment",
 )
 
 
@@ -248,6 +249,7 @@ def run_lead_search(
     initialise_csv(failure_csv_path, FAILURE_CSV_FIELDS)
 
     rows: list[dict[str, str]] = []
+    saved_references: set[str] = set()
     total_applications = 0
     captured_documents = 0
     failed_councils: list[str] = []
@@ -285,6 +287,13 @@ def run_lead_search(
             cancelled = True
             return True
         return False
+
+    def reserve_reference(reference: str) -> bool:
+        with lock:
+            if reference in saved_references:
+                return False
+            saved_references.add(reference)
+        return True
 
     def save_row(row: dict[str, str]) -> None:
         current = 0
@@ -351,6 +360,10 @@ def run_lead_search(
                         continue
                     if not application_matches_search_area(application, user_geojson):
                         continue
+                    reference = application.reference or application.uid
+                    if not reserve_reference(reference):
+                        _log(log, f"{target.authority}: skipped duplicate reference {reference}")
+                        continue
                     matched_count += 1
                     if config.download_application_files:
                         application = enrich_application_documents(application)
@@ -362,7 +375,7 @@ def run_lead_search(
                         downloaded_count = 0
                     save_row(
                         {
-                            "Reference": application.reference or application.uid,
+                            "Reference": reference,
                             "address": application.address or "",
                             "application link": application_link(application),
                             "proposal": application.description or "",
@@ -939,6 +952,8 @@ def proposal_is_excluded(proposal: str | None) -> bool:
         return False
     normalized = re.sub(r"\s+", " ", proposal).strip().casefold()
     if normalized.startswith("t1"):
+        return True
+    if normalized.startswith("g1"):
         return True
     if "retrospective" in normalized and not re.search(r"\bpart\b", normalized):
         return True

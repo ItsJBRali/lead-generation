@@ -161,6 +161,7 @@ class LeadSearchTest(unittest.TestCase):
             "EDC Consultation for new gates",
             "Removal of condition 2 for boundary gates",
             "Partial approval of details for entrance gates",
+            "Noise Assessment for new automated gates",
         ]
 
         for proposal in excluded_proposals:
@@ -214,7 +215,18 @@ class LeadSearchTest(unittest.TestCase):
             authority="Example",
             uid="1",
             url="https://example.test",
-            description="T1 Oak - install replacement boundary gates",
+            description="T1 - Oak - install replacement boundary gates",
+            date_received="2026-06-12",
+        )
+
+        self.assertFalse(application_matches(application, date(2026, 6, 1), date(2026, 6, 30), ["gates"]))
+
+    def test_application_matches_excludes_proposals_starting_with_g1(self) -> None:
+        application = PlanningApplication(
+            authority="Example",
+            uid="1",
+            url="https://example.test",
+            description="G1 Mixed trees - install replacement boundary gates",
             date_received="2026-06-12",
         )
 
@@ -528,6 +540,81 @@ class LeadSearchTest(unittest.TestCase):
             self.assertTrue(csv_text.startswith("Reference,address,application link"))
             self.assertIn("24/01234/FUL,1 Example Street,https://planning.example.gov.uk/detail/ABC123", csv_text)
             self.assertFalse((result.output_dir / "Example Council").exists())
+
+    def test_run_lead_search_removes_duplicate_exact_references(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_geojson = root / "search.geojson"
+            user_geojson.write_text(
+                json.dumps(
+                    {
+                        "type": "FeatureCollection",
+                        "features": [polygon_feature("search area", 0, 0, 1, 1)],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            catalogue = root / "catalogue.geojson"
+            catalogue.write_text(
+                json.dumps(
+                    {
+                        "type": "FeatureCollection",
+                        "features": [
+                            {
+                                **polygon_feature("Example Council", 0, 0, 1, 1),
+                                "properties": {
+                                    "authority": "Example Council",
+                                    "portal_family": "idox",
+                                    "base_url": "https://planning.example.gov.uk",
+                                    "listing_url": "https://planning.example.gov.uk/search",
+                                },
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = LeadSearchConfig(
+                geojson_path=user_geojson,
+                output_root=root,
+                start_date=date(2026, 6, 1),
+                end_date=date(2026, 6, 30),
+                keywords=["driveway gates"],
+                catalogue_path=catalogue,
+                download_application_files=False,
+            )
+            applications = [
+                PlanningApplication(
+                    authority="Example Council",
+                    uid="ABC123",
+                    url="https://planning.example.gov.uk/detail/ABC123",
+                    reference="24/01234/FUL",
+                    address="1 Example Street",
+                    description="New driveway gates",
+                    date_received="2026-06-10",
+                ),
+                PlanningApplication(
+                    authority="Example Council",
+                    uid="DEF456",
+                    url="https://planning.example.gov.uk/detail/DEF456",
+                    reference="24/01234/FUL",
+                    address="2 Example Street",
+                    description="New driveway gates",
+                    date_received="2026-06-10",
+                ),
+            ]
+
+            captured_counts: list[int] = []
+            with patch("lead_generator.planning.leads.discover_portal_applications", return_value=applications):
+                result = run_lead_search(config, captured=captured_counts.append)
+
+            self.assertEqual(result.leads_found, 1)
+            self.assertEqual(captured_counts, [1])
+            with result.csv_path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["Reference"], "24/01234/FUL")
+            self.assertEqual(rows[0]["application link"], "https://planning.example.gov.uk/detail/ABC123")
 
     def test_run_lead_search_updates_output_csv_when_cancelled(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
