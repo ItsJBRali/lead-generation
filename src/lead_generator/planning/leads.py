@@ -13,6 +13,7 @@ from http.cookiejar import CookieJar
 from email.message import Message
 from importlib import resources
 from pathlib import Path
+from queue import Empty, Queue
 from time import monotonic, sleep
 from typing import Callable, Iterable
 from urllib.error import HTTPError, URLError
@@ -140,6 +141,8 @@ USER_AGENT = (
     "Chrome/126.0.0.0 Safari/537.36"
 )
 PLANIT_PAGE_SIZE = 100
+PLANIT_MAX_PAGES = 100
+PLANIT_GATE_WAIT_TIMEOUT_SECONDS = 30.0
 DEFAULT_SEARCH_WORKER_COUNT = 4
 MAX_SEARCH_WORKER_COUNT = 8
 DEFAULT_PLATFORM_CONCURRENCY_LIMIT = 2
@@ -158,6 +161,8 @@ PLATFORM_RECOVERY_SUCCESS_COUNT = 4
 SEARCH_WORKER_STAGGER_BASE_SECONDS = 0.5
 SEARCH_WORKER_STAGGER_INCREMENT_SECONDS = 0.15
 SEARCH_WORKER_STAGGER_MAX_SECONDS = 1.5
+COUNCIL_SEARCH_ATTEMPT_TIMEOUT_SECONDS = 240.0
+COUNCIL_SEARCH_HEARTBEAT_SECONDS = 30.0
 DOCUMENT_DOWNLOAD_DELAY_SECONDS = 0.0
 RATE_LIMIT_HTTP_CODES = {429, 503}
 MAX_RETRY_AFTER_SECONDS = 20.0
@@ -381,6 +386,14 @@ class CouncilSearchDegradedError(RuntimeError):
     """The council service responded, but its search could not be completed."""
 
 
+class CouncilSearchTimeoutError(RuntimeError):
+    """A council search exceeded the overall attempt deadline."""
+
+
+class CouncilSearchCancelledError(RuntimeError):
+    """A council search was abandoned after the user cancelled the run."""
+
+
 def parse_keywords(text: str) -> list[str]:
     keywords: list[str] = []
     seen: set[str] = set()
@@ -394,6 +407,71 @@ def parse_keywords(text: str) -> list[str]:
         seen.add(key)
         keywords.append(keyword)
     return keywords
+
+
+def discover_portal_applications_with_deadline(
+    target: CouncilTarget,
+    start_date: date,
+    end_date: date,
+    *,
+    timeout_seconds: float = COUNCIL_SEARCH_ATTEMPT_TIMEOUT_SECONDS,
+    heartbeat_seconds: float = COUNCIL_SEARCH_HEARTBEAT_SECONDS,
+    log: LogCallback | None = None,
+    should_cancel: CancelCallback | None = None,
+) -> list[PlanningApplication]:
+    """Run one council search without allowing a stuck adapter to block the queue."""
+
+    outcome: Queue[tuple[list[PlanningApplication] | None, Exception | None]] = Queue(maxsize=1)
+
+    def discover() -> None:
+        try:
+            outcome.put(
+                (
+                    discover_portal_applications(target, start_date, end_date),
+                    None,
+                )
+            )
+        except Exception as exc:  # pragma: no cover - forwarded to the search worker
+            outcome.put((None, exc))
+
+    attempt = threading.Thread(
+        target=discover,
+        name=f"Council search: {target.authority}",
+        daemon=True,
+    )
+    attempt.start()
+
+    started_at = monotonic()
+    deadline = started_at + max(timeout_seconds, 0.01)
+    next_heartbeat = started_at + max(heartbeat_seconds, 0.01)
+    while True:
+        now = monotonic()
+        remaining = deadline - now
+        if remaining <= 0:
+            raise CouncilSearchTimeoutError(
+                f"{target.authority} search exceeded the {timeout_seconds:.0f}-second attempt limit"
+            )
+        try:
+            heartbeat_wait = max(next_heartbeat - now, 0.01)
+            applications, error = outcome.get(
+                timeout=min(remaining, heartbeat_wait, 0.25)
+            )
+        except Empty:
+            if should_cancel and should_cancel():
+                raise CouncilSearchCancelledError(f"Cancelled while searching {target.authority}")
+            now = monotonic()
+            if log and now >= next_heartbeat:
+                elapsed = int(now - started_at)
+                _log(
+                    log,
+                    f"{target.authority}: still searching ({elapsed}s elapsed; "
+                    f"attempt limit {timeout_seconds:.0f}s)",
+                )
+                next_heartbeat = now + max(heartbeat_seconds, 0.01)
+            continue
+        if error is not None:
+            raise error
+        return applications or []
 
 
 def run_lead_search(
@@ -569,7 +647,15 @@ def run_lead_search(
             applications: list[PlanningApplication] = []
             attempt_error: Exception | None = None
             try:
-                applications = discover_portal_applications(target, config.start_date, config.end_date)
+                applications = discover_portal_applications_with_deadline(
+                    target,
+                    config.start_date,
+                    config.end_date,
+                    timeout_seconds=COUNCIL_SEARCH_ATTEMPT_TIMEOUT_SECONDS,
+                    heartbeat_seconds=COUNCIL_SEARCH_HEARTBEAT_SECONDS,
+                    log=log,
+                    should_cancel=cancellation_requested,
+                )
                 add_total_applications(target, len(applications))
                 if not applications:
                     add_no_application_council(target)
@@ -625,6 +711,10 @@ def run_lead_search(
                 affected_platform=affected_platform,
             )
             log_scheduler_adjustment(adjustment)
+
+            if isinstance(attempt_error, CouncilSearchCancelledError):
+                _log(log, f"{target.authority}: cancelled before the search completed")
+                return
 
             if attempt_error is None:
                 if final_attempt:
@@ -1133,8 +1223,14 @@ def with_portal_metadata(
 
 
 def discover_planit_applications(authority: str, start_date: date, end_date: date) -> list[PlanningApplication]:
-    with _PLANIT_CONCURRENCY_GATE:
+    if not _PLANIT_CONCURRENCY_GATE.acquire(timeout=PLANIT_GATE_WAIT_TIMEOUT_SECONDS):
+        raise RuntimeError(
+            f"Timed out waiting {PLANIT_GATE_WAIT_TIMEOUT_SECONDS:.0f}s for the PlanIt request slot"
+        )
+    try:
         return _discover_planit_applications_serial(authority, start_date, end_date)
+    finally:
+        _PLANIT_CONCURRENCY_GATE.release()
 
 
 def _discover_planit_applications_serial(
@@ -1143,6 +1239,7 @@ def _discover_planit_applications_serial(
     end_date: date,
 ) -> list[PlanningApplication]:
     records: list[dict[str, object]] = []
+    seen_pages: set[str] = set()
     page_size = PLANIT_PAGE_SIZE
     page = 1
     while True:
@@ -1156,10 +1253,20 @@ def _discover_planit_applications_serial(
         url = f"https://www.planit.org.uk/api/applics/json?{urlencode(params)}"
         payload = _fetch_json_with_retry(url)
         batch = payload.get("records", [])
+        if not isinstance(batch, list):
+            raise RuntimeError("PlanIt returned an invalid records collection")
+        page_signature = json.dumps(batch, sort_keys=True, default=str)
+        if batch and page_signature in seen_pages:
+            raise RuntimeError(f"PlanIt repeated pagination page {page} for {authority}")
+        seen_pages.add(page_signature)
         records.extend(batch)
         total = int(payload.get("total") or len(records))
         if not batch or len(records) >= total:
             break
+        if page >= PLANIT_MAX_PAGES:
+            raise RuntimeError(
+                f"PlanIt pagination exceeded {PLANIT_MAX_PAGES} pages for {authority}"
+            )
         page += 1
     return [_application_from_planit_record(authority, record) for record in records]
 

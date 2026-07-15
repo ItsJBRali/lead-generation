@@ -19,6 +19,7 @@ from lead_generator.planning.leads import (
     CouncilTarget,
     DownloadedFile,
     LeadSearchConfig,
+    _discover_planit_applications_serial,
     _fetch_json_with_retry,
     application_in_geojson,
     application_matches_search_area,
@@ -1302,6 +1303,99 @@ class LeadSearchTest(unittest.TestCase):
             with result.failure_csv_path.open(newline="", encoding="utf-8") as handle:
                 self.assertEqual(list(csv.DictReader(handle)), [])
 
+    def test_run_lead_search_times_out_stuck_council_and_continues_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_geojson = root / "search.geojson"
+            user_geojson.write_text(
+                json.dumps(
+                    {
+                        "type": "FeatureCollection",
+                        "features": [polygon_feature("search area", 0, 0, 2, 1)],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            catalogue = root / "catalogue.geojson"
+            catalogue.write_text(
+                json.dumps(
+                    {
+                        "type": "FeatureCollection",
+                        "features": [
+                            {
+                                **polygon_feature("Stuck Council", 0, 0, 1, 1),
+                                "properties": {
+                                    "authority": "Stuck Council",
+                                    "portal_family": "idox",
+                                    "scraper_type": "Idox",
+                                    "base_url": "https://stuck.example.gov.uk",
+                                    "listing_url": "https://stuck.example.gov.uk/search",
+                                },
+                            },
+                            {
+                                **polygon_feature("Working Council", 1, 0, 2, 1),
+                                "properties": {
+                                    "authority": "Working Council",
+                                    "portal_family": "arcus",
+                                    "scraper_type": "Arcus",
+                                    "base_url": "https://working.example.gov.uk",
+                                    "listing_url": "https://working.example.gov.uk/search",
+                                },
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = LeadSearchConfig(
+                geojson_path=user_geojson,
+                output_root=root,
+                start_date=date(2026, 6, 1),
+                end_date=date(2026, 6, 30),
+                keywords=["gates"],
+                catalogue_path=catalogue,
+                worker_count=1,
+            )
+            release_stuck_searches = threading.Event()
+            calls: list[str] = []
+            logs: list[str] = []
+
+            def fake_discover(target, start_date, end_date):
+                calls.append(target.authority)
+                if target.authority == "Stuck Council":
+                    release_stuck_searches.wait(timeout=2)
+                return []
+
+            try:
+                with (
+                    patch("lead_generator.planning.leads.COUNCIL_SEARCH_ATTEMPT_TIMEOUT_SECONDS", 0.08),
+                    patch("lead_generator.planning.leads.COUNCIL_SEARCH_HEARTBEAT_SECONDS", 0.02),
+                    patch("lead_generator.planning.leads.search_worker_start_delay", return_value=0),
+                    patch(
+                        "lead_generator.planning.leads.discover_portal_applications",
+                        side_effect=fake_discover,
+                    ),
+                ):
+                    result = run_lead_search(config, log=logs.append)
+            finally:
+                release_stuck_searches.set()
+
+            self.assertEqual(calls, ["Stuck Council", "Working Council", "Stuck Council"])
+            self.assertEqual(result.councils_completed, 2)
+            self.assertEqual(result.failed_councils, ["Stuck Council"])
+            self.assertTrue(any("still searching" in message for message in logs))
+            deferred_index = next(
+                index for index, message in enumerate(logs) if "Stuck Council: deferred" in message
+            )
+            working_index = next(
+                index for index, message in enumerate(logs) if "searching Working Council" in message
+            )
+            retry_index = next(
+                index for index, message in enumerate(logs) if "final retry for Stuck Council" in message
+            )
+            self.assertLess(deferred_index, working_index)
+            self.assertLess(working_index, retry_index)
+
     def test_run_lead_search_caps_configured_worker_count_at_eight(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1998,6 +2092,25 @@ class LeadSearchTest(unittest.TestCase):
         )
 
         self.assertEqual(filename, "Planning statement.pdf")
+
+    def test_planit_pagination_rejects_a_repeated_page(self) -> None:
+        repeated_page = {
+            "records": [{"uid": "24/00001/FUL", "description": "Driveway gates"}],
+            "total": 2,
+        }
+
+        with patch(
+            "lead_generator.planning.leads._fetch_json_with_retry",
+            return_value=repeated_page,
+        ) as fetch:
+            with self.assertRaisesRegex(RuntimeError, "repeated pagination page 2"):
+                _discover_planit_applications_serial(
+                    "Brighton",
+                    date(2026, 6, 1),
+                    date(2026, 6, 30),
+                )
+
+        self.assertEqual(fetch.call_count, 2)
 
     def test_fetch_json_waits_and_retries_after_rate_limit(self) -> None:
         class FakeResponse:
