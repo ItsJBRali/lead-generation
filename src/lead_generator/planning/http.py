@@ -6,10 +6,11 @@ from dataclasses import dataclass
 import json
 import re
 import ssl
+import threading
 from time import monotonic, sleep
 from email.utils import parsedate_to_datetime
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urljoin
+from urllib.parse import urlencode, urljoin, urlsplit
 from urllib.request import (
     HTTPCookieProcessor,
     HTTPSHandler,
@@ -35,6 +36,10 @@ class FetchResponse:
 
 
 class CouncilHttpClient:
+    _rate_limit_lock = threading.Lock()
+    _shared_last_request_at: dict[str, float] = {}
+    _blocked_until: dict[str, float] = {}
+
     def __init__(
         self,
         *,
@@ -43,11 +48,12 @@ class CouncilHttpClient:
         user_agent: str = (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/126.0 Safari/537.36 LeadGeneratorPlanningScraper/0.1"
+            "Chrome/126.0.0.0 Safari/537.36"
         ),
         retries: int = 2,
         verify_tls: bool = True,
         ca_file: str | None = None,
+        rate_limit_key: str | None = None,
     ) -> None:
         self.timeout_seconds = timeout_seconds
         self.min_delay_seconds = min_delay_seconds
@@ -55,8 +61,8 @@ class CouncilHttpClient:
         self.retries = retries
         self.verify_tls = verify_tls
         self.ca_file = ca_file
+        self.rate_limit_key = rate_limit_key
         self._tls_compat = False
-        self._last_request_at = 0.0
         self._cookies = CookieJar()
 
     def get(
@@ -118,22 +124,29 @@ class CouncilHttpClient:
     def _send(self, request: Request, url: str) -> FetchResponse:
         last_error: Exception | None = None
         for attempt in range(self.retries + 1):
-            self._wait_for_turn()
+            self._wait_for_turn(url)
             try:
                 with self._opener().open(request, timeout=self.timeout_seconds) as response:
                     charset = response.headers.get_content_charset() or "utf-8"
                     body = response.read().decode(charset, errors="replace")
+                    status_code = getattr(response, "status", 200)
+                    if not body.strip():
+                        last_error = CouncilFetchError(f"Empty response while fetching {url}")
+                        if attempt == self.retries:
+                            raise last_error
+                        self._pause_before_retry(url, attempt, minimum_seconds=3.0)
+                        continue
                     if _looks_like_waf_challenge(body):
                         raise CouncilFetchError(f"Blocked by web application firewall while fetching {url}")
                     return FetchResponse(
                         url=response.geturl(),
-                        status_code=getattr(response, "status", 200),
+                        status_code=status_code,
                         text=body,
                     )
             except HTTPError as exc:
                 if exc.code in {429, 503} and attempt < self.retries:
                     last_error = exc
-                    sleep(_retry_delay_seconds(exc, attempt))
+                    self._pause_before_retry(url, attempt, exc=exc)
                     continue
                 if exc.code < 500 or attempt == self.retries:
                     raise CouncilFetchError(f"HTTP {exc.code} while fetching {url}") from exc
@@ -151,15 +164,45 @@ class CouncilHttpClient:
                     raise CouncilFetchError(f"Network error while fetching {url}: {exc.reason}") from exc
                 last_error = exc
 
-            sleep(0.5 * (attempt + 1))
+            self._pause_before_retry(url, attempt, minimum_seconds=0.5 * (attempt + 1))
 
         raise CouncilFetchError(f"Could not fetch {url}") from last_error
 
-    def _wait_for_turn(self) -> None:
-        elapsed = monotonic() - self._last_request_at
-        if elapsed < self.min_delay_seconds:
-            sleep(self.min_delay_seconds - elapsed)
-        self._last_request_at = monotonic()
+    def _wait_for_turn(self, url: str) -> None:
+        key = self._throttle_key(url)
+        with self._rate_limit_lock:
+            now = monotonic()
+            next_allowed = max(
+                self._shared_last_request_at.get(key, 0.0) + self.min_delay_seconds,
+                self._blocked_until.get(key, 0.0),
+            )
+            self._shared_last_request_at[key] = next_allowed
+        if next_allowed > now:
+            sleep(next_allowed - now)
+
+    def _pause_before_retry(
+        self,
+        url: str,
+        attempt: int,
+        *,
+        exc: HTTPError | None = None,
+        minimum_seconds: float = 0.0,
+    ) -> None:
+        delay = _retry_delay_seconds(exc, attempt) if exc else minimum_seconds
+        delay = max(delay, minimum_seconds)
+        key = self._throttle_key(url)
+        with self._rate_limit_lock:
+            self._blocked_until[key] = max(self._blocked_until.get(key, 0.0), monotonic() + delay)
+        sleep(delay)
+
+    def _throttle_key(self, url: str | None = None) -> str:
+        if self.rate_limit_key:
+            return self.rate_limit_key
+        source = url or ""
+        return urlsplit(source).netloc.casefold() or self.configured_host_key()
+
+    def configured_host_key(self) -> str:
+        return f"client:{id(self)}"
 
     def _ssl_context(self) -> ssl.SSLContext | None:
         if self.verify_tls and not self.ca_file and certifi is None:

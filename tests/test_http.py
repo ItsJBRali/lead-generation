@@ -60,7 +60,7 @@ def test_http_client_uses_browser_like_user_agent_by_default() -> None:
     client = CouncilHttpClient(min_delay_seconds=0)
 
     assert client.user_agent.startswith("Mozilla/5.0")
-    assert "LeadGeneratorPlanningScraper" in client.user_agent
+    assert "Chrome/" in client.user_agent
 
 
 def test_http_client_retries_with_tls_compat_after_connection_reset() -> None:
@@ -103,3 +103,28 @@ def test_http_client_rejects_waf_placeholder_pages() -> None:
 
     with pytest.raises(CouncilFetchError, match="web application firewall"):
         client.get("https://planning.example.gov.uk/search")
+
+
+def test_http_client_retries_empty_responses_before_returning_content() -> None:
+    class FakeOpener:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def open(self, request, timeout):
+            self.calls += 1
+            return FakeResponse(b"" if self.calls == 1 else b"<html>ready</html>")
+
+    class FakeClient(CouncilHttpClient):
+        def __init__(self) -> None:
+            super().__init__(min_delay_seconds=0, retries=1)
+            self.fake_opener = FakeOpener()
+
+        def _opener(self):
+            return self.fake_opener
+
+    client = FakeClient()
+
+    response = client.get("https://planning.example.gov.uk/search")
+
+    assert response.text == "<html>ready</html>"
+    assert client.fake_opener.calls == 2

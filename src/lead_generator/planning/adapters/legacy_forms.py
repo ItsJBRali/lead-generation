@@ -79,7 +79,11 @@ class NativeListingScraper(PlanningScraper):
     ) -> None:
         super().__init__(config.authority)
         self.config = config
-        self.http = http_client or CouncilHttpClient()
+        self.http = http_client or CouncilHttpClient(
+            min_delay_seconds=1.25,
+            retries=5,
+            rate_limit_key=f"portal:{self.family}",
+        )
 
     def discover_ids(
         self,

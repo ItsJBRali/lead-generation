@@ -42,7 +42,12 @@ class IdoxPublicAccessScraper(PlanningScraper):
     def __init__(self, config: IdoxCouncilConfig, *, http_client: CouncilHttpClient | None = None) -> None:
         super().__init__(config.authority)
         self.config = config
-        self.http = http_client or CouncilHttpClient(timeout_seconds=30.0, min_delay_seconds=1.5, retries=4)
+        self.http = http_client or CouncilHttpClient(
+            timeout_seconds=30.0,
+            min_delay_seconds=2.0,
+            retries=6,
+            rate_limit_key="portal:idox",
+        )
 
     def discover_ids(self, *, listing_url: str | None = None, start_date: date | None = None, end_date: date | None = None, limit: int | None = None) -> DiscoveryResult:
         if listing_url and (start_date or end_date):

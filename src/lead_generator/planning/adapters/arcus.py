@@ -31,7 +31,12 @@ class ArcusPlanningScraper(PlanningScraper):
     ) -> None:
         super().__init__(config.authority)
         self.config = config
-        self.http = http_client or CouncilHttpClient(verify_tls=False)
+        self.http = http_client or CouncilHttpClient(
+            verify_tls=False,
+            min_delay_seconds=1.25,
+            retries=5,
+            rate_limit_key="portal:arcus",
+        )
 
     def discover_ids(
         self,

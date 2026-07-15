@@ -126,7 +126,11 @@ ProgressCallback = Callable[[int, int], None]
 CapturedCallback = Callable[[int], None]
 CancelCallback = Callable[[], bool]
 
-USER_AGENT = "Mozilla/5.0 LeadGeneratorPlanningScraper/0.1 (+responsible planning data collection)"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/126.0.0.0 Safari/537.36"
+)
 PLANIT_PAGE_SIZE = 100
 DEFAULT_SEARCH_WORKER_COUNT = 4
 MAX_SEARCH_WORKER_COUNT = 8
