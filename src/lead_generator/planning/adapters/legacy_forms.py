@@ -82,7 +82,7 @@ class NativeListingScraper(PlanningScraper):
         self.http = http_client or CouncilHttpClient(
             min_delay_seconds=1.25,
             retries=5,
-            rate_limit_key=f"portal:{self.family}",
+            concurrency_key=f"portal:{self.family}",
         )
 
     def discover_ids(

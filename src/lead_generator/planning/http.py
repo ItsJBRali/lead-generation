@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from http.cookiejar import CookieJar
 from dataclasses import dataclass
+from contextlib import nullcontext
 import json
 import re
 import ssl
@@ -37,8 +38,10 @@ class FetchResponse:
 
 class CouncilHttpClient:
     _rate_limit_lock = threading.Lock()
+    _concurrency_lock = threading.Lock()
     _shared_last_request_at: dict[str, float] = {}
     _blocked_until: dict[str, float] = {}
+    _concurrency_gates: dict[tuple[str, int], threading.BoundedSemaphore] = {}
 
     def __init__(
         self,
@@ -54,6 +57,8 @@ class CouncilHttpClient:
         verify_tls: bool = True,
         ca_file: str | None = None,
         rate_limit_key: str | None = None,
+        concurrency_key: str | None = None,
+        concurrency_limit: int = 2,
     ) -> None:
         self.timeout_seconds = timeout_seconds
         self.min_delay_seconds = min_delay_seconds
@@ -62,6 +67,8 @@ class CouncilHttpClient:
         self.verify_tls = verify_tls
         self.ca_file = ca_file
         self.rate_limit_key = rate_limit_key
+        self.concurrency_key = concurrency_key
+        self.concurrency_limit = max(concurrency_limit, 1)
         self._tls_compat = False
         self._cookies = CookieJar()
 
@@ -124,25 +131,27 @@ class CouncilHttpClient:
     def _send(self, request: Request, url: str) -> FetchResponse:
         last_error: Exception | None = None
         for attempt in range(self.retries + 1):
-            self._wait_for_turn(url)
             try:
-                with self._opener().open(request, timeout=self.timeout_seconds) as response:
-                    charset = response.headers.get_content_charset() or "utf-8"
-                    body = response.read().decode(charset, errors="replace")
-                    status_code = getattr(response, "status", 200)
-                    if not body.strip():
-                        last_error = CouncilFetchError(f"Empty response while fetching {url}")
-                        if attempt == self.retries:
-                            raise last_error
-                        self._pause_before_retry(url, attempt, minimum_seconds=3.0)
-                        continue
-                    if _looks_like_waf_challenge(body):
-                        raise CouncilFetchError(f"Blocked by web application firewall while fetching {url}")
-                    return FetchResponse(
-                        url=response.geturl(),
-                        status_code=status_code,
-                        text=body,
-                    )
+                with self._request_slot():
+                    self._wait_for_turn(url)
+                    with self._opener().open(request, timeout=self.timeout_seconds) as response:
+                        charset = response.headers.get_content_charset() or "utf-8"
+                        body = response.read().decode(charset, errors="replace")
+                        status_code = getattr(response, "status", 200)
+                        response_url = response.geturl()
+                if not body.strip():
+                    last_error = CouncilFetchError(f"Empty response while fetching {url}")
+                    if attempt == self.retries:
+                        raise last_error
+                    self._pause_before_retry(url, attempt, minimum_seconds=3.0)
+                    continue
+                if _looks_like_waf_challenge(body):
+                    raise CouncilFetchError(f"Blocked by web application firewall while fetching {url}")
+                return FetchResponse(
+                    url=response_url,
+                    status_code=status_code,
+                    text=body,
+                )
             except HTTPError as exc:
                 if exc.code in {429, 503} and attempt < self.retries:
                     last_error = exc
@@ -203,6 +212,17 @@ class CouncilHttpClient:
 
     def configured_host_key(self) -> str:
         return f"client:{id(self)}"
+
+    def _request_slot(self):
+        if not self.concurrency_key:
+            return nullcontext()
+        gate_key = (self.concurrency_key, self.concurrency_limit)
+        with self._concurrency_lock:
+            gate = self._concurrency_gates.get(gate_key)
+            if gate is None:
+                gate = threading.BoundedSemaphore(self.concurrency_limit)
+                self._concurrency_gates[gate_key] = gate
+        return gate
 
     def _ssl_context(self) -> ssl.SSLContext | None:
         if self.verify_tls and not self.ca_file and certifi is None:

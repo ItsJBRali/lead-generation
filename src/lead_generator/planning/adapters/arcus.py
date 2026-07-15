@@ -35,7 +35,7 @@ class ArcusPlanningScraper(PlanningScraper):
             verify_tls=False,
             min_delay_seconds=1.25,
             retries=5,
-            rate_limit_key="portal:arcus",
+            concurrency_key="portal:arcus",
         )
 
     def discover_ids(

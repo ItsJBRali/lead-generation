@@ -175,12 +175,56 @@ PLANIT_FIRST_AUTHORITIES = {
     "Surrey",
 }
 
-PORTAL_UNAVAILABLE_EMPTY_RESULT_AUTHORITIES = {
-    "Brighton",
-    "Nuneaton",
-    "Portsmouth",
-    "Surrey",
-}
+FRESH_SESSION_RETRY_TOKENS = (
+    "http 403",
+    "http 429",
+    "http 500",
+    "http 502",
+    "http 503",
+    "http 504",
+    "blocked by web application firewall",
+    "document is empty",
+    "empty response",
+    "invalid arcus search response",
+    "network error",
+    "timed out",
+    "timeout",
+)
+
+RESPONSIVE_PORTAL_ERROR_TOKENS = (
+    "http 400",
+    "http 401",
+    "http 403",
+    "http 404",
+    "http 405",
+    "http 406",
+    "http 409",
+    "http 410",
+    "http 418",
+    "http 422",
+    "http 429",
+    "blocked by web application firewall",
+    "forbidden",
+    "could not determine",
+    "could not find",
+    "document is empty",
+    "empty response",
+    "invalid arcus search response",
+    "invalid json",
+    "not valid xml",
+    "requires a detail url",
+)
+
+CONFIRMED_OUTAGE_ERROR_TOKENS = (
+    "http 500",
+    "http 502",
+    "http 503",
+    "http 504",
+    "connection refused",
+    "getaddrinfo failed",
+    "name or service not known",
+    "no such host",
+)
 
 @dataclass(frozen=True, slots=True)
 class CouncilTarget:
@@ -229,6 +273,10 @@ class DownloadedFile:
     final_url: str
     content_type: str
     filename: str | None = None
+
+
+class CouncilSearchDegradedError(RuntimeError):
+    """The council service responded, but its search could not be completed."""
 
 
 def parse_keywords(text: str) -> list[str]:
@@ -336,11 +384,18 @@ def run_lead_search(
         with lock:
             no_application_councils.append(target.authority)
 
-    def save_failure(target: CouncilTarget, reason: str, *, no_applications_returned: bool = True) -> None:
+    def save_failure(
+        target: CouncilTarget,
+        reason: str,
+        *,
+        no_applications_returned: bool = True,
+        fatal: bool = True,
+    ) -> None:
         nonlocal had_error
         with lock:
-            had_error = True
-            if no_applications_returned:
+            if fatal:
+                had_error = True
+            if fatal and no_applications_returned:
                 failed_councils.append(target.authority)
             append_csv_row(
                 failure_csv_path,
@@ -407,6 +462,14 @@ def run_lead_search(
                     else:
                         _log(log, f"{target.authority}: saved {application.reference or application.uid} (file downloads not requested)")
                 _log(log, f"{target.authority}: {matched_count} applications matched keywords and location")
+            except CouncilSearchDegradedError as exc:
+                _log(log, f"{target.authority}: portal responded but search was unavailable: {exc}")
+                save_failure(
+                    target,
+                    f"Responsive portal search issue: {exc}",
+                    no_applications_returned=False,
+                    fatal=False,
+                )
             except Exception as exc:  # pragma: no cover - live-site resilience
                 _log(log, f"{target.authority}: failed: {exc}")
                 save_failure(target, str(exc), no_applications_returned=not applications)
@@ -557,28 +620,25 @@ def discover_portal_applications(target: CouncilTarget, start_date: date, end_da
         if planit_applications:
             return planit_applications
 
-    scraper = planning_scraper_for_target(target)
-    listing_url = target.listing_url or None
-    if not listing_url and not isinstance(scraper, IdoxPublicAccessScraper):
-        raise ValueError("Council has no portal search URL")
-
     try:
-        discovery = scraper.discover_ids(listing_url=listing_url, start_date=start_date, end_date=end_date)
+        discovery, scraper = _discover_portal_listing(target, start_date, end_date)
     except Exception as exc:
         planit_applications = discover_planit_fallback_applications(target, start_date, end_date, portal_error=exc)
         if planit_applications:
             return planit_applications
-        if _should_treat_unavailable_portal_as_empty(target, exc):
-            return []
+        if _portal_error_proves_service_responded(exc):
+            raise CouncilSearchDegradedError(str(exc)) from exc
         raise
     applications: list[PlanningApplication] = []
     seen: set[str] = set()
+    detail_fetch_failed = False
     for stub in discovery.applications:
         application = stub
         if not (stub.raw or {}).get("detail_complete"):
             try:
                 application = scraper.fetch_application(stub.uid, stub.url, include_documents=False)
             except Exception as exc:
+                detail_fetch_failed = True
                 stub.raw = {**(stub.raw or {}), "detail_fetch_error": str(exc)}
         application = with_portal_metadata(application, stub, target, discovery.source_url)
         key = application.reference or application.uid or application.url
@@ -591,18 +651,86 @@ def discover_portal_applications(target: CouncilTarget, start_date: date, end_da
             if received is not None and (received < start_date or received > end_date):
                 continue
         applications.append(application)
-    if not applications:
+    if not applications or detail_fetch_failed:
         planit_applications = discover_planit_fallback_applications(target, start_date, end_date)
         if planit_applications:
-            return planit_applications
+            return _merge_portal_and_planit_applications(applications, planit_applications)
     return applications
 
 
-def _should_treat_unavailable_portal_as_empty(target: CouncilTarget, exc: Exception) -> bool:
-    if target.authority not in PORTAL_UNAVAILABLE_EMPTY_RESULT_AUTHORITIES:
-        return False
-    text = f"{type(exc).__name__}: {exc}".casefold()
-    return any(token in text for token in ("http 403", "forbidden", "web application firewall", "timed out", "timeout"))
+def _merge_portal_and_planit_applications(
+    portal_applications: list[PlanningApplication],
+    planit_applications: list[PlanningApplication],
+) -> list[PlanningApplication]:
+    by_reference = {
+        (application.reference or application.uid).strip(): application
+        for application in portal_applications
+        if application.reference or application.uid
+    }
+    merged = list(portal_applications)
+    for fallback in planit_applications:
+        reference = (fallback.reference or fallback.uid).strip()
+        existing = by_reference.get(reference)
+        if existing is None:
+            by_reference[reference] = fallback
+            merged.append(fallback)
+            continue
+        for field in (
+            "address",
+            "description",
+            "status",
+            "decision",
+            "date_received",
+            "date_validated",
+            "postcode",
+        ):
+            if not getattr(existing, field) and getattr(fallback, field):
+                setattr(existing, field, getattr(fallback, field))
+        existing.raw = {
+            **(fallback.raw or {}),
+            **(existing.raw or {}),
+            "planit_supplemented": True,
+        }
+    return merged
+
+
+def _discover_portal_listing(target: CouncilTarget, start_date: date, end_date: date):
+    last_error: Exception | None = None
+    for attempt in range(2):
+        scraper = planning_scraper_for_target(target)
+        listing_url = target.listing_url or None
+        if not listing_url and not isinstance(scraper, IdoxPublicAccessScraper):
+            raise ValueError("Council has no portal search URL")
+        try:
+            discovery = scraper.discover_ids(listing_url=listing_url, start_date=start_date, end_date=end_date)
+            return discovery, scraper
+        except Exception as exc:
+            last_error = exc
+            if attempt == 0 and _should_retry_portal_with_fresh_session(exc):
+                continue
+            raise
+    raise last_error or RuntimeError(f"Could not search {target.authority}")
+
+
+def _should_retry_portal_with_fresh_session(exc: Exception) -> bool:
+    text = _portal_error_text(exc)
+    return any(token in text for token in FRESH_SESSION_RETRY_TOKENS)
+
+
+def _portal_error_proves_service_responded(exc: Exception) -> bool:
+    text = _portal_error_text(exc)
+    if any(token in text for token in RESPONSIVE_PORTAL_ERROR_TOKENS):
+        return True
+    return not any(token in text for token in CONFIRMED_OUTAGE_ERROR_TOKENS)
+
+
+def _portal_error_text(exc: Exception) -> str:
+    parts = [f"{type(exc).__name__}: {exc}"]
+    cause = exc.__cause__
+    while cause is not None:
+        parts.append(f"{type(cause).__name__}: {cause}")
+        cause = cause.__cause__
+    return " | ".join(parts).casefold()
 
 
 def discover_planit_fallback_applications(

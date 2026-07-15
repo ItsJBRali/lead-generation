@@ -46,7 +46,7 @@ class IdoxPublicAccessScraper(PlanningScraper):
             timeout_seconds=30.0,
             min_delay_seconds=2.0,
             retries=6,
-            rate_limit_key="portal:idox",
+            concurrency_key="portal:idox",
         )
 
     def discover_ids(self, *, listing_url: str | None = None, start_date: date | None = None, end_date: date | None = None, limit: int | None = None) -> DiscoveryResult:

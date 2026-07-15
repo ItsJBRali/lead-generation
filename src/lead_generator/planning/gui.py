@@ -12,6 +12,12 @@ import customtkinter as ctk
 from lead_generator.planning.leads import DEFAULT_KEYWORDS, DEFAULT_SEARCH_WORKER_COUNT, MAX_SEARCH_WORKER_COUNT, LeadSearchConfig, parse_keywords, run_lead_search
 
 
+def previous_week_date_range(reference_date: date | None = None) -> tuple[date, date]:
+    today = reference_date or date.today()
+    current_monday = today - timedelta(days=today.weekday())
+    return current_monday - timedelta(days=7), current_monday - timedelta(days=1)
+
+
 class DateSelector(ctk.CTkFrame):
     def __init__(self, master, label: str, initial: date) -> None:
         super().__init__(master, fg_color="transparent")
@@ -111,8 +117,7 @@ class LeadGeneratorApp(ctk.CTk):
         controls = ctk.CTkFrame(shell, corner_radius=20, fg_color="#172033")
         controls.grid(row=2, column=0, padx=26, pady=12, sticky="ew")
         controls.grid_columnconfigure((0, 1), weight=1)
-        default_end = date.today()
-        default_start = default_end - timedelta(days=30)
+        default_start, default_end = previous_week_date_range()
         self.start_selector = DateSelector(controls, "Start date", default_start)
         self.end_selector = DateSelector(controls, "End date", default_end)
         self.start_selector.grid(row=0, column=0, padx=16, pady=16, sticky="ew")

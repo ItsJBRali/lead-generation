@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ssl
+import threading
 from urllib.error import URLError
 
 import pytest
@@ -128,3 +129,58 @@ def test_http_client_retries_empty_responses_before_returning_content() -> None:
 
     assert response.text == "<html>ready</html>"
     assert client.fake_opener.calls == 2
+
+
+def test_http_client_limits_concurrent_requests_for_same_platform() -> None:
+    first_started = threading.Event()
+    release_first = threading.Event()
+    second_opened = threading.Event()
+
+    class BlockingResponse(FakeResponse):
+        def __init__(self, first: bool) -> None:
+            super().__init__()
+            self.first = first
+
+        def read(self) -> bytes:
+            if self.first:
+                first_started.set()
+                assert release_first.wait(timeout=2)
+            else:
+                second_opened.set()
+            return self.body
+
+    class FakeOpener:
+        def __init__(self, first: bool) -> None:
+            self.first = first
+
+        def open(self, request, timeout):
+            return BlockingResponse(self.first)
+
+    class FakeClient(CouncilHttpClient):
+        def __init__(self, first: bool) -> None:
+            super().__init__(
+                min_delay_seconds=0,
+                concurrency_key="portal:test-concurrency",
+                concurrency_limit=1,
+            )
+            self.fake_opener = FakeOpener(first)
+
+        def _opener(self):
+            return self.fake_opener
+
+    first_client = FakeClient(True)
+    second_client = FakeClient(False)
+    first_thread = threading.Thread(target=first_client.get, args=("https://one.example.gov.uk/search",))
+    second_thread = threading.Thread(target=second_client.get, args=("https://two.example.gov.uk/search",))
+
+    first_thread.start()
+    assert first_started.wait(timeout=1)
+    second_thread.start()
+    assert not second_opened.wait(timeout=0.1)
+    release_first.set()
+    first_thread.join(timeout=2)
+    second_thread.join(timeout=2)
+
+    assert second_opened.is_set()
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()

@@ -96,11 +96,11 @@ class GenericLabelledPlanningScraper(PlanningScraper):
         super().__init__(config.authority)
         self.config = config
         platform = config.family.casefold().strip()
-        rate_limit_key = f"portal:{platform}" if platform and platform not in {"unknown", "generic", "custom"} else None
+        concurrency_key = f"portal:{platform}" if platform and platform not in {"unknown", "generic", "custom"} else None
         self.http = http_client or CouncilHttpClient(
             min_delay_seconds=1.25,
             retries=5,
-            rate_limit_key=rate_limit_key,
+            concurrency_key=concurrency_key,
         )
 
     def discover_ids(
