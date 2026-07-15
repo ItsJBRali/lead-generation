@@ -32,6 +32,7 @@ from lead_generator.planning.leads import (
     download_pdf_documents,
     enrich_planit_application,
     fetch_arcus_public_register_file_list,
+    fetch_arcus_files_public_document_list,
     fetch_arcus_salesforce_document_list,
     fetch_publisher_document_list,
     iter_document_links,
@@ -1805,6 +1806,67 @@ class LeadSearchTest(unittest.TestCase):
             "https://www.be.milton-keynes.gov.uk/pr/sfc/servlet.shepherd/version/download/068MK",
         )
         self.assertEqual(documents[0].document_type, "APPPLAN - Plans")
+
+    def test_fetch_arcus_files_public_document_list_reads_wiltshire_rows(self) -> None:
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return json.dumps(
+                    {
+                        "actions": [
+                            {
+                                "state": "SUCCESS",
+                                "returnValue": [
+                                    {
+                                        "Id": "068WILTS",
+                                        "ContentDocumentId": "069WILTS",
+                                        "Title": "Proposed site plan",
+                                        "arcshared__Category__c": "Plans",
+                                        "arcshared__Document_Date__c": "2026-07-10",
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                ).encode()
+
+        class FakeOpener:
+            def open(self, request, timeout):
+                self.request_url = request.full_url
+                self.request_data = request.data.decode()
+                return FakeResponse()
+
+        boot = {
+            "mode": "PROD",
+            "app": "siteforce:napiliApp",
+            "fwuid": "FWUID",
+            "loaded": {"APPLICATION@markup://siteforce:napiliApp": "APPHASH"},
+            "pathPrefix": "/pr",
+        }
+        page_html = f'<script src="/pr/s/sfsites/l/{quote(json.dumps(boot, separators=(",", ":")), safe="")}/bootstrap.js"></script>'
+        opener = FakeOpener()
+
+        documents = fetch_arcus_files_public_document_list(
+            page_html,
+            "https://development.wiltshire.gov.uk/pr/s/planning-application/a0iWILTS/pl202600001",
+            opener,
+        )
+
+        self.assertEqual(len(documents), 1)
+        self.assertIn("arcshared.FilesPublicCont.getFiles=1", opener.request_url)
+        self.assertIn("FilesPublicCont", opener.request_data)
+        self.assertIn("a0iWILTS", opener.request_data)
+        self.assertEqual(documents[0].title, "Proposed site plan")
+        self.assertEqual(
+            documents[0].url,
+            "https://development.wiltshire.gov.uk/pr/sfc/servlet.shepherd/version/download/068WILTS",
+        )
+        self.assertEqual(documents[0].document_type, "Plans")
 
     def test_document_download_follows_html_intermediate_page(self) -> None:
         class FakeResponse:

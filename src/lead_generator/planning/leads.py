@@ -52,6 +52,8 @@ from lead_generator.planning.adapters import (
     StatMapPlanningScraper,
     TascomiPlanningScraper,
     WebFormsPlanningScraper,
+    WiltshireCouncilConfig,
+    WiltshirePlanningScraper,
 )
 from lead_generator.planning.adapters.civica import fetch_civica_documents_from_raw
 from lead_generator.planning.adapters.generic import GenericCouncilConfig, GenericLabelledPlanningScraper
@@ -425,7 +427,7 @@ def run_lead_search(
                 add_total_applications(len(applications))
                 if not applications:
                     add_no_application_council(target)
-                _log(log, f"{target.authority}: found {len(applications)} received applications in the date range")
+                _log(log, f"{target.authority}: found {len(applications)} applications in the date range")
                 matched_count = 0
                 for application in applications:
                     if cancellation_requested():
@@ -778,6 +780,8 @@ def planning_scraper_for_target(target: CouncilTarget) -> PlanningScraper:
     portal_key = f"{scraper_type} {family}"
     authority_key = target.authority.casefold()
 
+    if authority_key == "wiltshire":
+        return WiltshirePlanningScraper(WiltshireCouncilConfig(authority=target.authority, base_url=base_url))
     if "arcus" in portal_key:
         return ArcusPlanningScraper(ArcusCouncilConfig(authority=target.authority, base_url=base_url))
     if "achieveforms" in portal_key or "achieve forms" in portal_key:
@@ -801,7 +805,7 @@ def planning_scraper_for_target(target: CouncilTarget) -> PlanningScraper:
         return SocrataPlanningScraper(LegacyFormsCouncilConfig(authority=target.authority, base_url=base_url))
     if "statmap" in portal_key or "horizonext" in listing_key or "horizonext" in listing_key:
         return StatMapPlanningScraper(LegacyFormsCouncilConfig(authority=target.authority, base_url=base_url))
-    if authority_key in {"eastleigh", "wiltshire"}:
+    if authority_key == "eastleigh":
         return ArcusPlanningScraper(ArcusCouncilConfig(authority=target.authority, base_url=base_url))
     if authority_key == "peak district":
         return EnterpriseStorePlanningScraper(
@@ -1070,6 +1074,11 @@ def fetch_planit_documents(docs_url: str) -> list[PlanningDocument]:
         seen.add(arcus_document.url)
         documents.append(arcus_document)
     for arcus_document in fetch_arcus_public_register_file_list(text, page_url, opener):
+        if arcus_document.url in seen:
+            continue
+        seen.add(arcus_document.url)
+        documents.append(arcus_document)
+    for arcus_document in fetch_arcus_files_public_document_list(text, page_url, opener):
         if arcus_document.url in seen:
             continue
         seen.add(arcus_document.url)
@@ -1354,6 +1363,7 @@ def source_document_candidates(document: PlanningDocument, opener) -> list[str]:
     candidates.extend(fetch_publisher_document_list(text, page_url, opener))
     candidates.extend(fetch_arcus_salesforce_document_list(text, page_url, opener))
     candidates.extend(fetch_arcus_public_register_file_list(text, page_url, opener))
+    candidates.extend(fetch_arcus_files_public_document_list(text, page_url, opener))
     wanted = _comparable_title(document.title)
     matching = [
         candidate.url
@@ -1681,7 +1691,7 @@ def _salesforce_content_version_documents(records: list[dict[str, object]], page
         version_id = str(record.get("Id") or "")
         if not version_id:
             continue
-        extension = clean_text(str(record.get("FileExtension") or "")).lower()
+        extension = (clean_text(str(record.get("FileExtension") or "")) or "").lower()
         title = clean_text(str(record.get("Title") or "Document"))
         if extension and not title.casefold().endswith(f".{extension}"):
             title = f"{title}.{extension}"
@@ -1698,8 +1708,77 @@ def _salesforce_content_version_documents(records: list[dict[str, object]], page
     return documents
 
 
+def fetch_arcus_files_public_document_list(text: str, page_url: str, opener) -> list[PlanningDocument]:
+    record_id = _salesforce_arcus_record_id(page_url)
+    context = _salesforce_aura_context(text)
+    if not record_id or not context:
+        return []
+    parts = urlsplit(page_url)
+    path_prefix = str(context.get("pathPrefix") or _salesforce_path_prefix(parts.path)).rstrip("/")
+    endpoint = urlunsplit(
+        (
+            parts.scheme,
+            parts.netloc,
+            f"{path_prefix}/s/sfsites/aura",
+            urlencode({"r": "26", "arcshared.FilesPublicCont.getFiles": "1"}),
+            "",
+        )
+    )
+    message = {
+        "actions": [
+            {
+                "id": "1;a",
+                "descriptor": "apex://arcshared.FilesPublicCont/ACTION$getFiles",
+                "callingDescriptor": "markup://arcshared:FilesPublic",
+                "params": {"recordId": record_id, "config": "BE PR File Columns"},
+                "version": None,
+            }
+        ]
+    }
+    payload = urlencode(
+        {
+            "message": json.dumps(message, separators=(",", ":")),
+            "aura.context": json.dumps(context, separators=(",", ":")),
+            "aura.pageURI": parts.path,
+            "aura.token": "null",
+        }
+    ).encode("utf-8")
+    request = Request(
+        endpoint,
+        data=payload,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Referer": page_url,
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "X-Requested-With": "XMLHttpRequest",
+        },
+        method="POST",
+    )
+    try:
+        with _open_url_with_retry(request, timeout=45, opener=opener) as response:
+            response_text = response.read().decode("utf-8", errors="replace")
+    except Exception:
+        return []
+    try:
+        payload_data = json.loads(response_text)
+    except json.JSONDecodeError:
+        return []
+    records: list[dict[str, object]] = []
+    for action in payload_data.get("actions", []):
+        if not isinstance(action, dict):
+            continue
+        return_value = action.get("returnValue")
+        if isinstance(return_value, list):
+            records.extend(item for item in return_value if isinstance(item, dict))
+    return _salesforce_content_version_documents(records, page_url)
+
+
 def _salesforce_arcus_record_id(page_url: str) -> str | None:
-    match = re.search(r"/s/(?:papplication|detail)/([^/?#]+)", urlsplit(page_url).path, flags=re.IGNORECASE)
+    match = re.search(
+        r"/s/(?:papplication|planning-application|detail)/([^/?#]+)",
+        urlsplit(page_url).path,
+        flags=re.IGNORECASE,
+    )
     return unquote(match.group(1)) if match else None
 
 

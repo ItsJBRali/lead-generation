@@ -24,6 +24,7 @@ from .legacy_forms import (
 )
 from .northgate import NorthgateCouncilConfig, NorthgatePlanningScraper
 from .ocella import OcellaCouncilConfig, OcellaPlanningScraper
+from .wiltshire import WiltshireCouncilConfig, WiltshirePlanningScraper
 
 __all__ = [
     "PlanningScraper",
@@ -56,4 +57,6 @@ __all__ = [
     "NorthgatePlanningScraper",
     "OcellaCouncilConfig",
     "OcellaPlanningScraper",
+    "WiltshireCouncilConfig",
+    "WiltshirePlanningScraper",
 ]
