@@ -59,6 +59,11 @@ from lead_generator.planning.adapters.civica import fetch_civica_documents_from_
 from lead_generator.planning.adapters.generic import GenericCouncilConfig, GenericLabelledPlanningScraper
 from lead_generator.planning.models import PlanningApplication, PlanningDocument
 from lead_generator.planning.parsing import clean_text
+from lead_generator.planning.scheduler import (
+    PlatformAwareScheduler,
+    ScheduledTask,
+    SchedulerAdjustment,
+)
 
 
 DEFAULT_KEYWORDS = [
@@ -136,6 +141,22 @@ USER_AGENT = (
 PLANIT_PAGE_SIZE = 100
 DEFAULT_SEARCH_WORKER_COUNT = 4
 MAX_SEARCH_WORKER_COUNT = 8
+DEFAULT_PLATFORM_CONCURRENCY_LIMIT = 2
+PLATFORM_CONCURRENCY_LIMITS = {
+    "planit": 1,
+    "salesforce": 1,
+    "arcus": 2,
+    "idox": 3,
+    "custom": 3,
+}
+SEARCH_HOST_CONCURRENCY_LIMIT = 1
+PLATFORM_RATE_LIMIT_COOLDOWN_SECONDS = 15.0
+PLATFORM_BLOCKED_COOLDOWN_SECONDS = 8.0
+PLATFORM_SERVICE_COOLDOWN_SECONDS = 8.0
+PLATFORM_RECOVERY_SUCCESS_COUNT = 4
+SEARCH_WORKER_STAGGER_BASE_SECONDS = 0.5
+SEARCH_WORKER_STAGGER_INCREMENT_SECONDS = 0.15
+SEARCH_WORKER_STAGGER_MAX_SECONDS = 1.5
 DOCUMENT_DOWNLOAD_DELAY_SECONDS = 0.0
 RATE_LIMIT_HTTP_CODES = {429, 503}
 MAX_RETRY_AFTER_SECONDS = 20.0
@@ -158,6 +179,7 @@ HISTORY_CSV_FIELDS = [
 ]
 _REQUEST_THROTTLE_LOCK = threading.Lock()
 _LAST_REQUEST_AT: dict[str, float] = {}
+_PLANIT_CONCURRENCY_GATE = threading.BoundedSemaphore(1)
 
 PLANIT_AUTHORITY_ALIASES = {
     "Aylesbury Vale": ("Buckinghamshire",),
@@ -237,6 +259,86 @@ class CouncilTarget:
     listing_url: str | None
     geometry: dict[str, object]
     link_test_ok: bool = False
+
+
+def council_platform_key(target: CouncilTarget) -> str:
+    if target.authority in PLANIT_AUTHORITY_ALIASES or target.authority in PLANIT_FIRST_AUTHORITIES:
+        return "planit"
+    authority = target.authority.casefold()
+    portal = f"{target.scraper_type} {target.portal_family}".casefold()
+    if authority in {"eastleigh", "wiltshire"}:
+        return "salesforce"
+    platform_markers = (
+        ("idox", "idox"),
+        ("arcus", "arcus"),
+        ("achieveforms", "achieveforms"),
+        ("achieve forms", "achieveforms"),
+        ("atrium", "atrium"),
+        ("tascomi", "tascomi"),
+        ("enterprisestore", "enterprise-store"),
+        ("enterprise store", "enterprise-store"),
+        ("appsearchserv", "app-search-serv"),
+        ("fastweb", "fastweb"),
+        ("cced", "cced"),
+        ("astun", "astun"),
+        ("socrata", "socrata"),
+        ("statmap", "statmap"),
+        ("ocella", "ocella"),
+        ("agile", "agile"),
+        ("civica", "civica"),
+        ("northgate", "northgate"),
+        ("planningexplorer", "northgate"),
+    )
+    for marker, platform in platform_markers:
+        if marker in portal:
+            return platform
+    return "custom"
+
+
+def council_host_key(target: CouncilTarget, platform: str | None = None) -> str:
+    platform = platform or council_platform_key(target)
+    if platform == "planit":
+        return "www.planit.org.uk"
+    source_url = target.listing_url or target.base_url
+    host = urlsplit(source_url).netloc.casefold()
+    return host or target.authority.casefold()
+
+
+def scheduled_council_task(target: CouncilTarget) -> ScheduledTask[CouncilTarget]:
+    platform = council_platform_key(target)
+    return ScheduledTask(
+        item=target,
+        platform=platform,
+        host=council_host_key(target, platform),
+    )
+
+
+def search_failure_signal(exc: Exception) -> str:
+    text = _portal_error_text(exc)
+    if any(token in text for token in ("http 429", "too many requests", "rate limit")):
+        return "rate_limited"
+    if any(token in text for token in ("http 403", "forbidden", "web application firewall")):
+        return "blocked"
+    if "http 503" in text:
+        return "service_unavailable"
+    return "failed"
+
+
+def search_failure_platform(task: ScheduledTask[CouncilTarget], exc: Exception) -> str:
+    text = _portal_error_text(exc)
+    if "planit.org.uk" in text:
+        return "planit"
+    return task.platform
+
+
+def search_worker_start_delay(worker_index: int) -> float:
+    if worker_index <= 0:
+        return 0.0
+    return min(
+        SEARCH_WORKER_STAGGER_BASE_SECONDS
+        + ((worker_index - 1) * SEARCH_WORKER_STAGGER_INCREMENT_SECONDS),
+        SEARCH_WORKER_STAGGER_MAX_SECONDS,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -334,18 +436,27 @@ def run_lead_search(
         raise ValueError("No planning authorities overlap the supplied GeoJSON boundary.")
     _progress(progress, completed, len(targets))
 
-    pending_targets = deque(targets)
     lock = threading.Lock()
+    completed_authorities: set[str] = set()
+    counted_authorities: set[str] = set()
+    captured_document_references: set[str] = set()
+    deferred_tasks: list[ScheduledTask[CouncilTarget]] = []
+    scheduler = PlatformAwareScheduler[CouncilTarget](
+        platform_limits=PLATFORM_CONCURRENCY_LIMITS,
+        default_platform_limit=DEFAULT_PLATFORM_CONCURRENCY_LIMIT,
+        host_limit=SEARCH_HOST_CONCURRENCY_LIMIT,
+        rate_limit_cooldown_seconds=PLATFORM_RATE_LIMIT_COOLDOWN_SECONDS,
+        blocked_cooldown_seconds=PLATFORM_BLOCKED_COOLDOWN_SECONDS,
+        service_cooldown_seconds=PLATFORM_SERVICE_COOLDOWN_SECONDS,
+        recovery_successes=PLATFORM_RECOVERY_SUCCESS_COUNT,
+    )
 
-    def next_target(reverse: bool) -> CouncilTarget | None:
-        with lock:
-            if not pending_targets:
-                return None
-            return pending_targets.pop() if reverse else pending_targets.popleft()
-
-    def mark_complete() -> None:
+    def mark_complete(target: CouncilTarget) -> None:
         nonlocal completed
         with lock:
+            if target.authority in completed_authorities:
+                return
+            completed_authorities.add(target.authority)
             completed += 1
             current = completed
         _progress(progress, current, len(targets))
@@ -372,19 +483,26 @@ def run_lead_search(
             current = len(rows)
         _captured(captured, current)
 
-    def add_total_applications(count: int) -> None:
+    def add_total_applications(target: CouncilTarget, count: int) -> None:
         nonlocal total_applications
         with lock:
+            if target.authority in counted_authorities:
+                return
+            counted_authorities.add(target.authority)
             total_applications += count
 
-    def add_captured_document_application() -> None:
+    def add_captured_document_application(reference: str) -> None:
         nonlocal captured_documents
         with lock:
+            if reference in captured_document_references:
+                return
+            captured_document_references.add(reference)
             captured_documents += 1
 
     def add_no_application_council(target: CouncilTarget) -> None:
         with lock:
-            no_application_councils.append(target.authority)
+            if target.authority not in no_application_councils:
+                no_application_councils.append(target.authority)
 
     def save_failure(
         target: CouncilTarget,
@@ -397,7 +515,7 @@ def run_lead_search(
         with lock:
             if fatal:
                 had_error = True
-            if fatal and no_applications_returned:
+            if fatal and no_applications_returned and target.authority not in failed_councils:
                 failed_councils.append(target.authority)
             append_csv_row(
                 failure_csv_path,
@@ -411,20 +529,50 @@ def run_lead_search(
                 },
             )
 
-    def search_worker(name: str, *, reverse: bool = False) -> None:
-        while True:
-            if cancellation_requested():
-                _log(log, f"{name}: cancelled.")
-                return
-            target = next_target(reverse)
-            if target is None:
-                return
+    def log_scheduler_adjustment(adjustment: SchedulerAdjustment | None) -> None:
+        if adjustment is None:
+            return
+        if adjustment.cooldown_seconds:
+            _log(
+                log,
+                f"Scheduler: paused new {adjustment.platform} searches for "
+                f"{adjustment.cooldown_seconds:.0f}s after {adjustment.reason}; "
+                f"concurrency is now {adjustment.limit}",
+            )
+        else:
+            _log(
+                log,
+                f"Scheduler: {adjustment.platform} concurrency increased to "
+                f"{adjustment.limit} after successful searches",
+            )
 
-            _log(log, f"{name}: searching {target.authority} ({target.portal_family})")
+    def search_worker(
+        name: str,
+        *,
+        final_attempt: bool,
+        initial_delay: float,
+    ) -> None:
+        if initial_delay:
+            sleep(initial_delay)
+        while True:
+            task = scheduler.acquire(should_stop=cancellation_requested)
+            if task is None:
+                if cancelled:
+                    _log(log, f"{name}: cancelled.")
+                return
+            target = task.item
+
+            attempt_label = "final retry for" if final_attempt else "searching"
+            _log(
+                log,
+                f"{name}: {attempt_label} {target.authority} "
+                f"({task.platform}, {task.host})",
+            )
             applications: list[PlanningApplication] = []
+            attempt_error: Exception | None = None
             try:
                 applications = discover_portal_applications(target, config.start_date, config.end_date)
-                add_total_applications(len(applications))
+                add_total_applications(target, len(applications))
                 if not applications:
                     add_no_application_council(target)
                 _log(log, f"{target.authority}: found {len(applications)} applications in the date range")
@@ -443,12 +591,12 @@ def run_lead_search(
                     matched_count += 1
                     if config.download_application_files:
                         application = enrich_application_documents(application)
-                        if application.documents:
-                            add_captured_document_application()
                         lead_folder = create_lead_folder(output_dir, target.authority, application)
                         downloaded_count = download_pdf_documents(application.documents, lead_folder, log=log)
                     else:
                         downloaded_count = 0
+                    if config.download_application_files and application.documents:
+                        add_captured_document_application(reference)
                     save_row(
                         {
                             "Reference": reference,
@@ -464,35 +612,94 @@ def run_lead_search(
                     else:
                         _log(log, f"{target.authority}: saved {application.reference or application.uid} (file downloads not requested)")
                 _log(log, f"{target.authority}: {matched_count} applications matched keywords and location")
-            except CouncilSearchDegradedError as exc:
-                _log(log, f"{target.authority}: portal responded but search was unavailable: {exc}")
+            except Exception as exc:  # pragma: no cover - live-site resilience
+                attempt_error = exc
+
+            signal = search_failure_signal(attempt_error) if attempt_error else "success"
+            affected_platform = (
+                search_failure_platform(task, attempt_error)
+                if attempt_error
+                else task.platform
+            )
+            adjustment = scheduler.release(
+                task,
+                signal=signal,
+                affected_platform=affected_platform,
+            )
+            log_scheduler_adjustment(adjustment)
+
+            if attempt_error is None:
+                if final_attempt:
+                    _log(log, f"{target.authority}: final retry succeeded")
+                mark_complete(target)
+                continue
+
+            if not final_attempt:
+                with lock:
+                    deferred_tasks.append(task)
+                _log(
+                    log,
+                    f"{target.authority}: deferred until the final retry pass: {attempt_error}",
+                )
+                continue
+
+            if isinstance(attempt_error, CouncilSearchDegradedError):
+                _log(
+                    log,
+                    f"{target.authority}: portal responded but the final retry was unavailable: "
+                    f"{attempt_error}",
+                )
                 save_failure(
                     target,
-                    f"Responsive portal search issue: {exc}",
+                    f"Responsive portal search issue after final retry: {attempt_error}",
                     no_applications_returned=False,
                     fatal=False,
                 )
-            except Exception as exc:  # pragma: no cover - live-site resilience
-                _log(log, f"{target.authority}: failed: {exc}")
-                save_failure(target, str(exc), no_applications_returned=not applications)
-            finally:
-                mark_complete()
+            else:
+                _log(log, f"{target.authority}: final retry failed: {attempt_error}")
+                save_failure(
+                    target,
+                    str(attempt_error),
+                    no_applications_returned=not applications,
+                )
+            mark_complete(target)
 
     configured_worker_count = min(max(config.worker_count, 1), MAX_SEARCH_WORKER_COUNT)
-    worker_count = min(configured_worker_count, len(targets))
-    workers = [
-        threading.Thread(
-            target=search_worker,
-            args=(f"Search worker {index + 1}",),
-            kwargs={"reverse": bool(index % 2)},
-            daemon=True,
+
+    def run_search_phase(
+        phase_tasks: list[ScheduledTask[CouncilTarget]],
+        *,
+        final_attempt: bool,
+    ) -> None:
+        scheduler.load_phase(phase_tasks)
+        worker_count = min(configured_worker_count, len(phase_tasks))
+        workers = [
+            threading.Thread(
+                target=search_worker,
+                args=(f"Search worker {index + 1}",),
+                kwargs={
+                    "final_attempt": final_attempt,
+                    "initial_delay": search_worker_start_delay(index),
+                },
+                daemon=True,
+            )
+            for index in range(worker_count)
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+
+    run_search_phase(
+        [scheduled_council_task(target) for target in targets],
+        final_attempt=False,
+    )
+    if deferred_tasks and not cancelled:
+        _log(
+            log,
+            f"Starting final retry pass for {len(deferred_tasks)} deferred councils after all other searches finished",
         )
-        for index in range(worker_count)
-    ]
-    for worker in workers:
-        worker.start()
-    for worker in workers:
-        worker.join()
+        run_search_phase(list(deferred_tasks), final_attempt=True)
 
     if cancelled:
         completion = "Cancelled"
@@ -926,6 +1133,15 @@ def with_portal_metadata(
 
 
 def discover_planit_applications(authority: str, start_date: date, end_date: date) -> list[PlanningApplication]:
+    with _PLANIT_CONCURRENCY_GATE:
+        return _discover_planit_applications_serial(authority, start_date, end_date)
+
+
+def _discover_planit_applications_serial(
+    authority: str,
+    start_date: date,
+    end_date: date,
+) -> list[PlanningApplication]:
     records: list[dict[str, object]] = []
     page_size = PLANIT_PAGE_SIZE
     page = 1

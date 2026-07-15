@@ -941,8 +941,12 @@ class LeadSearchTest(unittest.TestCase):
                 catalogue_path=catalogue,
             )
 
+            broken_attempts = 0
+
             def fake_discover(target, start_date, end_date):
+                nonlocal broken_attempts
                 if target.authority == "Broken Council":
+                    broken_attempts += 1
                     raise RuntimeError("portal exploded")
                 return []
 
@@ -957,6 +961,7 @@ class LeadSearchTest(unittest.TestCase):
             self.assertEqual(failures[0]["scraper_type"], "Idox")
             self.assertEqual(failures[0]["listing_url"], "https://broken.example.gov.uk/search")
             self.assertEqual(failures[0]["reason"], "portal exploded")
+            self.assertEqual(broken_attempts, 2)
 
     def test_run_lead_search_records_degraded_portal_without_failing_run(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1004,7 +1009,7 @@ class LeadSearchTest(unittest.TestCase):
             with patch(
                 "lead_generator.planning.leads.discover_portal_applications",
                 side_effect=CouncilSearchDegradedError("HTTP 403 while fetching portal"),
-            ):
+            ), patch("lead_generator.planning.leads.PLATFORM_BLOCKED_COOLDOWN_SECONDS", 0):
                 result = run_lead_search(config)
 
             self.assertEqual(result.failed_councils, [])
@@ -1140,7 +1145,7 @@ class LeadSearchTest(unittest.TestCase):
             self.assertEqual(rows[0]["Completion"], "Failed")
             self.assertEqual(rows[0]["Captured Documents"], "1")
 
-    def test_run_lead_search_starts_four_workers_from_both_ends(self) -> None:
+    def test_run_lead_search_round_robins_platform_queues(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             user_geojson = root / "search.geojson"
@@ -1181,7 +1186,8 @@ class LeadSearchTest(unittest.TestCase):
                                 **polygon_feature("Council C", 0, 0, 1, 1),
                                 "properties": {
                                     "authority": "Council C",
-                                    "portal_family": "idox",
+                                    "portal_family": "arcus",
+                                    "scraper_type": "Arcus",
                                     "base_url": "https://c.example.gov.uk",
                                     "listing_url": "https://c.example.gov.uk/search",
                                 },
@@ -1190,7 +1196,8 @@ class LeadSearchTest(unittest.TestCase):
                                 **polygon_feature("Council D", 0, 0, 1, 1),
                                 "properties": {
                                     "authority": "Council D",
-                                    "portal_family": "idox",
+                                    "portal_family": "civica",
+                                    "scraper_type": "Civica",
                                     "base_url": "https://d.example.gov.uk",
                                     "listing_url": "https://d.example.gov.uk/search",
                                 },
@@ -1207,25 +1214,93 @@ class LeadSearchTest(unittest.TestCase):
                 end_date=date(2026, 6, 30),
                 keywords=["driveway gates"],
                 catalogue_path=catalogue,
+                worker_count=1,
             )
             started: list[str] = []
-            lock = threading.Lock()
-            all_started = threading.Event()
 
-            def fake_discover(authority, start_date, end_date):
-                target = authority
-                with lock:
-                    started.append(target.authority)
-                    if len(started) >= 4:
-                        all_started.set()
-                all_started.wait(timeout=1)
+            def fake_discover(target, start_date, end_date):
+                started.append(target.authority)
                 return []
 
             with patch("lead_generator.planning.leads.discover_portal_applications", side_effect=fake_discover):
                 result = run_lead_search(config)
 
             self.assertEqual(result.councils_completed, 4)
-            self.assertEqual(set(started[:4]), {"Council A", "Council B", "Council C", "Council D"})
+            self.assertEqual(started, ["Council A", "Council C", "Council D", "Council B"])
+
+    def test_run_lead_search_retries_rate_limited_council_after_first_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_geojson = root / "search.geojson"
+            user_geojson.write_text(
+                json.dumps(
+                    {
+                        "type": "FeatureCollection",
+                        "features": [polygon_feature("search area", 0, 0, 1, 1)],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            council_specs = [
+                ("Rate Limited", "idox"),
+                ("Idox Working", "idox"),
+                ("Arcus Working", "arcus"),
+            ]
+            catalogue = root / "catalogue.geojson"
+            catalogue.write_text(
+                json.dumps(
+                    {
+                        "type": "FeatureCollection",
+                        "features": [
+                            {
+                                **polygon_feature(authority, 0, 0, 1, 1),
+                                "properties": {
+                                    "authority": authority,
+                                    "portal_family": platform,
+                                    "scraper_type": platform.title(),
+                                    "base_url": f"https://{authority.casefold().replace(' ', '-')}.example.gov.uk",
+                                    "listing_url": f"https://{authority.casefold().replace(' ', '-')}.example.gov.uk/search",
+                                },
+                            }
+                            for authority, platform in council_specs
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = LeadSearchConfig(
+                geojson_path=user_geojson,
+                output_root=root,
+                start_date=date(2026, 6, 1),
+                end_date=date(2026, 6, 30),
+                keywords=["driveway gates"],
+                catalogue_path=catalogue,
+                worker_count=1,
+            )
+            calls: list[str] = []
+            rate_limited_attempts = 0
+
+            def fake_discover(target, start_date, end_date):
+                nonlocal rate_limited_attempts
+                calls.append(target.authority)
+                if target.authority == "Rate Limited":
+                    rate_limited_attempts += 1
+                    if rate_limited_attempts == 1:
+                        raise CouncilSearchDegradedError("HTTP 429 while fetching portal")
+                return []
+
+            with (
+                patch("lead_generator.planning.leads.PLATFORM_RATE_LIMIT_COOLDOWN_SECONDS", 0),
+                patch("lead_generator.planning.leads.discover_portal_applications", side_effect=fake_discover),
+            ):
+                result = run_lead_search(config)
+
+            self.assertEqual(calls, ["Rate Limited", "Arcus Working", "Idox Working", "Rate Limited"])
+            self.assertEqual(result.councils_completed, 3)
+            self.assertEqual(result.failed_councils, [])
+            self.assertEqual(result.completion, "Completed")
+            with result.failure_csv_path.open(newline="", encoding="utf-8") as handle:
+                self.assertEqual(list(csv.DictReader(handle)), [])
 
     def test_run_lead_search_caps_configured_worker_count_at_eight(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1241,6 +1316,7 @@ class LeadSearchTest(unittest.TestCase):
                 encoding="utf-8",
             )
             catalogue = root / "catalogue.geojson"
+            platforms = ["idox"] * 4 + ["custom"] * 3 + ["arcus"] * 3
             catalogue.write_text(
                 json.dumps(
                     {
@@ -1250,7 +1326,8 @@ class LeadSearchTest(unittest.TestCase):
                                 **polygon_feature(f"Council {index}", 0, 0, 1, 1),
                                 "properties": {
                                     "authority": f"Council {index}",
-                                    "portal_family": "idox",
+                                    "portal_family": platforms[index],
+                                    "scraper_type": platforms[index].title(),
                                     "base_url": f"https://{index}.example.gov.uk",
                                     "listing_url": f"https://{index}.example.gov.uk/search",
                                 },
@@ -1296,7 +1373,10 @@ class LeadSearchTest(unittest.TestCase):
 
             releaser = threading.Thread(target=release_after_first_batch, daemon=True)
             releaser.start()
-            with patch("lead_generator.planning.leads.discover_portal_applications", side_effect=fake_discover):
+            with (
+                patch("lead_generator.planning.leads.search_worker_start_delay", return_value=0),
+                patch("lead_generator.planning.leads.discover_portal_applications", side_effect=fake_discover),
+            ):
                 result = run_lead_search(config)
             releaser.join(timeout=1)
 
