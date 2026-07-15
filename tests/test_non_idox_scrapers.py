@@ -359,6 +359,63 @@ class FakeAtriumHttpClient:
         )
 
 
+class FakeModernAtriumHttpClient:
+    def __init__(self) -> None:
+        self.posts: list[tuple[str, dict[str, str]]] = []
+        self.gets: list[tuple[str, dict[str, str] | None]] = []
+
+    def get(
+        self,
+        url: str,
+        params: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> FetchResponse:
+        self.gets.append((url, params))
+        if "/Search/Advanced" not in url:
+            return FetchResponse(
+                url=url,
+                status_code=200,
+                text='<a href="/Search/Advanced">Advanced search</a>',
+            )
+        return FetchResponse(
+            url=url,
+            status_code=200,
+            text="""
+            <form method="post" action="/Search/Results">
+              <input name="DateValidFrom"><input name="DateValidTo">
+              <input type="checkbox" name="SearchPlanning" value="true" checked>
+              <input type="checkbox" name="SearchBuildingControl" value="true" checked>
+              <input type="checkbox" name="SearchEnforcement" value="true" checked>
+              <input type="submit" name="Search" value="Search">
+            </form>
+            """,
+        )
+
+    def post_form(
+        self,
+        url: str,
+        data: dict[str, str],
+        headers: dict[str, str] | None = None,
+    ) -> FetchResponse:
+        self.posts.append((url, data))
+        return FetchResponse(
+            url=url,
+            status_code=200,
+            text="""
+            <form method="post" action="/Search/ChangeResultsPerPage">
+              <select name="resultsPerPage"><option value="10">10</option><option value="100">100</option></select>
+            </form>
+            <div class="row results__item">
+              <a href="/Planning/Display/P/26/02488/FUL">P/26/02488/FUL</a>
+              <div class="results__address">1 High Street BH1 1AA</div>
+            </div>
+            <div class="row searchResultsCardRow">
+              <h2>CR/2026/0409/192</h2>
+              <a href="/Planning/Display/CR/2026/0409/192">2 Station Road RH10 1AA</a>
+            </div>
+            """,
+        )
+
 class FakeLegacyFormsHttpClient:
     def __init__(self, pages: dict[str, str]) -> None:
         self.pages = pages
@@ -435,7 +492,76 @@ class NonIdoxScraperTest(unittest.TestCase):
         self.assertEqual(discovery.applications[0].reference, "20260834")
         self.assertEqual(discovery.applications[0].date_validated, "2026-06-13")
         self.assertEqual(discovery.applications[1].reference, "20260844")
+        self.assertTrue(discovery.applications[1].raw["detail_complete"])
         self.assertIn("ResultsPage/2", http.gets[-1])
+
+    def test_atrium_expands_legacy_results_without_page_size_form(self) -> None:
+        class LegacyAtriumHttp:
+            def __init__(self) -> None:
+                self.posts: list[tuple[str, dict[str, str]]] = []
+
+            def post_form(self, url, data, headers=None):
+                self.posts.append((url, data))
+                rows = "".join(
+                    f'<tr><td><a href="/Planning/Display/26/{index:05d}">26/{index:05d}</a></td><td></td><td>Address {index}</td><td>Proposal {index}</td></tr>'
+                    for index in range(23)
+                )
+                return FetchResponse(
+                    url="https://planning.example.gov.uk/Search/Results/1/250",
+                    status_code=200,
+                    text=f"<table>{rows}</table>",
+                )
+
+        http = LegacyAtriumHttp()
+        scraper = AtriumPlanningScraper(
+            AtriumCouncilConfig("Example", "https://planning.example.gov.uk"),
+            http_client=http,
+        )
+        first_page = FetchResponse(
+            url="https://planning.example.gov.uk/Search/Results",
+            status_code=200,
+            text="""
+            <p>Planning (23)</p>
+            <table>
+              <tr><td><a href="/Planning/Display/26/00001">26/00001</a></td></tr>
+            </table>
+            <a href="/Search/ResultsPage/2?module=PLA">Next</a>
+            """,
+        )
+
+        expanded = scraper._expand_results_per_page(first_page)
+
+        self.assertTrue(http.posts[0][0].endswith("/Search/ChangeResultsPerPage"))
+        self.assertEqual(http.posts[0][1]["resultsPerPage"], "250")
+        self.assertEqual(len(scraper.parse_listing(expanded.text, expanded.url)), 23)
+
+    def test_atrium_discovers_advanced_search_and_keeps_slash_references(self) -> None:
+        http = FakeModernAtriumHttpClient()
+        scraper = AtriumPlanningScraper(
+            AtriumCouncilConfig("BCP", "https://planning.example.gov.uk"),
+            http_client=http,
+        )
+
+        discovery = scraper.discover_ids(
+            listing_url="https://planning.example.gov.uk/",
+            start_date=date(2026, 7, 6),
+            end_date=date(2026, 7, 12),
+        )
+
+        self.assertIn("/Search/Advanced", http.gets[1][0])
+        payload = http.posts[0][1]
+        self.assertEqual(payload["DateValidFrom"], "06/07/2026")
+        self.assertEqual(payload["SearchPlanning"], "true")
+        self.assertEqual(payload["SearchBuildingControl"], "false")
+        self.assertEqual(payload["SearchEnforcement"], "false")
+        self.assertEqual(http.posts[1][1], {"resultsPerPage": "100"})
+        self.assertEqual(
+            [application.reference for application in discovery.applications],
+            ["P/26/02488/FUL", "CR/2026/0409/192"],
+        )
+        self.assertEqual(discovery.applications[0].date_validated, "2026-07-06")
+        self.assertTrue(discovery.applications[0].raw["date_inferred_from_search_window"])
+        self.assertEqual(discovery.applications[1].address, "2 Station Road RH10 1AA")
 
     def test_tascomi_search_uses_received_dates(self) -> None:
         http = FakeLegacyFormsHttpClient(
@@ -695,6 +821,46 @@ class NonIdoxScraperTest(unittest.TestCase):
 
         self.assertEqual(http.gets[1][1]["regdate1"], "08/06/2026")
         self.assertEqual(discovery.applications[0].reference, "26/00123/FUL")
+
+    def test_query_form_uses_registration_dates_and_parses_detail_table_results(self) -> None:
+        http = FakeLegacyFormsHttpClient(
+            {
+                "get": """
+                <form method="post" action="/results">
+                  <input name="regdate1"><input name="regdate2">
+                  <input name="dcndate1"><input name="dcndate2">
+                  <input name="aplrecdate1"><input name="aplrecdate2">
+                </form>
+                """,
+                "post": """
+                <table>
+                  <tr><td>Planning Application No:</td><td>
+                    <a href="/detail/646267">CB/26/02106/LDCP (click for more details)</a>
+                  </td></tr>
+                  <tr><td>Registration Date:</td><td>10/06/2026</td></tr>
+                  <tr><td>Parish Name:</td><td>Dunstable</td></tr>
+                  <tr><td>Location:</td><td>4 Linden Close, Dunstable, LU5 4PF</td></tr>
+                </table>
+                """,
+            }
+        )
+        scraper = QueryFormPlanningScraper(
+            LegacyFormsCouncilConfig("Central Bedfordshire", "https://planning.example.gov.uk"),
+            http_client=http,
+        )
+
+        discovery = scraper.discover_ids(
+            listing_url="https://planning.example.gov.uk/search",
+            start_date=date(2026, 6, 8),
+            end_date=date(2026, 6, 14),
+        )
+
+        payload = http.posts[0][1]
+        self.assertEqual(payload["regdate1"], "08/06/2026")
+        self.assertEqual(payload["regdate2"], "14/06/2026")
+        self.assertEqual(payload["dcndate1"], "")
+        self.assertEqual(payload["aplrecdate1"], "")
+        self.assertEqual([app.reference for app in discovery.applications], ["CB/26/02106/LDCP"])
 
     def test_civica_listing_and_detail(self) -> None:
         scraper = CivicaPlanningScraper(

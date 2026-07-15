@@ -100,5 +100,5 @@ $env:PYTHONPATH = "$PWD\src"
 To rebuild the executable:
 
 ```powershell
-& "C:\Users\JBRal\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe" -m PyInstaller --noconfirm --clean PlanningLeadGenerator.spec
+& ".\.venv\Scripts\python.exe" -m PyInstaller --noconfirm --clean PlanningLeadGenerator.spec
 ```

@@ -32,6 +32,7 @@ from lead_generator.planning.adapters import (
     AstunPlanningScraper,
     AtriumCouncilConfig,
     AtriumPlanningScraper,
+    authority_specific_scraper,
     CcedPlanningScraper,
     CivicaCouncilConfig,
     CivicaPlanningScraper,
@@ -185,7 +186,6 @@ PLANIT_AUTHORITY_ALIASES = {
     "Aylesbury Vale": ("Buckinghamshire",),
     "Brighton and Hove": ("Brighton",),
     "Chiltern South Bucks": ("Buckinghamshire",),
-    "Taunton Deane": ("Somerset",),
     "West Somerset": ("Somerset",),
     "Windsor and Maidenhead": ("Windsor",),
     "Wycombe": ("Buckinghamshire",),
@@ -194,8 +194,6 @@ PLANIT_AUTHORITY_ALIASES = {
 PLANIT_FIRST_AUTHORITIES = {
     "Birmingham",
     "South Cambridgeshire",
-    "South Oxfordshire",
-    "Stratford on Avon",
     "Surrey",
 }
 
@@ -989,6 +987,8 @@ def planning_scraper_for_target(target: CouncilTarget) -> PlanningScraper:
 
     if authority_key == "wiltshire":
         return WiltshirePlanningScraper(WiltshireCouncilConfig(authority=target.authority, base_url=base_url))
+    if authority_scraper := authority_specific_scraper(target.authority, base_url):
+        return authority_scraper
     if "arcus" in portal_key:
         return ArcusPlanningScraper(ArcusCouncilConfig(authority=target.authority, base_url=base_url))
     if "achieveforms" in portal_key or "achieve forms" in portal_key:

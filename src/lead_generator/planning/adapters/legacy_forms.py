@@ -50,6 +50,7 @@ LABEL_MAP = {
     "receiveddate": "date_received",
     "registered": "date_received",
     "registered_date": "date_received",
+    "registration_date": "date_received",
     "valid_from_date": "date_validated",
     "valid_from": "date_validated",
     "validfrom": "date_validated",
@@ -734,7 +735,10 @@ class HtmlListPlanningScraper(NativeListingScraper):
             reference = extract_reference(f"{text} {href}")
             if not reference:
                 continue
-            if not any(token in href.casefold() for token in ("planning", "application", "/application/", "eplanning")):
+            if not any(
+                token in href.casefold()
+                for token in ("planning", "application", "/application/", "eplanning", "detail")
+            ):
                 continue
             key = reference.casefold()
             if key in seen:
@@ -798,14 +802,26 @@ class QueryFormPlanningScraper(NativeListingScraper):
         return forms[-1] if forms else first(document.xpath("//form"))
 
     def _set_dates(self, data: dict[str, str], start_date: date | None, end_date: date | None) -> None:
-        for key in list(data):
+        candidates: dict[str, list[tuple[int, str]]] = {"from": [], "to": []}
+        for key in data:
             normalized = normalize_label(key)
-            if start_date and any(token in normalized for token in ("from", "start", "min", "regdate1", "date1")):
-                if "date" in normalized or "regdate" in normalized:
-                    data[key] = start_date.strftime("%d/%m/%Y")
-            if end_date and any(token in normalized for token in ("to", "end", "max", "regdate2", "date2")):
-                if "date" in normalized or "regdate" in normalized:
-                    data[key] = end_date.strftime("%d/%m/%Y")
+            if "date" not in normalized and "regdate" not in normalized:
+                continue
+            if any(token in normalized for token in ("regdate", "received", "registered", "valid")):
+                priority = 0
+            elif any(token in normalized for token in ("decision", "appeal", "committee", "comm")):
+                priority = 20
+            else:
+                priority = 10
+            if any(token in normalized for token in ("from", "start", "min", "regdate1", "date1")):
+                candidates["from"].append((priority, key))
+            if any(token in normalized for token in ("to", "end", "max", "regdate2", "date2")):
+                candidates["to"].append((priority, key))
+
+        if start_date and candidates["from"]:
+            data[min(candidates["from"])[1]] = start_date.strftime("%d/%m/%Y")
+        if end_date and candidates["to"]:
+            data[min(candidates["to"])[1]] = end_date.strftime("%d/%m/%Y")
 
 
 class WebFormsPlanningScraper(QueryFormPlanningScraper):
@@ -830,14 +846,16 @@ def parse_header_tables(html_text: str, page_url: str, authority: str, family: s
     applications: list[PlanningApplication] = []
     seen: set[str] = set()
     for table in document.xpath("//table"):
-        header_cells = table.xpath(".//tr[th]/*[self::th or self::td]")
+        header_rows = table.xpath(".//tr[th][1]")
+        header_cells = header_rows[0].xpath("./*[self::th or self::td]") if header_rows else []
         if not header_cells:
             first_row = first(table.xpath(".//tr[1]"))
             header_cells = first_row.xpath("./*[self::th or self::td]") if first_row is not None else []
         headers = [normalize_label(clean_text(" ".join(cell.itertext())) or "") for cell in header_cells]
-        if not any(header in LABEL_MAP for header in headers):
+        if sum(header in LABEL_MAP for header in headers) < 2:
             continue
-        for row in table.xpath(".//tr[position() > 1]"):
+        rows = table.xpath(".//tr")
+        for row in rows[1:]:
             cells = row.xpath("./*[self::td or self::th]")
             if len(cells) < 2:
                 continue

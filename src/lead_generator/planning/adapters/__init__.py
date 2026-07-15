@@ -5,6 +5,7 @@ from .achieveforms import AchieveFormsCouncilConfig, AchieveFormsPlanningScraper
 from .agile import AgileCouncilConfig, AgilePlanningScraper
 from .arcus import ArcusCouncilConfig, ArcusPlanningScraper
 from .atrium import AtriumCouncilConfig, AtriumPlanningScraper
+from .authority_specific import AUTHORITY_ADAPTER_FACTORIES, authority_specific_scraper
 from .civica import CivicaCouncilConfig, CivicaPlanningScraper
 from .idox import IdoxCouncilConfig, IdoxPublicAccessScraper
 from .legacy_forms import (
@@ -36,6 +37,8 @@ __all__ = [
     "ArcusPlanningScraper",
     "AtriumCouncilConfig",
     "AtriumPlanningScraper",
+    "AUTHORITY_ADAPTER_FACTORIES",
+    "authority_specific_scraper",
     "CivicaCouncilConfig",
     "CivicaPlanningScraper",
     "IdoxCouncilConfig",
