@@ -39,6 +39,7 @@ LABEL_MAP = {
     "app_number": "reference",
     "case_reference": "reference",
     "development_address": "address",
+    "address_of_proposal": "address",
     "site_location": "address",
     "site_address": "address",
     "location": "address",
@@ -147,7 +148,8 @@ class NativeListingScraper(PlanningScraper):
         for select in form.xpath(".//select[@name]"):
             options = select.xpath(".//option[@selected]") or select.xpath(".//option")[:1]
             if options:
-                data[select.get("name")] = options[0].get("value") or clean_text(" ".join(options[0].itertext())) or ""
+                value = options[0].get("value")
+                data[select.get("name")] = value if value is not None else clean_text(" ".join(options[0].itertext())) or ""
         for textarea in form.xpath(".//textarea[@name]"):
             data[textarea.get("name")] = clean_text(" ".join(textarea.itertext())) or ""
         return data

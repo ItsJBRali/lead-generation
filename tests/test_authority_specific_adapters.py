@@ -25,6 +25,7 @@ from lead_generator.planning.leads import CouncilTarget, planning_scraper_for_ta
 
 EXPECTED_ADAPTERS = {
     "Ashford": "AshfordPlanningScraper",
+    "Bath": "BathPlanningScraper",
     "BCP": "BcpPlanningScraper",
     "Wychavon": "WychavonPlanningScraper",
     "Barking and Dagenham": "BarkingAndDagenhamPlanningScraper",
@@ -38,6 +39,8 @@ EXPECTED_ADAPTERS = {
     "Waltham Forest": "WalthamForestPlanningScraper",
     "Vale of White Horse": "ValeOfWhiteHorsePlanningScraper",
     "Bromley": "BromleyPlanningScraper",
+    "Carmarthenshire": "CarmarthenshirePlanningScraper",
+    "Colchester": "ColchesterPlanningScraper",
     "Broxbourne": "BroxbournePlanningScraper",
     "Taunton Deane": "TauntonDeanePlanningScraper",
     "Camden": "CamdenPlanningScraper",
@@ -57,7 +60,10 @@ EXPECTED_ADAPTERS = {
     "Essex": "EssexPlanningScraper",
     "Exmoor": "ExmoorPlanningScraper",
     "Gloucestershire": "GloucestershirePlanningScraper",
+    "Kensington": "KensingtonPlanningScraper",
     "Shepway": "ShepwayPlanningScraper",
+    "Telford": "TelfordPlanningScraper",
+    "West Dunbartonshire": "WestDunbartonshirePlanningScraper",
 }
 
 

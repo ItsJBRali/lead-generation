@@ -65,6 +65,25 @@ def test_http_client_uses_browser_like_user_agent_by_default() -> None:
     assert "Chrome/" in client.user_agent
 
 
+def test_http_client_preserves_binary_response_bytes() -> None:
+    body = b"\x02\x00\x00\x00\xff\x00planning"
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            return FakeResponse(body)
+
+    class FakeClient(CouncilHttpClient):
+        def _opener(self):
+            return FakeOpener()
+
+    response = FakeClient(min_delay_seconds=0).get_bytes(
+        "https://planning.example.gov.uk/api/cases"
+    )
+
+    assert response.status_code == 200
+    assert response.body == body
+
+
 def test_http_request_monitor_reports_activity() -> None:
     class FakeOpener:
         def open(self, request, timeout):

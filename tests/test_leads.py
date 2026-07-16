@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 from lxml import html
 
+from lead_generator.planning.adapters.generic import GenericLabelledPlanningScraper
 from lead_generator.planning.leads import (
     CouncilSearchDegradedError,
     CouncilTarget,
@@ -41,6 +42,7 @@ from lead_generator.planning.leads import (
     load_authority_catalogue,
     planit_document_source_urls,
     parse_keywords,
+    planning_scraper_for_target,
     point_in_geometry,
     run_lead_search,
     sanitize_path_part,
@@ -107,10 +109,15 @@ class LeadSearchTest(unittest.TestCase):
             "https://idoxcloud.nuneatonandbedworth.gov.uk/planning/index.html?fa=search",
         )
 
-    def test_builtin_catalogue_includes_known_english_gap_authorities(self) -> None:
+    def test_builtin_catalogue_includes_all_active_non_ni_authority_types(self) -> None:
         catalogue = load_authority_catalogue(Path("src/lead_generator/planning/data/planning_authorities.geojson"))
         authorities = {feature["properties"]["authority"] for feature in catalogue["features"]}
+        area_types = [feature["properties"]["area_type"] for feature in catalogue["features"]]
 
+        self.assertEqual(len(catalogue["features"]), 399)
+        self.assertEqual(area_types.count("Scottish Council"), 32)
+        self.assertEqual(area_types.count("Welsh Principal Area"), 22)
+        self.assertNotIn("Northern Ireland District", area_types)
         self.assertTrue(
             {
                 "East Suffolk",
@@ -118,7 +125,6 @@ class LeadSearchTest(unittest.TestCase):
                 "North Northamptonshire",
                 "West Northamptonshire",
                 "Westmorland and Furness",
-                "Cumberland",
                 "Adur and Worthing",
                 "Mid Kent",
                 "South West Devon",
@@ -126,9 +132,56 @@ class LeadSearchTest(unittest.TestCase):
                 "Bromsgrove Redditch",
                 "Chiltern South Bucks",
                 "South Norfolk Broadland",
-                "Greater Cambridge",
+                "Bath",
+                "Carmarthenshire",
+                "Colchester",
+                "East Dunbartonshire",
+                "Telford",
             }.issubset(authorities)
         )
+
+    def test_builtin_catalogue_records_shared_and_current_council_codes(self) -> None:
+        catalogue = load_authority_catalogue(Path("src/lead_generator/planning/data/planning_authorities.geojson"))
+        properties = [feature["properties"] for feature in catalogue["features"]]
+        covered_codes = {
+            code
+            for item in properties
+            for code in ([item.get("gss_code")] if item.get("gss_code") else []) + item.get("covered_gss_codes", [])
+        }
+
+        self.assertTrue(
+            {
+                "E06000063",  # Cumberland's three legacy planning registers
+                "E07000044",  # South Hams via South West Devon
+                "E07000110",  # Maidstone via Mid Kent
+                "E07000223",  # Adur via Adur and Worthing
+                "E08000037",  # Gateshead's current code
+                "S12000047",  # Fife's current code
+                "S12000048",  # Perth and Kinross's current code
+                "S12000049",  # Glasgow City's current code
+                "S12000050",  # North Lanarkshire's current code
+            }.issubset(covered_codes)
+        )
+
+    def test_builtin_catalogue_has_a_supported_adapter_for_every_target(self) -> None:
+        catalogue = load_authority_catalogue(Path("src/lead_generator/planning/data/planning_authorities.geojson"))
+        generic_authorities: list[str] = []
+        for feature in catalogue["features"]:
+            properties = feature["properties"]
+            target = CouncilTarget(
+                authority=properties["authority"],
+                portal_family=properties["portal_family"],
+                scraper_type=properties["scraper_type"],
+                base_url=properties["base_url"],
+                listing_url=properties["listing_url"],
+                geometry=feature["geometry"],
+                link_test_ok=properties["link_test_ok"],
+            )
+            scraper = planning_scraper_for_target(target)
+            if type(scraper) is GenericLabelledPlanningScraper:
+                generic_authorities.append(target.authority)
+
+        self.assertEqual(generic_authorities, [])
 
     def test_point_in_geometry_handles_polygon(self) -> None:
         geometry = polygon_feature("area", 0, 0, 1, 1)["geometry"]

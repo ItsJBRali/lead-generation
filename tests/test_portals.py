@@ -9,6 +9,7 @@ class PortalDetectionTest(unittest.TestCase):
     def test_detects_major_portal_families(self) -> None:
         cases = {
             "idox": ("<html>PublicAccess applicationDetails.do</html>", "https://example.gov.uk/online-applications"),
+            "arcus": ("<html>Arcus_BE_Public_Register</html>", "https://example.my.site.com/pr/s/register-view"),
             "ocella": ("<meta name='generator' content='OcellaWeb'>", "https://example.gov.uk/planning"),
             "civica": ("<html>Civica Authority Public Access</html>", "https://example.gov.uk/planning"),
             "agile": ("<html>Agile Applications</html>", "https://example.gov.uk/apas/run/WPHAPPDETAIL.DisplayUrl"),

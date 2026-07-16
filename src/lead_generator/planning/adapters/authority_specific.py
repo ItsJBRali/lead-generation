@@ -15,6 +15,14 @@ from lxml import html
 from lead_generator.planning.adapters.arcus import ArcusCouncilConfig, ArcusPlanningScraper
 from lead_generator.planning.adapters.atrium import AtriumCouncilConfig, AtriumPlanningScraper
 from lead_generator.planning.adapters.base import PlanningScraper
+from lead_generator.planning.adapters.bespoke_portals import (
+    BathPlanningScraper,
+    CarmarthenshirePlanningScraper,
+    ColchesterPlanningScraper,
+    KensingtonPlanningScraper,
+    TelfordPlanningScraper,
+    WestDunbartonshirePlanningScraper,
+)
 from lead_generator.planning.adapters.legacy_forms import (
     AstunPlanningScraper,
     CcedPlanningScraper,
@@ -768,6 +776,8 @@ def _legacy(adapter: type[PlanningScraper]) -> Callable[[str, str], PlanningScra
 
 AUTHORITY_ADAPTER_FACTORIES: dict[str, Callable[[str, str], PlanningScraper]] = {
     "ashford": _arcus(AshfordPlanningScraper),
+    "bath": _legacy(BathPlanningScraper),
+    "bath and north east somerset": _legacy(BathPlanningScraper),
     "bcp": _atrium(BcpPlanningScraper),
     "wychavon": _atrium(WychavonPlanningScraper),
     "barking and dagenham": _legacy(BarkingAndDagenhamPlanningScraper),
@@ -780,6 +790,8 @@ AUTHORITY_ADAPTER_FACTORIES: dict[str, Callable[[str, str], PlanningScraper]] = 
     "waltham forest": _legacy(WalthamForestPlanningScraper),
     "vale of white horse": _atrium(ValeOfWhiteHorsePlanningScraper),
     "bromley": _arcus(BromleyPlanningScraper),
+    "carmarthenshire": _arcus(CarmarthenshirePlanningScraper),
+    "colchester": _legacy(ColchesterPlanningScraper),
     "broxbourne": _legacy(BroxbournePlanningScraper),
     "taunton deane": _legacy(TauntonDeanePlanningScraper),
     "camden": _legacy(CamdenPlanningScraper),
@@ -799,7 +811,11 @@ AUTHORITY_ADAPTER_FACTORIES: dict[str, Callable[[str, str], PlanningScraper]] = 
     "essex": _atrium(EssexPlanningScraper),
     "exmoor": _atrium(ExmoorPlanningScraper),
     "gloucestershire": _legacy(GloucestershirePlanningScraper),
+    "kensington": _legacy(KensingtonPlanningScraper),
+    "kensington and chelsea": _legacy(KensingtonPlanningScraper),
     "shepway": _arcus(ShepwayPlanningScraper),
+    "telford": _legacy(TelfordPlanningScraper),
+    "west dunbartonshire": _legacy(WestDunbartonshirePlanningScraper),
 }
 
 
@@ -813,10 +829,13 @@ __all__ = [
     "AshfordPlanningScraper",
     "BarkingAndDagenhamPlanningScraper",
     "BcpPlanningScraper",
+    "BathPlanningScraper",
     "BromleyPlanningScraper",
     "BroxbournePlanningScraper",
+    "CarmarthenshirePlanningScraper",
     "CamdenPlanningScraper",
     "CentralBedfordshirePlanningScraper",
+    "ColchesterPlanningScraper",
     "CoventryPlanningScraper",
     "CrawleyPlanningScraper",
     "DevonPlanningScraper",
@@ -827,12 +846,15 @@ __all__ = [
     "EssexPlanningScraper",
     "ExmoorPlanningScraper",
     "GloucestershirePlanningScraper",
+    "KensingtonPlanningScraper",
     "ShepwayPlanningScraper",
     "SomersetPlanningScraper",
     "SouthOxfordshirePlanningScraper",
     "StratfordOnAvonPlanningScraper",
     "SurreyPlanningScraper",
     "TandridgePlanningScraper",
+    "TelfordPlanningScraper",
+    "WestDunbartonshirePlanningScraper",
     "TauntonDeanePlanningScraper",
     "ValeOfWhiteHorsePlanningScraper",
     "WalthamForestPlanningScraper",

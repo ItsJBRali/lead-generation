@@ -49,6 +49,21 @@ class FetchResponse:
     text: str
 
 
+@dataclass(slots=True)
+class BinaryFetchResponse:
+    url: str
+    status_code: int
+    body: bytes
+
+
+@dataclass(slots=True)
+class _RawFetchResponse:
+    url: str
+    status_code: int
+    body: bytes
+    charset: str
+
+
 _REQUEST_MONITOR = threading.local()
 _BROWSER_FALLBACK_GATE = threading.BoundedSemaphore(1)
 
@@ -162,6 +177,27 @@ class CouncilHttpClient:
             response = self._send(request, url)
         return response
 
+    def get_bytes(
+        self,
+        url: str,
+        params: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> BinaryFetchResponse:
+        if params:
+            separator = "&" if "?" in url else "?"
+            url = f"{url}{separator}{urlencode(params)}"
+
+        request_headers = {"User-Agent": self.user_agent}
+        if headers:
+            request_headers.update(headers)
+        request = Request(url, headers=request_headers)
+        response = self._send_raw(request, url)
+        return BinaryFetchResponse(
+            url=response.url,
+            status_code=response.status_code,
+            body=response.body,
+        )
+
     def post_form(
         self,
         url: str,
@@ -183,21 +219,40 @@ class CouncilHttpClient:
         )
         return self._send(request, url)
 
-    def post_json(self, url: str, data: object) -> FetchResponse:
+    def post_json(
+        self,
+        url: str,
+        data: object,
+        headers: dict[str, str] | None = None,
+    ) -> FetchResponse:
         encoded = json.dumps(data).encode("utf-8")
+        request_headers = {
+            "User-Agent": self.user_agent,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        if headers:
+            request_headers.update(headers)
         request = Request(
             url,
             data=encoded,
-            headers={
-                "User-Agent": self.user_agent,
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            },
+            headers=request_headers,
             method="POST",
         )
         return self._send(request, url)
 
     def _send(self, request: Request, url: str) -> FetchResponse:
+        response = self._send_raw(request, url)
+        body = response.body.decode(response.charset, errors="replace")
+        if _looks_like_waf_challenge(body):
+            raise CouncilFetchError(f"Blocked by web application firewall while fetching {url}")
+        return FetchResponse(
+            url=response.url,
+            status_code=response.status_code,
+            text=body,
+        )
+
+    def _send_raw(self, request: Request, url: str) -> _RawFetchResponse:
         last_error: Exception | None = None
         for attempt in range(self.retries + 1):
             _raise_if_request_cancelled()
@@ -210,7 +265,7 @@ class CouncilHttpClient:
                     _report_request_activity()
                     with self._opener().open(request, timeout=self.timeout_seconds) as response:
                         charset = response.headers.get_content_charset() or "utf-8"
-                        body = response.read().decode(charset, errors="replace")
+                        body = response.read()
                         status_code = getattr(response, "status", 200)
                         response_url = response.geturl()
                 _report_request_activity()
@@ -220,12 +275,11 @@ class CouncilHttpClient:
                         raise last_error
                     self._pause_before_retry(url, attempt, minimum_seconds=3.0)
                     continue
-                if _looks_like_waf_challenge(body):
-                    raise CouncilFetchError(f"Blocked by web application firewall while fetching {url}")
-                return FetchResponse(
+                return _RawFetchResponse(
                     url=response_url,
                     status_code=status_code,
-                    text=body,
+                    body=body,
+                    charset=charset,
                 )
             except HTTPError as exc:
                 if exc.code in {429, 503} and attempt < self.retries:
