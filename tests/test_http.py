@@ -123,6 +123,28 @@ def test_http_client_retries_with_tls_compat_after_connection_reset() -> None:
     assert client._tls_compat is True
 
 
+def test_http_client_retries_with_tls_compat_after_unexpected_eof() -> None:
+    class FakeOpener:
+        def __init__(self, client: CouncilHttpClient) -> None:
+            self.client = client
+
+        def open(self, request, timeout):
+            if not self.client._tls_compat:
+                raise URLError("[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol")
+            return FakeResponse()
+
+    class FakeClient(CouncilHttpClient):
+        def _opener(self):
+            return FakeOpener(self)
+
+    client = FakeClient(min_delay_seconds=0)
+
+    response = client.get("https://planning.example.gov.uk/search")
+
+    assert response.status_code == 200
+    assert client._tls_compat is True
+
+
 def test_http_client_rejects_waf_placeholder_pages() -> None:
     class FakeOpener:
         def open(self, request, timeout):

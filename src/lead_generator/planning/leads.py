@@ -204,6 +204,16 @@ PLANIT_FIRST_AUTHORITIES = {
     "Surrey",
 }
 
+CURRENT_PORTAL_OVERRIDES = {
+    "Nuneaton": {
+        "portal_family": "tascomi",
+        "scraper_type": "Tascomi",
+        "base_url": "https://idoxcloud.nuneatonandbedworth.gov.uk/planning/",
+        "listing_url": "https://idoxcloud.nuneatonandbedworth.gov.uk/planning/index.html?fa=search",
+        "planning_url": "https://idoxcloud.nuneatonandbedworth.gov.uk/planning/index.html?fa=search",
+    },
+}
+
 FRESH_SESSION_RETRY_TOKENS = (
     "http 403",
     "http 429",
@@ -862,9 +872,16 @@ def load_geojson(path: Path) -> dict[str, object]:
 
 def load_authority_catalogue(path: Path | None = None) -> dict[str, object]:
     if path:
-        return load_geojson(path)
-    data = resources.files("lead_generator.planning.data").joinpath("planning_authorities.geojson")
-    return json.loads(data.read_text(encoding="utf-8"))
+        catalogue = load_geojson(path)
+    else:
+        data = resources.files("lead_generator.planning.data").joinpath("planning_authorities.geojson")
+        catalogue = json.loads(data.read_text(encoding="utf-8"))
+    for feature in catalogue.get("features", []):
+        properties = feature.get("properties") or {}
+        override = CURRENT_PORTAL_OVERRIDES.get(str(properties.get("authority") or ""))
+        if override:
+            properties.update(override)
+    return catalogue
 
 
 def select_overlapping_authorities(
@@ -964,30 +981,35 @@ def discover_portal_applications(target: CouncilTarget, start_date: date, end_da
     applications: list[PlanningApplication] = []
     seen: set[str] = set()
     detail_fetch_failed = False
-    for stub in discovery.applications:
-        application = stub
-        if not (stub.raw or {}).get("detail_complete"):
-            try:
-                application = scraper.fetch_application(stub.uid, stub.url, include_documents=False)
-            except Exception as exc:
-                detail_fetch_failed = True
-                stub.raw = {**(stub.raw or {}), "detail_fetch_error": str(exc)}
-        application = with_portal_metadata(application, stub, target, discovery.source_url)
-        key = application.reference or application.uid or application.url
-        if key in seen:
-            continue
-        seen.add(key)
-        application_date = application.date_received or application.date_validated
-        if application_date:
-            received = _parse_iso_date(application_date)
-            if received is not None and (received < start_date or received > end_date):
+    try:
+        for stub in discovery.applications:
+            application = stub
+            if not (stub.raw or {}).get("detail_complete"):
+                try:
+                    application = scraper.fetch_application(stub.uid, stub.url, include_documents=False)
+                except Exception as exc:
+                    detail_fetch_failed = True
+                    stub.raw = {**(stub.raw or {}), "detail_fetch_error": str(exc)}
+            application = with_portal_metadata(application, stub, target, discovery.source_url)
+            key = application.reference or application.uid or application.url
+            if key in seen:
                 continue
-        applications.append(application)
-    if not applications or detail_fetch_failed:
-        planit_applications = discover_planit_fallback_applications(target, start_date, end_date)
-        if planit_applications:
-            return _merge_portal_and_planit_applications(applications, planit_applications)
-    return applications
+            seen.add(key)
+            application_date = application.date_received or application.date_validated
+            if application_date:
+                received = _parse_iso_date(application_date)
+                if received is not None and (received < start_date or received > end_date):
+                    continue
+            applications.append(application)
+        if not applications or detail_fetch_failed:
+            planit_applications = discover_planit_fallback_applications(target, start_date, end_date)
+            if planit_applications:
+                return _merge_portal_and_planit_applications(applications, planit_applications)
+        return applications
+    finally:
+        close = getattr(scraper, "close", None)
+        if callable(close):
+            close()
 
 
 def _merge_portal_and_planit_applications(

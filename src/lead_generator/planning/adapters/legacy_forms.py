@@ -9,7 +9,12 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 from lxml import html
 
 from lead_generator.planning.adapters.base import PlanningScraper
-from lead_generator.planning.http import CouncilHttpClient
+from lead_generator.planning.http import (
+    CouncilBrowserClient,
+    CouncilFetchError,
+    CouncilHttpClient,
+    browser_fallback_recommended,
+)
 from lead_generator.planning.models import DiscoveryResult, PlanningApplication
 from lead_generator.planning.parsing import clean_text, extract_postcode, normalize_label, parse_council_date
 
@@ -162,6 +167,29 @@ class TascomiPlanningScraper(NativeListingScraper):
         end_date: date | None,
         limit: int | None,
     ) -> list[PlanningApplication]:
+        try:
+            return self._search(listing_url, start_date=start_date, end_date=end_date, limit=limit)
+        except CouncilFetchError as exc:
+            if not browser_fallback_recommended(exc) or isinstance(self.http, CouncilBrowserClient):
+                raise
+            primary_error = exc
+            browser = CouncilBrowserClient()
+            self.http = browser
+            try:
+                return self._search(listing_url, start_date=start_date, end_date=end_date, limit=limit)
+            except Exception as browser_error:
+                browser.close()
+                browser_error.add_note(f"Direct portal request also failed: {primary_error}")
+                raise
+
+    def _search(
+        self,
+        listing_url: str,
+        *,
+        start_date: date | None,
+        end_date: date | None,
+        limit: int | None,
+    ) -> list[PlanningApplication]:
         response = self.http.get(listing_url)
         document = html.fromstring(response.text)
         form = first(document.xpath("//form[.//input[@name='received_date_from'] or .//input[@name='valid_date_from']]"))
@@ -177,7 +205,60 @@ class TascomiPlanningScraper(NativeListingScraper):
             if end_date:
                 data["received_date_to"] = end_date.strftime("%d-%m-%Y")
             response = self.http.post_form(self._absolute_action(response.url, form), data)
+
         applications = parse_header_tables(response.text, response.url, self.authority, self.family)
+        seen = {(application.reference or application.uid).casefold() for application in applications}
+        if form is not None and (limit is None or len(applications) < limit):
+            action = self._absolute_action(response.url, form)
+            for page in range(2, 251):
+                page_data = {key: value for key, value in data.items() if value}
+                page_data.update(
+                    {
+                        "fa": "search",
+                        "page": str(page),
+                        "ajax": "true",
+                        "result_loader": "true",
+                        "submitted": "true",
+                    }
+                )
+                page_response = self.http.post_form(
+                    action,
+                    page_data,
+                    headers={"X-Requested-With": "XMLHttpRequest"},
+                )
+                if not page_response.text.strip():
+                    break
+                page_applications = parse_header_tables(
+                    page_response.text,
+                    page_response.url,
+                    self.authority,
+                    self.family,
+                )
+                new_applications = [
+                    application
+                    for application in page_applications
+                    if (application.reference or application.uid).casefold() not in seen
+                ]
+                if not new_applications:
+                    break
+                for application in new_applications:
+                    seen.add((application.reference or application.uid).casefold())
+                applications.extend(new_applications)
+                if limit is not None and len(applications) >= limit:
+                    break
+
+        inferred_date = start_date or end_date
+        for application in applications:
+            if inferred_date and not (application.date_received or application.date_validated):
+                application.date_received = inferred_date.isoformat()
+            application.raw = {
+                **(application.raw or {}),
+                "detail_complete": True,
+                "date_range_filtered": bool(start_date or end_date),
+                "date_inferred_from_search_window": bool(
+                    inferred_date and not application.raw.get("date_received")
+                ),
+            }
         return applications[:limit] if limit is not None else applications
 
 
@@ -868,6 +949,15 @@ def parse_header_tables(html_text: str, page_url: str, authority: str, family: s
                 if label and value:
                     fields[label] = value
             href = first(anchor.get("href") for anchor in row.xpath(".//a[@href]"))
+            if not href:
+                application_id = first(
+                    button.get("data-id")
+                    for button in row.xpath(
+                        ".//*[@data-id and contains(concat(' ', normalize-space(@class), ' '), ' view_application ')]"
+                    )
+                )
+                if application_id:
+                    href = f"{replace_query_action(page_url, 'getApplication')}&{urlencode({'id': application_id})}"
             app = application_from_fields(
                 authority,
                 family,

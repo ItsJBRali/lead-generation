@@ -20,6 +20,19 @@ from urllib.request import (
 )
 
 try:
+    from selenium import webdriver
+    from selenium.common.exceptions import WebDriverException
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support import expected_conditions as selenium_conditions
+    from selenium.webdriver.support.ui import WebDriverWait
+except ImportError:  # pragma: no cover - optional outside the packaged GUI
+    webdriver = None
+    WebDriverException = Exception
+    By = None
+    selenium_conditions = None
+    WebDriverWait = None
+
+try:
     import certifi
 except ImportError:  # pragma: no cover - depends on the runtime environment
     certifi = None
@@ -37,6 +50,7 @@ class FetchResponse:
 
 
 _REQUEST_MONITOR = threading.local()
+_BROWSER_FALLBACK_GATE = threading.BoundedSemaphore(1)
 
 
 @contextmanager
@@ -315,6 +329,278 @@ class CouncilHttpClient:
         return build_opener(*handlers)
 
 
+class CouncilBrowserClient:
+    """Small Selenium-backed client used only when a portal requires JavaScript."""
+
+    def __init__(self, *, timeout_seconds: float = 45.0) -> None:
+        self.timeout_seconds = timeout_seconds
+        self._driver = None
+        self._owns_gate = False
+
+    def get(
+        self,
+        url: str,
+        params: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> FetchResponse:
+        del headers
+        if params:
+            separator = "&" if "?" in url else "?"
+            url = f"{url}{separator}{urlencode(params)}"
+        driver = self._ensure_driver()
+        try:
+            _report_request_activity()
+            driver.get(url)
+            self._wait_for_usable_page()
+            return self._response()
+        except CouncilFetchError:
+            raise
+        except Exception as exc:
+            raise CouncilFetchError(f"Browser fallback could not fetch {url}: {exc}") from exc
+
+    def post_form(
+        self,
+        url: str,
+        data: dict[str, str],
+        headers: dict[str, str] | None = None,
+    ) -> FetchResponse:
+        driver = self._ensure_driver()
+        try:
+            _report_request_activity()
+            if str(data.get("ajax", "")).casefold() == "true" or (
+                headers and headers.get("X-Requested-With", "").casefold() == "xmlhttprequest"
+            ):
+                return self._post_ajax(url, data)
+            root = driver.find_element(By.TAG_NAME, "html")
+            submitted = driver.execute_script(
+                """
+                const target = new URL(arguments[0], window.location.href);
+                const values = arguments[1];
+                const forms = Array.from(document.forms);
+                const form = forms.find((candidate) => {
+                    const action = new URL(candidate.action || window.location.href, window.location.href);
+                    return action.pathname === target.pathname;
+                }) || forms[0];
+                if (!form) return false;
+                for (const [name, value] of Object.entries(values)) {
+                    const controls = Array.from(form.elements).filter((item) => item.name === name);
+                    for (const control of controls) {
+                        const type = (control.type || '').toLowerCase();
+                        if (type === 'radio' || type === 'checkbox') {
+                            control.checked = String(control.value) === String(value);
+                        } else {
+                            control.value = value == null ? '' : String(value);
+                        }
+                        control.dispatchEvent(new Event('input', {bubbles: true}));
+                        control.dispatchEvent(new Event('change', {bubbles: true}));
+                    }
+                }
+                const submit = form.querySelector('button[type="submit"], input[type="submit"]');
+                if (submit) submit.click(); else form.requestSubmit();
+                return true;
+                """,
+                url,
+                data,
+            )
+            if not submitted:
+                raise CouncilFetchError(f"Browser fallback could not find the form for {url}")
+            try:
+                WebDriverWait(driver, self.timeout_seconds).until(selenium_conditions.staleness_of(root))
+            except Exception:
+                pass
+            self._wait_for_usable_page()
+            return self._response()
+        except CouncilFetchError:
+            raise
+        except Exception as exc:
+            raise CouncilFetchError(f"Browser fallback could not submit {url}: {exc}") from exc
+
+    def _post_ajax(self, url: str, data: dict[str, str]) -> FetchResponse:
+        driver = self._ensure_driver()
+        result = driver.execute_async_script(
+            """
+            const done = arguments[arguments.length - 1];
+            fetch(arguments[0], {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                    'X-Requested-With': 'XMLHttpRequest'
+                },
+                body: new URLSearchParams(arguments[1]).toString()
+            }).then(async (response) => done({
+                status: response.status,
+                url: response.url,
+                text: await response.text()
+            })).catch((error) => done({error: String(error)}));
+            """,
+            url,
+            data,
+        )
+        _report_request_activity()
+        if not isinstance(result, dict) or result.get("error"):
+            detail = result.get("error") if isinstance(result, dict) else "no response"
+            raise CouncilFetchError(f"Browser fallback AJAX request failed for {url}: {detail}")
+        status_code = int(result.get("status") or 0)
+        if status_code >= 400:
+            raise CouncilFetchError(f"HTTP {status_code} while fetching {url}")
+        return FetchResponse(
+            url=str(result.get("url") or url),
+            status_code=status_code or 200,
+            text=str(result.get("text") or ""),
+        )
+
+    def close(self) -> None:
+        driver, self._driver = self._driver, None
+        try:
+            if driver is not None:
+                driver.quit()
+        finally:
+            if self._owns_gate:
+                self._owns_gate = False
+                _BROWSER_FALLBACK_GATE.release()
+
+    def _ensure_driver(self):
+        if self._driver is not None:
+            return self._driver
+        if webdriver is None:
+            raise CouncilFetchError("Browser fallback is unavailable because Selenium is not installed")
+        while not _BROWSER_FALLBACK_GATE.acquire(timeout=0.25):
+            _raise_if_request_cancelled()
+            _report_request_activity()
+        self._owns_gate = True
+        try:
+            self._driver = self._create_driver()
+            self._driver.set_page_load_timeout(self.timeout_seconds)
+            self._driver.set_script_timeout(self.timeout_seconds)
+            return self._driver
+        except Exception as exc:
+            self.close()
+            raise CouncilFetchError(f"Could not start the council browser fallback: {exc}") from exc
+
+    def _create_driver(self):
+        chrome_options = webdriver.ChromeOptions()
+        self._configure_options(chrome_options)
+        try:
+            driver = webdriver.Chrome(options=chrome_options)
+        except WebDriverException as chrome_error:
+            edge_options = webdriver.EdgeOptions()
+            self._configure_options(edge_options)
+            try:
+                driver = webdriver.Edge(options=edge_options)
+            except WebDriverException as edge_error:
+                raise CouncilFetchError(
+                    f"Chrome could not start ({chrome_error}); Edge could not start ({edge_error})"
+                ) from edge_error
+        try:
+            driver.execute_cdp_cmd(
+                "Page.addScriptToEvaluateOnNewDocument",
+                {
+                    "source": (
+                        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+                        "Object.defineProperty(navigator, 'languages', {get: () => ['en-GB', 'en']});"
+                    )
+                },
+            )
+        except Exception:
+            pass
+        return driver
+
+    def _configure_options(self, options) -> None:
+        for argument in (
+            "--disable-gpu",
+            "--disable-dev-shm-usage",
+            "--no-sandbox",
+            "--window-size=1280,1000",
+            "--window-position=-32000,-32000",
+            "--disable-blink-features=AutomationControlled",
+            "--lang=en-GB",
+            "--log-level=3",
+        ):
+            options.add_argument(argument)
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option("useAutomationExtension", False)
+
+    def _wait_for_usable_page(self) -> None:
+        driver = self._ensure_driver()
+
+        def ready(_driver) -> bool:
+            _raise_if_request_cancelled()
+            _report_request_activity()
+            try:
+                source = _driver.page_source or ""
+                lowered = source[:6000].casefold()
+                title = (_driver.title or "").casefold()
+                ready_state = _driver.execute_script("return document.readyState") == "complete"
+                if ready_state and (
+                    "403 forbidden" in title
+                    or "service unavailable" in title
+                    or "bad gateway" in title
+                ):
+                    return True
+                challenge = len(source) < 5000 and (
+                    "javascript is disabled" in lowered
+                    or "awswaf" in lowered
+                    or "captcha-sdk.awswaf.com" in lowered
+                    or "incapsula incident id" in lowered
+                    or "request unsuccessful" in lowered
+                )
+                challenge = challenge or "checking you're not a bot" in lowered or "azure waf" in title
+                return ready_state and len(source) > 500 and not challenge
+            except Exception:
+                return False
+
+        try:
+            WebDriverWait(driver, self.timeout_seconds, poll_frequency=0.25).until(ready)
+        except Exception as exc:
+            raise CouncilFetchError(
+                f"Browser challenge did not complete while fetching {getattr(driver, 'current_url', '')}"
+            ) from exc
+        self._raise_for_error_page()
+
+    def _raise_for_error_page(self) -> None:
+        driver = self._ensure_driver()
+        source = driver.page_source or ""
+        title = (driver.title or "").casefold()
+        opening = source[:12000].casefold()
+        if any(
+            token in title
+            for token in ("403 forbidden", "service unavailable", "internal server error", "bad gateway")
+        ) or (
+            len(source) < 12000
+            and any(token in opening for token in ("403 forbidden", ">503<", "service unavailable", "bad gateway"))
+        ):
+            raise CouncilFetchError(f"Council website error page while fetching {driver.current_url}")
+
+    def _response(self) -> FetchResponse:
+        driver = self._ensure_driver()
+        return FetchResponse(url=driver.current_url, status_code=200, text=driver.page_source)
+
+    def __del__(self):  # pragma: no cover - best effort during interpreter shutdown
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def browser_fallback_recommended(exc: Exception) -> bool:
+    text = str(exc).casefold()
+    return any(
+        token in text
+        for token in (
+            "http 403",
+            "http 405",
+            "http 503",
+            "empty response",
+            "web application firewall",
+            "council website error page",
+            "unexpected_eof_while_reading",
+            "eof occurred in violation of protocol",
+            "northgate date search was not accepted",
+        )
+    )
+
+
 def _retry_delay_seconds(exc: HTTPError, attempt: int) -> float:
     retry_after = exc.headers.get("Retry-After") if exc.headers else None
     if retry_after:
@@ -354,6 +640,8 @@ def _is_tls_compatibility_error(exc: Exception) -> bool:
                 "unsafe legacy renegotiation",
                 "tlsv1 alert protocol version",
                 "wrong version number",
+                "unexpected_eof_while_reading",
+                "eof occurred in violation of protocol",
             )
         )
     )

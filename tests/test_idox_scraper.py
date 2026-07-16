@@ -173,6 +173,27 @@ class IdoxPublicAccessScraperTest(unittest.TestCase):
         self.assertEqual(application.date_validated, "2026-07-10")
         self.assertTrue(application.raw["detail_complete"])
 
+    def test_parse_listing_recognizes_reference_with_letters_before_year(self) -> None:
+        listing_html = """
+        <html><body><ul>
+          <li class="searchresult">
+            <a class="summaryLink" href="/online-applications/applicationDetails.do?keyVal=ABC123XYZ">
+              <div class="summaryLinkTextClamp">Construction of a garden room.</div>
+            </a>
+            <p class="address">9 Woodside Avenue Brighton BN1 5NF</p>
+            <p class="metaInfo">Ref. No: BH2026/01701 | Received: Fri 10 Jul 2026</p>
+          </li>
+        </ul></body></html>
+        """
+
+        application = self.scraper.parse_listing(
+            listing_html,
+            "https://planning.example.gov.uk/online-applications/advancedSearchResults.do?action=firstPage",
+        )[0]
+
+        self.assertEqual(application.reference, "BH2026/01701")
+        self.assertEqual(application.description, "Construction of a garden room.")
+
     def test_parse_detail_maps_fields_dates_and_postcode(self) -> None:
         summary_html = (FIXTURES / "idox_summary.html").read_text(encoding="utf-8")
         application = self.scraper.parse_detail(summary_html, "https://planning.example.gov.uk/online-applications/applicationDetails.do?activeTab=summary&keyVal=ABC123XYZ")

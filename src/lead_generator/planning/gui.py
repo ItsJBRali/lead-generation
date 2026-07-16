@@ -360,9 +360,15 @@ class LeadGeneratorApp(ctk.CTk):
         self.cancel_button.configure(state="disabled")
 
     def _append_log(self, message: str) -> None:
+        top_index = self.log_box.index("@0,0")
+        _, bottom_fraction = self.log_box.yview()
+        following_latest = bottom_fraction >= 0.999
         self.log_box.configure(state="normal")
         self.log_box.insert("end", f"{message}\n")
-        self.log_box.see("end")
+        if following_latest:
+            self.log_box.see("end")
+        else:
+            self.log_box.yview(top_index)
         self.log_box.configure(state="disabled")
 
     def _clear_log(self) -> None:

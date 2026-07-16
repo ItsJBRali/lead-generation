@@ -574,7 +574,7 @@ class NonIdoxScraperTest(unittest.TestCase):
                 "post": """
                 <table>
                   <tr><th>Application Reference</th><th>Location Details</th><th>Proposal</th><th>View</th></tr>
-                  <tr><td>PL/1674/26</td><td>1 High Street HA1 1AA</td><td>Install entrance gates</td><td><a href="/planning/index.html?fa=getApplication&id=233493">View</a></td></tr>
+                  <tr><td>PL/1674/26</td><td>1 High Street HA1 1AA</td><td>Install entrance gates</td><td><button class="view_application" data-id="233493">View</button></td></tr>
                 </table>
                 """,
             }
@@ -590,7 +590,57 @@ class NonIdoxScraperTest(unittest.TestCase):
         self.assertEqual(http.posts[0][1]["received_date_from"], "08-06-2026")
         self.assertEqual(discovery.applications[0].reference, "PL/1674/26")
         self.assertEqual(discovery.applications[0].description, "Install entrance gates")
+        self.assertEqual(discovery.applications[0].date_received, "2026-06-08")
         self.assertTrue(discovery.applications[0].raw["detail_complete"])
+        self.assertTrue(discovery.applications[0].raw["date_inferred_from_search_window"])
+        self.assertIn("fa=getApplication", discovery.applications[0].url)
+        self.assertIn("id=233493", discovery.applications[0].url)
+
+    def test_tascomi_search_fetches_all_ajax_result_pages(self) -> None:
+        class PaginatedTascomiHttpClient(FakeLegacyFormsHttpClient):
+            def post_form(self, url, data, headers=None):
+                self.posts.append((url, data))
+                page = data.get("page")
+                if page == "3":
+                    body = ""
+                else:
+                    reference = "PL/0002/26" if page == "2" else "PL/0001/26"
+                    application_id = "102" if page == "2" else "101"
+                    body = f"""
+                    <table>
+                      <tr><th>Application Reference</th><th>Location Details</th><th>Proposal</th><th>View</th></tr>
+                      <tr><td>{reference}</td><td>1 High Street HA1 1AA</td><td>Install gates</td>
+                      <td><button class=\"view_application\" data-id=\"{application_id}\">View</button></td></tr>
+                    </table>
+                    """
+                return FetchResponse(url=url, status_code=200, text=body)
+
+        http = PaginatedTascomiHttpClient(
+            {
+                "get": """
+                <form method="post" action="/planning/index.html">
+                  <input name="fa" value="search"><input name="received_date_from"><input name="received_date_to">
+                </form>
+                """
+            }
+        )
+        scraper = TascomiPlanningScraper(
+            LegacyFormsCouncilConfig("Merton", "https://planning.example.gov.uk"),
+            http_client=http,
+        )
+
+        discovery = scraper.discover_ids(
+            listing_url="https://planning.example.gov.uk/planning/index.html?fa=search",
+            start_date=date(2026, 7, 6),
+            end_date=date(2026, 7, 12),
+        )
+
+        self.assertEqual(
+            [application.reference for application in discovery.applications],
+            ["PL/0001/26", "PL/0002/26"],
+        )
+        self.assertEqual([post[1].get("page") for post in http.posts], [None, "2", "3"])
+        self.assertTrue(all(application.raw["detail_complete"] for application in discovery.applications))
 
     def test_enterprisestore_search_uses_ajax_result_path(self) -> None:
         http = FakeLegacyFormsHttpClient(
@@ -1069,6 +1119,84 @@ class NonIdoxScraperTest(unittest.TestCase):
         self.assertEqual(application.description, "Garden studio")
         self.assertEqual(application.decision, "Approved")
         self.assertEqual(application.date_validated, "2026-06-08")
+
+    def test_northgate_submits_received_date_range_and_follows_all_result_pages(self) -> None:
+        class FakeNorthgateHttpClient:
+            def __init__(self) -> None:
+                self.posts: list[tuple[str, dict[str, str], dict[str, str] | None]] = []
+                self.gets: list[tuple[str, dict[str, str] | None]] = []
+
+            def get(self, url: str, params=None, headers=None) -> FetchResponse:
+                self.gets.append((url, headers))
+                if "p=10" in url:
+                    return FetchResponse(
+                        url=url,
+                        status_code=200,
+                        text="""
+                        Records 2 to 2 of 2
+                        <a href="StdDetails.aspx?TYPE=PL/PlanningPK.xml&amp;PARAM0=RU.26/0019">RU.26/0019</a>
+                        <a href="StdResults.aspx?PS=10&amp;XMLLoc=/other-results.xml&amp;p=20">3</a>
+                        """,
+                    )
+                return FetchResponse(
+                    url=url,
+                    status_code=200,
+                    text="""
+                    <form method="post" action="GeneralSearch.aspx">
+                      <input type="hidden" name="__VIEWSTATE" value="state">
+                      <input type="hidden" name="__EVENTVALIDATION" value="validation">
+                      <select name="cboSelectDateValue"><option selected value="DATE_RECEIVED">Date Received</option></select>
+                      <input type="radio" name="rbGroup" value="rbRange">
+                      <input type="radio" name="rbGroup" value="rbNotApplicable" checked>
+                      <input name="dateStart"><input name="dateEnd">
+                      <input type="hidden" name="edrDateSelection" value="">
+                      <input type="submit" name="csbtnSearch" value="Search">
+                    </form>
+                    <a href="UserGuide.html">Example 15/0001</a>
+                    """,
+                )
+
+            def post_form(self, url: str, data: dict[str, str], headers=None) -> FetchResponse:
+                self.posts.append((url, data, headers))
+                return FetchResponse(
+                    url="https://planning.example.gov.uk/PlanningExplorer/Generic/StdResults.aspx?PS=10",
+                    status_code=200,
+                    text="""
+                    Records 1 to 1 of 2
+                    <a href="StdDetails.aspx?PT=Planning Applications On-Line&amp;TYPE=PL/PlanningPK.xml&amp;PARAM0=RU.26/0001">RU.26/0001</a>
+                    <a href="UserGuide.html">Example 15/0001</a>
+                    <a href="StdResults.aspx?PT=\n Planning Applications On-Line&amp;PS=\n 10&amp;XMLLoc=/results.xml&amp;p=\n 10">2</a>
+                    """,
+                )
+
+        http = FakeNorthgateHttpClient()
+        scraper = NorthgatePlanningScraper(
+            NorthgateCouncilConfig("Runnymede", "https://planning.example.gov.uk/PlanningExplorer"),
+            http_client=http,
+        )
+
+        discovery = scraper.discover_ids(
+            listing_url="https://planning.example.gov.uk/PlanningExplorer/GeneralSearch.aspx",
+            start_date=date(2026, 7, 6),
+            end_date=date(2026, 7, 12),
+        )
+
+        self.assertEqual([application.reference for application in discovery.applications], ["RU.26/0001", "RU.26/0019"])
+        self.assertTrue(all(application.date_received == "2026-07-06" for application in discovery.applications))
+        self.assertTrue(all(application.raw["date_inferred_from_search_window"] for application in discovery.applications))
+        self.assertEqual(http.posts[0][1]["dateStart"], "06/07/2026")
+        self.assertEqual(http.posts[0][1]["dateEnd"], "12/07/2026")
+        self.assertEqual(http.posts[0][1]["rbGroup"], "rbRange")
+        self.assertEqual(http.posts[0][2]["Origin"], "https://planning.example.gov.uk")
+        self.assertIn("p=10", http.gets[-1][0])
+        self.assertFalse(any("p=20" in url for url, _headers in http.gets))
+        self.assertEqual(http.gets[-1][1]["Referer"], discovery.source_url)
+        self.assertNotIn(" ", discovery.applications[0].url)
+
+        self.assertEqual(
+            scraper._date_format("<html><body>Dates use the format DD-MM-YYYY.</body></html>"),
+            "%d-%m-%Y",
+        )
 
 
 if __name__ == "__main__":

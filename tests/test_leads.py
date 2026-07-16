@@ -94,6 +94,19 @@ class LeadSearchTest(unittest.TestCase):
             self.assertTrue(properties["council_name"])
             self.assertTrue(properties["listing_url"])
 
+    def test_builtin_catalogue_uses_nuneatons_current_public_planning_portal(self) -> None:
+        catalogue = load_authority_catalogue(Path("src/lead_generator/planning/data/planning_authorities.geojson"))
+        properties = next(
+            feature["properties"] for feature in catalogue["features"] if feature["properties"]["authority"] == "Nuneaton"
+        )
+
+        self.assertEqual(properties["portal_family"], "tascomi")
+        self.assertEqual(properties["scraper_type"], "Tascomi")
+        self.assertEqual(
+            properties["listing_url"],
+            "https://idoxcloud.nuneatonandbedworth.gov.uk/planning/index.html?fa=search",
+        )
+
     def test_builtin_catalogue_includes_known_english_gap_authorities(self) -> None:
         catalogue = load_authority_catalogue(Path("src/lead_generator/planning/data/planning_authorities.geojson"))
         authorities = {feature["properties"]["authority"] for feature in catalogue["features"]}

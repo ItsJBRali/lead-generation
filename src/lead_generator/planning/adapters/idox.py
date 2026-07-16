@@ -8,9 +8,25 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 from lxml import html
 
 from lead_generator.planning.adapters.base import PlanningScraper
-from lead_generator.planning.http import CouncilFetchError, CouncilHttpClient, FetchResponse
+from lead_generator.planning.http import (
+    CouncilBrowserClient,
+    CouncilFetchError,
+    CouncilHttpClient,
+    FetchResponse,
+    browser_fallback_recommended,
+)
 from lead_generator.planning.models import DiscoveryResult, PlanningApplication, PlanningDocument
 from lead_generator.planning.parsing import clean_text, extract_postcode, normalize_label, parse_council_date
+
+
+IDOX_REFERENCE_RE = re.compile(
+    r"\b(?:"
+    r"[A-Z]{1,8}\d{2,4}/[A-Z0-9.-]+(?:/[A-Z0-9.-]+)*"
+    r"|[A-Z]{1,8}/\d{2,4}/[A-Z0-9.-]+(?:/[A-Z0-9.-]+)*"
+    r"|\d{2,4}/[A-Z0-9.-]+(?:/[A-Z0-9.-]+)*"
+    r")\b",
+    flags=re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +66,22 @@ class IdoxPublicAccessScraper(PlanningScraper):
         )
 
     def discover_ids(self, *, listing_url: str | None = None, start_date: date | None = None, end_date: date | None = None, limit: int | None = None) -> DiscoveryResult:
+        try:
+            return self._discover_ids(listing_url=listing_url, start_date=start_date, end_date=end_date, limit=limit)
+        except CouncilFetchError as exc:
+            if not browser_fallback_recommended(exc) or isinstance(self.http, CouncilBrowserClient):
+                raise
+            primary_error = exc
+            browser = CouncilBrowserClient()
+            self.http = browser
+            try:
+                return self._discover_ids(listing_url=listing_url, start_date=start_date, end_date=end_date, limit=limit)
+            except Exception as browser_error:
+                browser.close()
+                browser_error.add_note(f"Direct portal request also failed: {primary_error}")
+                raise
+
+    def _discover_ids(self, *, listing_url: str | None = None, start_date: date | None = None, end_date: date | None = None, limit: int | None = None) -> DiscoveryResult:
         if listing_url and (start_date or end_date):
             response = self._fetch_advanced_search(listing_url, start_date=start_date, end_date=end_date)
         elif listing_url:
@@ -329,7 +361,7 @@ class IdoxPublicAccessScraper(PlanningScraper):
     def _extract_reference(self, anchor: html.HtmlElement, row_text: str | None) -> str | None:
         for value in (clean_text(" ".join(anchor.itertext())), row_text):
             if value:
-                match = re.search(r"\b\d{2,4}[/.-][A-Z0-9/.-]+\b", value, flags=re.IGNORECASE)
+                match = IDOX_REFERENCE_RE.search(value)
                 if match:
                     return match.group(0)
         return clean_text(" ".join(anchor.itertext()))
