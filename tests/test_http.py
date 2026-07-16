@@ -7,6 +7,7 @@ from urllib.error import URLError
 
 import pytest
 
+import lead_generator.planning.http as planning_http
 from lead_generator.planning.http import CouncilFetchError, CouncilHttpClient, monitor_council_requests
 
 
@@ -182,6 +183,39 @@ def test_http_client_rejects_waf_placeholder_pages() -> None:
 
     with pytest.raises(CouncilFetchError, match="web application firewall"):
         client.get("https://planning.example.gov.uk/search")
+
+
+def test_browser_client_falls_back_from_chrome_to_edge(monkeypatch) -> None:
+    configured: list[tuple[str, str]] = []
+
+    class FakeOptions:
+        def add_argument(self, argument: str) -> None:
+            configured.append(("argument", argument))
+
+        def add_experimental_option(self, name: str, value: object) -> None:
+            configured.append((name, str(value)))
+
+    class FakeDriver:
+        def execute_cdp_cmd(self, command: str, payload: object) -> None:
+            configured.append(("cdp", command))
+
+    def broken_chrome(*, options):
+        raise planning_http.WebDriverException("Chrome unavailable")
+
+    def working_edge(*, options):
+        configured.append(("driver", "edge"))
+        return FakeDriver()
+
+    monkeypatch.setattr(planning_http, "ChromeOptions", FakeOptions)
+    monkeypatch.setattr(planning_http, "ChromeWebDriver", broken_chrome)
+    monkeypatch.setattr(planning_http, "EdgeOptions", FakeOptions)
+    monkeypatch.setattr(planning_http, "EdgeWebDriver", working_edge)
+
+    driver = planning_http.CouncilBrowserClient()._create_driver()
+
+    assert isinstance(driver, FakeDriver)
+    assert ("driver", "edge") in configured
+    assert ("argument", "--disable-blink-features=AutomationControlled") in configured
 
 
 def test_http_client_retries_empty_responses_before_returning_content() -> None:

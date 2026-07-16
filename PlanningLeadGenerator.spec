@@ -1,12 +1,21 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+SELENIUM_BROWSER_IMPORTS = [
+    'selenium.webdriver.chrome.options',
+    'selenium.webdriver.chrome.service',
+    'selenium.webdriver.chrome.webdriver',
+    'selenium.webdriver.edge.options',
+    'selenium.webdriver.edge.service',
+    'selenium.webdriver.edge.webdriver',
+]
+
 
 a = Analysis(
     ['src\\lead_generator\\planning\\gui.py'],
     pathex=['src'],
     binaries=[],
     datas=[('src\\lead_generator\\planning\\data\\planning_authorities.geojson', 'lead_generator\\planning\\data')],
-    hiddenimports=[],
+    hiddenimports=SELENIUM_BROWSER_IMPORTS,
     hookspath=['tools\\pyinstaller_hooks'],
     hooksconfig={},
     runtime_hooks=[],

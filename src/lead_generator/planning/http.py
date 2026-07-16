@@ -20,13 +20,19 @@ from urllib.request import (
 )
 
 try:
-    from selenium import webdriver
     from selenium.common.exceptions import WebDriverException
+    from selenium.webdriver.chrome.options import Options as ChromeOptions
+    from selenium.webdriver.chrome.webdriver import WebDriver as ChromeWebDriver
     from selenium.webdriver.common.by import By
+    from selenium.webdriver.edge.options import Options as EdgeOptions
+    from selenium.webdriver.edge.webdriver import WebDriver as EdgeWebDriver
     from selenium.webdriver.support import expected_conditions as selenium_conditions
     from selenium.webdriver.support.ui import WebDriverWait
 except ImportError:  # pragma: no cover - optional outside the packaged GUI
-    webdriver = None
+    ChromeOptions = None
+    ChromeWebDriver = None
+    EdgeOptions = None
+    EdgeWebDriver = None
     WebDriverException = Exception
     By = None
     selenium_conditions = None
@@ -517,7 +523,7 @@ class CouncilBrowserClient:
     def _ensure_driver(self):
         if self._driver is not None:
             return self._driver
-        if webdriver is None:
+        if ChromeOptions is None or ChromeWebDriver is None:
             raise CouncilFetchError("Browser fallback is unavailable because Selenium is not installed")
         while not _BROWSER_FALLBACK_GATE.acquire(timeout=0.25):
             _raise_if_request_cancelled()
@@ -533,15 +539,17 @@ class CouncilBrowserClient:
             raise CouncilFetchError(f"Could not start the council browser fallback: {exc}") from exc
 
     def _create_driver(self):
-        chrome_options = webdriver.ChromeOptions()
+        chrome_options = ChromeOptions()
         self._configure_options(chrome_options)
         try:
-            driver = webdriver.Chrome(options=chrome_options)
+            driver = ChromeWebDriver(options=chrome_options)
         except WebDriverException as chrome_error:
-            edge_options = webdriver.EdgeOptions()
+            if EdgeOptions is None or EdgeWebDriver is None:
+                raise CouncilFetchError(f"Chrome could not start ({chrome_error})") from chrome_error
+            edge_options = EdgeOptions()
             self._configure_options(edge_options)
             try:
-                driver = webdriver.Edge(options=edge_options)
+                driver = EdgeWebDriver(options=edge_options)
             except WebDriverException as edge_error:
                 raise CouncilFetchError(
                     f"Chrome could not start ({chrome_error}); Edge could not start ({edge_error})"
