@@ -29,6 +29,7 @@ from lead_generator.planning.leads import (
     document_filename,
     document_download_candidates,
     discover_portal_applications,
+    discover_portal_applications_with_deadline,
     download_document_bytes,
     download_pdf_documents,
     enrich_planit_application,
@@ -46,6 +47,7 @@ from lead_generator.planning.leads import (
     select_overlapping_authorities,
 )
 from lead_generator.planning.models import PlanningApplication, PlanningDocument
+from lead_generator.planning.http import CouncilHttpClient
 
 
 def polygon_feature(name: str, xmin: float, ymin: float, xmax: float, ymax: float) -> dict[str, object]:
@@ -1368,7 +1370,7 @@ class LeadSearchTest(unittest.TestCase):
 
             try:
                 with (
-                    patch("lead_generator.planning.leads.COUNCIL_SEARCH_ATTEMPT_TIMEOUT_SECONDS", 0.08),
+                    patch("lead_generator.planning.leads.COUNCIL_SEARCH_INACTIVITY_TIMEOUT_SECONDS", 0.08),
                     patch("lead_generator.planning.leads.COUNCIL_SEARCH_HEARTBEAT_SECONDS", 0.02),
                     patch("lead_generator.planning.leads.search_worker_start_delay", return_value=0),
                     patch(
@@ -1395,6 +1397,66 @@ class LeadSearchTest(unittest.TestCase):
             )
             self.assertLess(deferred_index, working_index)
             self.assertLess(working_index, retry_index)
+
+    def test_council_deadline_allows_active_requests_past_inactivity_limit(self) -> None:
+        class FakeHeaders:
+            def get_content_charset(self):
+                return "utf-8"
+
+        class FakeResponse:
+            headers = FakeHeaders()
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def geturl(self):
+                return "https://planning.example.gov.uk/search"
+
+            def read(self):
+                return b"<html>active</html>"
+
+        class FakeOpener:
+            def open(self, request, timeout):
+                return FakeResponse()
+
+        class ActiveClient(CouncilHttpClient):
+            def _opener(self):
+                return FakeOpener()
+
+        target = CouncilTarget(
+            authority="Active Council",
+            portal_family="idox",
+            scraper_type="Idox",
+            base_url="https://planning.example.gov.uk",
+            listing_url="https://planning.example.gov.uk/search",
+            geometry={},
+        )
+        client = ActiveClient(min_delay_seconds=0)
+
+        def active_discover(*args, **kwargs):
+            for _ in range(5):
+                client.get("https://planning.example.gov.uk/search")
+                threading.Event().wait(0.03)
+            return []
+
+        with patch(
+            "lead_generator.planning.leads.discover_portal_applications",
+            side_effect=active_discover,
+        ):
+            applications = discover_portal_applications_with_deadline(
+                target,
+                date(2026, 7, 6),
+                date(2026, 7, 12),
+                timeout_seconds=0.05,
+                max_elapsed_seconds=1.0,
+                heartbeat_seconds=0.02,
+            )
+
+        self.assertEqual(applications, [])
 
     def test_run_lead_search_caps_configured_worker_count_at_eight(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

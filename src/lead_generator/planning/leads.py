@@ -60,6 +60,7 @@ from lead_generator.planning.adapters import (
 from lead_generator.planning.adapters.civica import fetch_civica_documents_from_raw
 from lead_generator.planning.adapters.generic import GenericCouncilConfig, GenericLabelledPlanningScraper
 from lead_generator.planning.models import PlanningApplication, PlanningDocument
+from lead_generator.planning.http import monitor_council_requests
 from lead_generator.planning.parsing import clean_text
 from lead_generator.planning.scheduler import (
     PlatformAwareScheduler,
@@ -161,7 +162,8 @@ PLATFORM_RECOVERY_SUCCESS_COUNT = 4
 SEARCH_WORKER_STAGGER_BASE_SECONDS = 0.5
 SEARCH_WORKER_STAGGER_INCREMENT_SECONDS = 0.15
 SEARCH_WORKER_STAGGER_MAX_SECONDS = 1.5
-COUNCIL_SEARCH_ATTEMPT_TIMEOUT_SECONDS = 240.0
+COUNCIL_SEARCH_INACTIVITY_TIMEOUT_SECONDS = 120.0
+COUNCIL_SEARCH_MAX_ELAPSED_SECONDS = 1200.0
 COUNCIL_SEARCH_HEARTBEAT_SECONDS = 30.0
 DOCUMENT_DOWNLOAD_DELAY_SECONDS = 0.0
 RATE_LIMIT_HTTP_CODES = {429, 503}
@@ -414,7 +416,8 @@ def discover_portal_applications_with_deadline(
     start_date: date,
     end_date: date,
     *,
-    timeout_seconds: float = COUNCIL_SEARCH_ATTEMPT_TIMEOUT_SECONDS,
+    timeout_seconds: float = COUNCIL_SEARCH_INACTIVITY_TIMEOUT_SECONDS,
+    max_elapsed_seconds: float = COUNCIL_SEARCH_MAX_ELAPSED_SECONDS,
     heartbeat_seconds: float = COUNCIL_SEARCH_HEARTBEAT_SECONDS,
     log: LogCallback | None = None,
     should_cancel: CancelCallback | None = None,
@@ -422,15 +425,28 @@ def discover_portal_applications_with_deadline(
     """Run one council search without allowing a stuck adapter to block the queue."""
 
     outcome: Queue[tuple[list[PlanningApplication] | None, Exception | None]] = Queue(maxsize=1)
+    activity_lock = threading.Lock()
+    attempt_cancelled = threading.Event()
+    started_at = monotonic()
+    last_activity_at = started_at
+
+    def record_activity() -> None:
+        nonlocal last_activity_at
+        with activity_lock:
+            last_activity_at = monotonic()
 
     def discover() -> None:
         try:
-            outcome.put(
-                (
-                    discover_portal_applications(target, start_date, end_date),
-                    None,
+            with monitor_council_requests(
+                record_activity,
+                should_cancel=attempt_cancelled.is_set,
+            ):
+                outcome.put(
+                    (
+                        discover_portal_applications(target, start_date, end_date),
+                        None,
+                    )
                 )
-            )
         except Exception as exc:  # pragma: no cover - forwarded to the search worker
             outcome.put((None, exc))
 
@@ -441,37 +457,55 @@ def discover_portal_applications_with_deadline(
     )
     attempt.start()
 
-    started_at = monotonic()
-    deadline = started_at + max(timeout_seconds, 0.01)
+    inactivity_limit = max(timeout_seconds, 0.01)
+    maximum_elapsed = max(max_elapsed_seconds, inactivity_limit)
     next_heartbeat = started_at + max(heartbeat_seconds, 0.01)
-    while True:
-        now = monotonic()
-        remaining = deadline - now
-        if remaining <= 0:
-            raise CouncilSearchTimeoutError(
-                f"{target.authority} search exceeded the {timeout_seconds:.0f}-second attempt limit"
-            )
-        try:
-            heartbeat_wait = max(next_heartbeat - now, 0.01)
-            applications, error = outcome.get(
-                timeout=min(remaining, heartbeat_wait, 0.25)
-            )
-        except Empty:
-            if should_cancel and should_cancel():
-                raise CouncilSearchCancelledError(f"Cancelled while searching {target.authority}")
+    try:
+        while True:
             now = monotonic()
-            if log and now >= next_heartbeat:
-                elapsed = int(now - started_at)
-                _log(
-                    log,
-                    f"{target.authority}: still searching ({elapsed}s elapsed; "
-                    f"attempt limit {timeout_seconds:.0f}s)",
+            with activity_lock:
+                activity_at = last_activity_at
+            inactive_for = now - activity_at
+            elapsed = now - started_at
+            if inactive_for >= inactivity_limit:
+                raise CouncilSearchTimeoutError(
+                    f"{target.authority} search made no request progress for "
+                    f"{timeout_seconds:.0f} seconds"
                 )
-                next_heartbeat = now + max(heartbeat_seconds, 0.01)
-            continue
-        if error is not None:
-            raise error
-        return applications or []
+            if elapsed >= maximum_elapsed:
+                raise CouncilSearchTimeoutError(
+                    f"{target.authority} search exceeded the "
+                    f"{max_elapsed_seconds:.0f}-second safety limit"
+                )
+            try:
+                heartbeat_wait = max(next_heartbeat - now, 0.01)
+                applications, error = outcome.get(
+                    timeout=min(
+                        inactivity_limit - inactive_for,
+                        maximum_elapsed - elapsed,
+                        heartbeat_wait,
+                        0.25,
+                    )
+                )
+            except Empty:
+                if should_cancel and should_cancel():
+                    raise CouncilSearchCancelledError(f"Cancelled while searching {target.authority}")
+                now = monotonic()
+                if log and now >= next_heartbeat:
+                    with activity_lock:
+                        inactive_for = max(now - last_activity_at, 0.0)
+                    _log(
+                        log,
+                        f"{target.authority}: still searching ({int(now - started_at)}s elapsed; "
+                        f"last request activity {int(inactive_for)}s ago)",
+                    )
+                    next_heartbeat = now + max(heartbeat_seconds, 0.01)
+                continue
+            if error is not None:
+                raise error
+            return applications or []
+    finally:
+        attempt_cancelled.set()
 
 
 def run_lead_search(
@@ -651,7 +685,8 @@ def run_lead_search(
                     target,
                     config.start_date,
                     config.end_date,
-                    timeout_seconds=COUNCIL_SEARCH_ATTEMPT_TIMEOUT_SECONDS,
+                    timeout_seconds=COUNCIL_SEARCH_INACTIVITY_TIMEOUT_SECONDS,
+                    max_elapsed_seconds=COUNCIL_SEARCH_MAX_ELAPSED_SECONDS,
                     heartbeat_seconds=COUNCIL_SEARCH_HEARTBEAT_SECONDS,
                     log=log,
                     should_cancel=cancellation_requested,

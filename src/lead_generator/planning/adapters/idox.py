@@ -98,10 +98,19 @@ class IdoxPublicAccessScraper(PlanningScraper):
             seen.add(uid)
             row_text = self._nearest_row_text(anchor)
             reference = self._extract_reference(anchor, row_text)
+            result_item = self._result_item(anchor)
+            description = self._listing_description(anchor, result_item, reference)
+            address = self._class_text(result_item, "address") or self._extract_address(row_text, reference)
+            status = self._status_text(result_item)
+            date_received = self._listing_date(result_item, "Received")
+            date_validated = self._listing_date(result_item, "Validated")
+            detail_complete = bool(description and address and (date_received or date_validated))
             applications.append(PlanningApplication(
                 authority=self.authority, uid=uid, url=self._summary_url(page_url, uid),
-                reference=reference, address=self._extract_address(row_text, reference),
-                source_url=page_url, raw={"listing_text": row_text} if row_text else {},
+                reference=reference, address=address, description=description, status=status,
+                date_received=date_received, date_validated=date_validated,
+                postcode=extract_postcode(address), source_url=page_url,
+                raw={"listing_text": row_text, "detail_complete": detail_complete} if row_text else {},
             ))
         if len(applications) == 1 and self._looks_like_application_summary(document):
             detail = self.parse_detail(html_text, page_url, fallback_uid=applications[0].uid)
@@ -330,6 +339,61 @@ class IdoxPublicAccessScraper(PlanningScraper):
             return None
         text = row_text.replace(reference, " ") if reference else row_text
         return clean_text(re.sub(r"\b(Application|Reference|Validated|Received|Status)\b:?", " ", text, flags=re.IGNORECASE))
+
+    def _result_item(self, anchor: html.HtmlElement) -> html.HtmlElement | None:
+        items = anchor.xpath(
+            "ancestor::li[contains(concat(' ', normalize-space(@class), ' '), ' searchresult ')][1] "
+            "| ancestor::article[1] "
+            "| ancestor::div[contains(concat(' ', normalize-space(@class), ' '), ' searchresult ')][1]"
+        )
+        return items[0] if items else None
+
+    def _class_text(self, container: html.HtmlElement | None, class_name: str) -> str | None:
+        if container is None:
+            return None
+        nodes = container.xpath(
+            f".//*[contains(concat(' ', normalize-space(@class), ' '), ' {class_name} ')]"
+        )
+        if not nodes:
+            return None
+        return clean_text(" ".join(nodes[0].itertext()))
+
+    def _listing_description(
+        self,
+        anchor: html.HtmlElement,
+        container: html.HtmlElement | None,
+        reference: str | None,
+    ) -> str | None:
+        description = self._class_text(container, "summaryLinkTextClamp")
+        if description:
+            return description
+        anchor_text = clean_text(" ".join(anchor.itertext()))
+        if not anchor_text or anchor_text == reference:
+            return None
+        return anchor_text
+
+    def _status_text(self, container: html.HtmlElement | None) -> str | None:
+        if container is None:
+            return None
+        nodes = container.xpath(
+            ".//*[contains(concat(' ', normalize-space(@class), ' '), ' badge-status ')]"
+            "//*[contains(concat(' ', normalize-space(@class), ' '), ' value ')]"
+        )
+        return clean_text(" ".join(nodes[0].itertext())) if nodes else None
+
+    def _listing_date(self, container: html.HtmlElement | None, label: str) -> str | None:
+        meta_text = self._class_text(container, "metaInfo")
+        if not meta_text:
+            return None
+        match = re.search(
+            rf"\b{re.escape(label)}\s*:\s*("
+            r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+\d{1,2}\s+\w+\s+\d{4}"
+            r"|\d{1,2}[/-]\d{1,2}[/-]\d{4}"
+            r")",
+            meta_text,
+            flags=re.IGNORECASE,
+        )
+        return parse_council_date(match.group(1)) if match else None
 
     def _extract_labelled_fields(self, document: html.HtmlElement) -> dict[str, str]:
         fields: dict[str, str] = {}

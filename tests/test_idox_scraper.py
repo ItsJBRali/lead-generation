@@ -112,6 +112,67 @@ class IdoxPublicAccessScraperTest(unittest.TestCase):
         self.assertIn("12 High Street", result[0].address or "")
         self.assertEqual(result[1].uid, "DEF456XYZ")
 
+    def test_parse_listing_uses_complete_standard_idox_result_fields(self) -> None:
+        listing_html = """
+        <html><body><ul>
+          <li class="searchresult">
+            <div class="badges">
+              <div class="badge-status"><div class="label">Status:</div><div class="value">Pending Consideration</div></div>
+            </div>
+            <a class="summaryLink" href="/online-applications/applicationDetails.do?keyVal=ABC123XYZ&amp;activeTab=summary">
+              <div class="summaryLinkTextClamp">Installation of new entrance gates and boundary treatment</div>
+            </a>
+            <p class="address">12 High Street, Bristol, BS1 4ST</p>
+            <p class="metaInfo">
+              Ref. No: 26/01234/FUL
+              <span class="divider">|</span> Received: Fri 10 Jul 2026
+              <span class="divider">|</span> Validated: Mon 13 Jul 2026
+            </p>
+          </li>
+        </ul></body></html>
+        """
+
+        result = self.scraper.parse_listing(
+            listing_html,
+            "https://planning.example.gov.uk/online-applications/advancedSearchResults.do?action=firstPage",
+        )
+
+        self.assertEqual(len(result), 1)
+        application = result[0]
+        self.assertEqual(application.reference, "26/01234/FUL")
+        self.assertEqual(application.description, "Installation of new entrance gates and boundary treatment")
+        self.assertEqual(application.address, "12 High Street, Bristol, BS1 4ST")
+        self.assertEqual(application.status, "Pending Consideration")
+        self.assertEqual(application.date_received, "2026-07-10")
+        self.assertEqual(application.date_validated, "2026-07-13")
+        self.assertEqual(application.postcode, "BS1 4ST")
+        self.assertTrue(application.raw["detail_complete"])
+
+    def test_parse_listing_uses_legacy_idox_link_text_as_description(self) -> None:
+        listing_html = """
+        <html><body><ul>
+          <li class="searchresult">
+            <a href="/online-applications/applicationDetails.do?keyVal=ABC123XYZ&amp;activeTab=summary">
+              Installation of new sliding entrance gates
+            </a>
+            <p class="address">17 Kings Ride, Tylers Green, HP10 8BJ</p>
+            <p class="metaInfo">
+              Ref. No: 26/05555/FUL <span class="divider">|</span>
+              Validated: Fri 10 Jul 2026 <span class="divider">|</span> Status: Registered
+            </p>
+          </li>
+        </ul></body></html>
+        """
+
+        application = self.scraper.parse_listing(
+            listing_html,
+            "https://planning.example.gov.uk/online-applications/advancedSearchResults.do?action=firstPage",
+        )[0]
+
+        self.assertEqual(application.description, "Installation of new sliding entrance gates")
+        self.assertEqual(application.date_validated, "2026-07-10")
+        self.assertTrue(application.raw["detail_complete"])
+
     def test_parse_detail_maps_fields_dates_and_postcode(self) -> None:
         summary_html = (FIXTURES / "idox_summary.html").read_text(encoding="utf-8")
         application = self.scraper.parse_detail(summary_html, "https://planning.example.gov.uk/online-applications/applicationDetails.do?activeTab=summary&keyVal=ABC123XYZ")

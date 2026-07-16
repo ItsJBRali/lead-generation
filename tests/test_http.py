@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import ssl
 import threading
+from time import monotonic
 from urllib.error import URLError
 
 import pytest
 
-from lead_generator.planning.http import CouncilFetchError, CouncilHttpClient
+from lead_generator.planning.http import CouncilFetchError, CouncilHttpClient, monitor_council_requests
 
 
 class FakeHeaders:
@@ -62,6 +63,42 @@ def test_http_client_uses_browser_like_user_agent_by_default() -> None:
 
     assert client.user_agent.startswith("Mozilla/5.0")
     assert "Chrome/" in client.user_agent
+
+
+def test_http_request_monitor_reports_activity() -> None:
+    class FakeOpener:
+        def open(self, request, timeout):
+            return FakeResponse()
+
+    class FakeClient(CouncilHttpClient):
+        def _opener(self):
+            return FakeOpener()
+
+    activity: list[float] = []
+    client = FakeClient(min_delay_seconds=0)
+
+    with monitor_council_requests(lambda: activity.append(monotonic())):
+        client.get("https://planning.example.gov.uk/search")
+
+    assert len(activity) >= 3
+
+
+def test_http_request_monitor_cancels_abandoned_request() -> None:
+    class UnexpectedOpener:
+        def open(self, request, timeout):
+            raise AssertionError("Cancelled request should not reach the network")
+
+    class FakeClient(CouncilHttpClient):
+        def _opener(self):
+            return UnexpectedOpener()
+
+    client = FakeClient(min_delay_seconds=0)
+
+    with (
+        monitor_council_requests(lambda: None, should_cancel=lambda: True),
+        pytest.raises(CouncilFetchError, match="cancelled"),
+    ):
+        client.get("https://planning.example.gov.uk/search")
 
 
 def test_http_client_retries_with_tls_compat_after_connection_reset() -> None:

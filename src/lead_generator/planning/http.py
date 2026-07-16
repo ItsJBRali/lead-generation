@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from http.cookiejar import CookieJar
 from dataclasses import dataclass
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import json
 import re
 import ssl
@@ -34,6 +34,61 @@ class FetchResponse:
     url: str
     status_code: int
     text: str
+
+
+_REQUEST_MONITOR = threading.local()
+
+
+@contextmanager
+def monitor_council_requests(
+    on_activity,
+    *,
+    should_cancel=None,
+):
+    """Report HTTP progress and allow an abandoned council search to stop cleanly."""
+
+    previous = getattr(_REQUEST_MONITOR, "state", None)
+    _REQUEST_MONITOR.state = (on_activity, should_cancel)
+    try:
+        yield
+    finally:
+        if previous is None:
+            try:
+                del _REQUEST_MONITOR.state
+            except AttributeError:
+                pass
+        else:
+            _REQUEST_MONITOR.state = previous
+
+
+def _report_request_activity() -> None:
+    state = getattr(_REQUEST_MONITOR, "state", None)
+    if not state or not state[0]:
+        return
+    try:
+        state[0]()
+    except Exception:
+        pass
+
+
+def _request_cancelled() -> bool:
+    state = getattr(_REQUEST_MONITOR, "state", None)
+    return bool(state and state[1] and state[1]())
+
+
+def _raise_if_request_cancelled() -> None:
+    if _request_cancelled():
+        raise CouncilFetchError("Council search request was cancelled")
+
+
+def _interruptible_sleep(seconds: float) -> None:
+    deadline = monotonic() + max(seconds, 0.0)
+    while True:
+        _raise_if_request_cancelled()
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return
+        sleep(min(remaining, 0.25))
 
 
 class CouncilHttpClient:
@@ -131,14 +186,20 @@ class CouncilHttpClient:
     def _send(self, request: Request, url: str) -> FetchResponse:
         last_error: Exception | None = None
         for attempt in range(self.retries + 1):
+            _raise_if_request_cancelled()
+            _report_request_activity()
             try:
                 with self._request_slot():
+                    _raise_if_request_cancelled()
                     self._wait_for_turn(url)
+                    _raise_if_request_cancelled()
+                    _report_request_activity()
                     with self._opener().open(request, timeout=self.timeout_seconds) as response:
                         charset = response.headers.get_content_charset() or "utf-8"
                         body = response.read().decode(charset, errors="replace")
                         status_code = getattr(response, "status", 200)
                         response_url = response.geturl()
+                _report_request_activity()
                 if not body.strip():
                     last_error = CouncilFetchError(f"Empty response while fetching {url}")
                     if attempt == self.retries:
@@ -187,7 +248,8 @@ class CouncilHttpClient:
             )
             self._shared_last_request_at[key] = next_allowed
         if next_allowed > now:
-            sleep(next_allowed - now)
+            _interruptible_sleep(next_allowed - now)
+        _report_request_activity()
 
     def _pause_before_retry(
         self,
@@ -202,7 +264,8 @@ class CouncilHttpClient:
         key = self._throttle_key(url)
         with self._rate_limit_lock:
             self._blocked_until[key] = max(self._blocked_until.get(key, 0.0), monotonic() + delay)
-        sleep(delay)
+        _interruptible_sleep(delay)
+        _report_request_activity()
 
     def _throttle_key(self, url: str | None = None) -> str:
         if self.rate_limit_key:
@@ -222,7 +285,16 @@ class CouncilHttpClient:
             if gate is None:
                 gate = threading.BoundedSemaphore(self.concurrency_limit)
                 self._concurrency_gates[gate_key] = gate
-        return gate
+        return self._cancellable_request_slot(gate)
+
+    @contextmanager
+    def _cancellable_request_slot(self, gate):
+        while not gate.acquire(timeout=0.25):
+            _raise_if_request_cancelled()
+        try:
+            yield
+        finally:
+            gate.release()
 
     def _ssl_context(self) -> ssl.SSLContext | None:
         if self.verify_tls and not self.ca_file and certifi is None:
