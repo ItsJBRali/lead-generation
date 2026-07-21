@@ -80,6 +80,19 @@ def test_enrichment_progress_shows_application_count() -> None:
     assert label.text == "3 of 8 applications enriched"
 
 
+def test_document_progress_shows_application_count() -> None:
+    label = FakeLabel()
+
+    LeadGeneratorApp._set_document_progress(
+        SimpleNamespace(enrichment_label=label),
+        3,
+        8,
+        requested=True,
+    )
+
+    assert label.text == "3 of 8 applications downloaded"
+
+
 def test_enrichment_progress_explains_when_not_requested() -> None:
     label = FakeLabel()
 

@@ -158,6 +158,7 @@ EXCLUDED_PROPOSAL_PREFIXES = (
 LogCallback = Callable[[str], None]
 ProgressCallback = Callable[[int, int], None]
 CapturedCallback = Callable[[int], None]
+DocumentProgressCallback = Callable[[int, int], None]
 EnrichmentProgressCallback = Callable[[int, int], None]
 CancelCallback = Callable[[], bool]
 
@@ -192,7 +193,8 @@ COUNCIL_SEARCH_MAX_ELAPSED_SECONDS = 1200.0
 COUNCIL_SEARCH_HEARTBEAT_SECONDS = 30.0
 DOCUMENT_DOWNLOAD_DELAY_SECONDS = 0.0
 DOCUMENT_DOWNLOAD_RETRY_DELAY_SECONDS = 10.0
-DOCUMENT_DOWNLOAD_ATTEMPTS = 5
+DOCUMENT_DOWNLOAD_ATTEMPTS = 2
+DOCUMENT_DOWNLOAD_MAX_RETRY_DELAY_SECONDS = 15.0
 MAX_CONCURRENT_DOCUMENT_BATCHES = 2
 RATE_LIMIT_HTTP_CODES = {429, 503}
 MAX_RETRY_AFTER_SECONDS = 60.0
@@ -441,6 +443,23 @@ class DownloadedFile:
 
 
 @dataclass(slots=True)
+class DocumentDownloadBatchResult:
+    downloaded_count: int = 0
+    transient_documents: list[PlanningDocument] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class DocumentDownloadJob:
+    reference: str
+    council: str
+    application: PlanningApplication
+    folder: Path
+    row: dict[str, str]
+    pending_documents: list[PlanningDocument] = field(default_factory=list)
+    downloaded_count: int = 0
+
+
+@dataclass(slots=True)
 class EnrichmentJob:
     reference: str
     folder: Path
@@ -460,6 +479,10 @@ class CouncilSearchTimeoutError(RuntimeError):
 
 class CouncilSearchCancelledError(RuntimeError):
     """A council search was abandoned after the user cancelled the run."""
+
+
+class DocumentDownloadCancelledError(RuntimeError):
+    """A document download was abandoned after the user cancelled the run."""
 
 
 def parse_keywords(text: str) -> list[str]:
@@ -580,6 +603,7 @@ def run_lead_search(
     log: LogCallback | None = None,
     progress: ProgressCallback | None = None,
     captured: CapturedCallback | None = None,
+    document_progress: DocumentProgressCallback | None = None,
     enrichment_progress: EnrichmentProgressCallback | None = None,
     should_cancel: CancelCallback | None = None,
 ) -> LeadSearchResult:
@@ -597,6 +621,7 @@ def run_lead_search(
     initialise_csv(failure_csv_path, FAILURE_CSV_FIELDS)
 
     rows: list[dict[str, str]] = []
+    document_jobs: list[DocumentDownloadJob] = []
     enrichment_jobs: list[EnrichmentJob] = []
     saved_references: set[str] = set()
     total_applications = 0
@@ -606,6 +631,7 @@ def run_lead_search(
     had_error = False
     cancelled = False
     completed = 0
+    documents_completed = 0
     feature_count = len(user_geojson.get("features", []))
     _log(log, f"Read {feature_count} user GeoJSON features from {config.geojson_path.name}")
     _log(log, f"Selected {len(targets)} overlapping planning authorities")
@@ -618,7 +644,9 @@ def run_lead_search(
     completed_authorities: set[str] = set()
     counted_authorities: set[str] = set()
     captured_document_references: set[str] = set()
+    completed_document_references: set[str] = set()
     deferred_tasks: list[ScheduledTask[CouncilTarget]] = []
+    deferred_document_jobs: list[DocumentDownloadJob] = []
     scheduler = PlatformAwareScheduler[CouncilTarget](
         platform_limits=PLATFORM_CONCURRENCY_LIMITS,
         default_platform_limit=DEFAULT_PLATFORM_CONCURRENCY_LIMIT,
@@ -653,10 +681,16 @@ def run_lead_search(
             saved_references.add(reference)
         return True
 
-    def save_row(row: dict[str, str], enrichment_job: EnrichmentJob | None = None) -> None:
+    def save_row(
+        row: dict[str, str],
+        enrichment_job: EnrichmentJob | None = None,
+        document_job: DocumentDownloadJob | None = None,
+    ) -> None:
         current = 0
         with lock:
             rows.append(row)
+            if document_job:
+                document_jobs.append(document_job)
             if enrichment_job:
                 enrichment_jobs.append(enrichment_job)
             append_csv_row(csv_path, APPLICATION_CSV_FIELDS, row)
@@ -678,6 +712,16 @@ def run_lead_search(
                 return
             captured_document_references.add(reference)
             captured_documents += 1
+
+    def mark_document_complete(job: DocumentDownloadJob, total: int) -> None:
+        nonlocal documents_completed
+        with lock:
+            if job.reference in completed_document_references:
+                return
+            completed_document_references.add(job.reference)
+            documents_completed += 1
+            current = documents_completed
+        _document_progress(document_progress, current, total)
 
     def add_no_application_council(target: CouncilTarget) -> None:
         with lock:
@@ -779,14 +823,9 @@ def run_lead_search(
                         continue
                     matched_count += 1
                     if config.download_application_files:
-                        application = enrich_application_documents(application)
                         lead_folder = create_lead_folder(output_dir, target.authority, application)
-                        downloaded_count = download_pdf_documents(application.documents, lead_folder, log=log)
                     else:
                         lead_folder = None
-                        downloaded_count = 0
-                    if config.download_application_files and downloaded_count:
-                        add_captured_document_application(reference)
                     row = {
                         "Reference": reference,
                         "address": application.address or "",
@@ -806,9 +845,22 @@ def run_lead_search(
                             agent_name=application.agent_name,
                             site_address=application.address,
                         )
-                    save_row(row, enrichment_job)
+                    document_job = None
+                    if lead_folder is not None:
+                        document_job = DocumentDownloadJob(
+                            reference=reference,
+                            council=target.authority,
+                            application=application,
+                            folder=lead_folder,
+                            row=row,
+                        )
+                    save_row(row, enrichment_job, document_job)
                     if config.download_application_files:
-                        _log(log, f"{target.authority}: saved {application.reference or application.uid} ({downloaded_count} documents downloaded)")
+                        _log(
+                            log,
+                            f"{target.authority}: saved {application.reference or application.uid} "
+                            "(documents queued)",
+                        )
                     else:
                         _log(log, f"{target.authority}: saved {application.reference or application.uid} (file downloads not requested)")
                 _log(log, f"{target.authority}: {matched_count} applications matched keywords and location")
@@ -868,6 +920,105 @@ def run_lead_search(
                 )
             mark_complete(target)
 
+    def process_document_job(
+        job: DocumentDownloadJob,
+        *,
+        final_attempt: bool,
+        total: int,
+    ) -> None:
+        if cancellation_requested():
+            return
+        try:
+            if not job.pending_documents:
+                job.application = enrich_application_documents(job.application)
+                job.pending_documents = list(job.application.documents)
+            if not job.pending_documents:
+                _log(log, f"{job.reference}: no downloadable documents were listed")
+                mark_document_complete(job, total)
+                return
+
+            result = _download_pdf_documents_once(
+                job.pending_documents,
+                job.folder,
+                log=lambda message: _log(log, f"{job.reference}: {message}"),
+                should_cancel=cancellation_requested,
+                defer_transient=not final_attempt,
+            )
+            job.downloaded_count += result.downloaded_count
+            if job.downloaded_count:
+                add_captured_document_application(job.reference)
+            if cancellation_requested():
+                return
+            job.pending_documents = result.transient_documents
+            if job.pending_documents and not final_attempt:
+                with lock:
+                    deferred_document_jobs.append(job)
+                _log(
+                    log,
+                    f"{job.reference}: deferred {len(job.pending_documents)} temporary "
+                    "document failure(s) until the end of the download queue",
+                )
+                return
+        except Exception as exc:  # pragma: no cover - live document portals vary
+            if not final_attempt and not cancellation_requested():
+                with lock:
+                    deferred_document_jobs.append(job)
+                _log(
+                    log,
+                    f"{job.reference}: document discovery deferred until the end of the "
+                    f"download queue: {exc}",
+                )
+                return
+            _log(log, f"{job.reference}: document download failed: {exc}")
+
+        _log(
+            log,
+            f"{job.council}: {job.reference} document processing complete "
+            f"({job.downloaded_count} downloaded)",
+        )
+        mark_document_complete(job, total)
+
+    def run_document_phase(
+        phase_jobs: list[DocumentDownloadJob],
+        *,
+        final_attempt: bool,
+        total: int,
+    ) -> None:
+        pending: Queue[DocumentDownloadJob] = Queue()
+        for job in phase_jobs:
+            pending.put(job)
+
+        def document_worker(name: str) -> None:
+            while not cancellation_requested():
+                try:
+                    job = pending.get_nowait()
+                except Empty:
+                    return
+                try:
+                    action = "retrying" if final_attempt else "downloading"
+                    _log(log, f"{name}: {action} documents for {job.reference}")
+                    process_document_job(
+                        job,
+                        final_attempt=final_attempt,
+                        total=total,
+                    )
+                finally:
+                    pending.task_done()
+
+        worker_count = min(MAX_CONCURRENT_DOCUMENT_BATCHES, len(phase_jobs))
+        workers = [
+            threading.Thread(
+                target=document_worker,
+                args=(f"Document worker {index + 1}",),
+                daemon=True,
+            )
+            for index in range(worker_count)
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+
     configured_worker_count = min(max(config.worker_count, 1), MAX_SEARCH_WORKER_COUNT)
 
     def run_search_phase(
@@ -906,6 +1057,37 @@ def run_lead_search(
         run_search_phase(list(deferred_tasks), final_attempt=True)
 
     if config.download_application_files:
+        total_document_jobs = len(document_jobs)
+        _document_progress(document_progress, 0, total_document_jobs)
+        if total_document_jobs and not cancelled:
+            _log(
+                log,
+                f"Council searches complete. Starting document downloads for "
+                f"{total_document_jobs} captured applications",
+            )
+            run_document_phase(
+                list(document_jobs),
+                final_attempt=False,
+                total=total_document_jobs,
+            )
+        if deferred_document_jobs and not cancelled:
+            _log(
+                log,
+                f"Starting final retry pass for {len(deferred_document_jobs)} deferred "
+                "application document job(s) after all other downloads finished",
+            )
+            retry_ready = _wait_for_document_retry_cooldown(
+                DOCUMENT_DOWNLOAD_RETRY_DELAY_SECONDS,
+                cancellation_requested,
+                deferred_count=len(deferred_document_jobs),
+            )
+            if retry_ready:
+                run_document_phase(
+                    list(deferred_document_jobs),
+                    final_attempt=True,
+                    total=total_document_jobs,
+                )
+
         total_enrichment_jobs = len(enrichment_jobs)
         _enrichment_progress(enrichment_progress, 0, total_enrichment_jobs)
         if total_enrichment_jobs:
@@ -1751,15 +1933,51 @@ def download_pdf_documents(
     destination: Path,
     *,
     log: LogCallback | None = None,
+    should_cancel: CancelCallback | None = None,
 ) -> int:
-    document_list = list(documents)
-    downloaded = 0
-    deferred: list[tuple[int, PlanningDocument, Exception]] = []
+    first_pass = _download_pdf_documents_once(
+        documents,
+        destination,
+        log=log,
+        should_cancel=should_cancel,
+    )
+    downloaded = first_pass.downloaded_count
+    if not first_pass.transient_documents:
+        return downloaded
+    if not _wait_for_document_retry_cooldown(
+        DOCUMENT_DOWNLOAD_RETRY_DELAY_SECONDS,
+        should_cancel,
+        log=log,
+        deferred_count=len(first_pass.transient_documents),
+    ):
+        return downloaded
+    final_pass = _download_pdf_documents_once(
+        first_pass.transient_documents,
+        destination,
+        log=log,
+        should_cancel=should_cancel,
+        defer_transient=False,
+    )
+    return downloaded + final_pass.downloaded_count
+
+
+def _download_pdf_documents_once(
+    documents: Iterable[PlanningDocument],
+    destination: Path,
+    *,
+    log: LogCallback | None = None,
+    should_cancel: CancelCallback | None = None,
+    defer_transient: bool = True,
+) -> DocumentDownloadBatchResult:
+    result = DocumentDownloadBatchResult()
+    blocked_hosts: set[str] = set()
     browser: CouncilBrowserClient | None = None
     browser_source_url: str | None = None
+    opener = _build_document_opener()
+    source_cache: dict[str, list[PlanningDocument]] = {}
 
     def download_one(index: int, document: PlanningDocument) -> None:
-        nonlocal browser, browser_source_url, downloaded
+        nonlocal browser, browser_source_url
         if _requires_browser_download(document):
             if browser is None:
                 browser = CouncilBrowserClient(timeout_seconds=60)
@@ -1773,43 +1991,95 @@ def download_pdf_documents(
                 content_type=_content_type_from_name(document.title),
             )
         else:
-            downloaded_file = download_document_file(document)
+            downloaded_file = download_document_file(
+                document,
+                opener=opener,
+                source_cache=source_cache,
+                should_cancel=should_cancel,
+            )
         filename = document_filename(document, downloaded_file, fallback=f"document-{index}")
         path = _unique_path(destination / filename)
         path.write_bytes(downloaded_file.payload)
-        downloaded += 1
+        result.downloaded_count += 1
         if DOCUMENT_DOWNLOAD_DELAY_SECONDS:
             sleep(DOCUMENT_DOWNLOAD_DELAY_SECONDS)
 
     with _DOCUMENT_DOWNLOAD_GATE:
         try:
-            for index, document in enumerate(document_list, start=1):
+            for index, document in enumerate(documents, start=1):
+                if should_cancel and should_cancel():
+                    break
                 if not _looks_like_downloadable_document(document):
                     _log(log, f"Skipped excluded document link: {document.title}")
                     continue
+                document_host = urlsplit(document.source_url or document.url).netloc.casefold()
+                if document_host and document_host in blocked_hosts:
+                    if defer_transient:
+                        result.transient_documents.append(document)
+                    else:
+                        _log(
+                            log,
+                            f"Could not download {document.title}: portal remained unavailable",
+                        )
+                    continue
                 try:
                     download_one(index, document)
-                except Exception as exc:  # pragma: no cover - network resilience
-                    deferred.append((index, document, exc))
-
-            if deferred:
-                _log(log, f"Retrying {len(deferred)} deferred document download(s) after a cooldown")
-                sleep(DOCUMENT_DOWNLOAD_RETRY_DELAY_SECONDS)
-                for index, document, first_error in deferred:
-                    try:
-                        download_one(index, document)
-                    except HTTPError as exc:
-                        if exc.code == 404:
-                            _log(log, f"Skipped unavailable document link: {document.title}")
-                        else:
-                            _log(log, f"Could not download {document.title}: HTTP {exc.code}")
-                    except Exception as exc:  # pragma: no cover - network resilience
-                        final_error = exc or first_error
-                        _log(log, f"Could not download {document.title}: {final_error}")
+                except Exception as exc:  # pragma: no cover - live network failures vary
+                    if isinstance(exc, DocumentDownloadCancelledError):
+                        break
+                    if _is_transient_document_error(exc):
+                        error_url = str(getattr(exc, "url", "") or "")
+                        error_host = urlsplit(error_url).netloc.casefold()
+                        blocked_hosts.update(host for host in (document_host, error_host) if host)
+                        if defer_transient:
+                            result.transient_documents.append(document)
+                            continue
+                    if isinstance(exc, HTTPError) and exc.code == 404:
+                        _log(log, f"Skipped unavailable document link: {document.title}")
+                    elif isinstance(exc, HTTPError):
+                        _log(log, f"Could not download {document.title}: HTTP {exc.code}")
+                    else:
+                        _log(log, f"Could not download {document.title}: {exc}")
         finally:
             if browser is not None:
                 browser.close()
-    return downloaded
+    return result
+
+
+def _is_transient_document_error(exc: Exception) -> bool:
+    if isinstance(exc, HTTPError):
+        return exc.code in {403, 408, 425, 429, 500, 502, 503, 504}
+    if isinstance(exc, ValueError):
+        return False
+    return True
+
+
+def _wait_for_document_retry_cooldown(
+    seconds: float,
+    should_cancel: CancelCallback | None,
+    *,
+    log: LogCallback | None = None,
+    deferred_count: int,
+) -> bool:
+    _log(log, f"Retrying {deferred_count} deferred document download(s) after a cooldown")
+    return _wait_for_cancelable_delay(seconds, should_cancel)
+
+
+def _wait_for_cancelable_delay(
+    seconds: float,
+    should_cancel: CancelCallback | None,
+) -> bool:
+    if should_cancel is None:
+        sleep(seconds)
+        return True
+    ready_at = monotonic() + max(seconds, 0.0)
+    while True:
+        if should_cancel():
+            return False
+        remaining = ready_at - monotonic()
+        if remaining <= 0:
+            return True
+        sleep(min(remaining, 0.25))
 
 
 def write_csv(csv_path: Path, rows: list[dict[str, str]]) -> None:
@@ -1884,22 +2154,43 @@ def application_link(application: PlanningApplication) -> str:
     return ""
 
 
-def download_document_file(document: PlanningDocument) -> DownloadedFile:
-    return _download_document_file(document)
+def download_document_file(
+    document: PlanningDocument,
+    *,
+    opener=None,
+    source_cache: dict[str, list[PlanningDocument]] | None = None,
+    should_cancel: CancelCallback | None = None,
+) -> DownloadedFile:
+    return _download_document_file(
+        document,
+        opener=opener,
+        source_cache=source_cache,
+        should_cancel=should_cancel,
+    )
 
 
 def download_document_bytes(document: PlanningDocument) -> bytes:
     return download_document_file(document).payload
 
 
-def _download_document_file(document: PlanningDocument) -> DownloadedFile:
+def _download_document_file(
+    document: PlanningDocument,
+    *,
+    opener=None,
+    source_cache: dict[str, list[PlanningDocument]] | None = None,
+    should_cancel: CancelCallback | None = None,
+) -> DownloadedFile:
     last_error: Exception | None = None
-    opener = _build_document_opener()
+    opener = opener or _build_document_opener()
     verify_tls = True
     tls_compat = False
     source_candidates: list[str] = []
     if document.source_url:
-        source_candidates = source_document_candidates(document, opener)
+        source_candidates = source_document_candidates(
+            document,
+            opener,
+            cache=source_cache,
+        )
     pending = deque([*source_candidates, *document_download_candidates(document.url)])
     seen: set[str] = set()
     while pending:
@@ -1912,6 +2203,8 @@ def _download_document_file(document: PlanningDocument) -> DownloadedFile:
             headers["Referer"] = document.source_url
         request = _document_request(url, headers)
         for attempt in range(DOCUMENT_DOWNLOAD_ATTEMPTS):
+            if should_cancel and should_cancel():
+                raise DocumentDownloadCancelledError("Document download cancelled")
             try:
                 _throttle_request(url)
                 with opener.open(request, timeout=30) as response:
@@ -1939,9 +2232,14 @@ def _download_document_file(document: PlanningDocument) -> DownloadedFile:
                     break
                 if exc.code not in RATE_LIMIT_HTTP_CODES or attempt == DOCUMENT_DOWNLOAD_ATTEMPTS - 1:
                     raise
-                delay = _retry_delay_seconds(exc, min(5.0 * (2**attempt), 45.0))
+                delay = min(
+                    _retry_delay_seconds(exc, min(5.0 * (2**attempt), 45.0)),
+                    DOCUMENT_DOWNLOAD_MAX_RETRY_DELAY_SECONDS,
+                )
                 _set_request_cooldown(url, delay)
-                sleep(delay)
+                if not _wait_for_cancelable_delay(delay, should_cancel):
+                    _clear_request_cooldown(url)
+                    raise DocumentDownloadCancelledError("Document download cancelled")
                 _clear_request_cooldown(url)
                 _skip_next_throttle(url)
             except Exception as exc:
@@ -2004,36 +2302,48 @@ def _content_type_from_name(name: str | None) -> str:
     }.get(extension, "application/octet-stream")
 
 
-def source_document_candidates(document: PlanningDocument, opener) -> list[str]:
+def source_document_candidates(
+    document: PlanningDocument,
+    opener,
+    *,
+    cache: dict[str, list[PlanningDocument]] | None = None,
+) -> list[str]:
     if not document.source_url:
         return []
-    try:
-        text, page_url = _fetch_html_with_portal_session(document.source_url, opener, timeout=30)
-    except Exception as exc:
-        if not _is_tls_certificate_error(exc):
-            return []
+    source_url = document.source_url
+    candidates: list[PlanningDocument]
+    if cache is not None and source_url in cache:
+        candidates = cache[source_url]
+    else:
         try:
-            fallback_opener = _build_document_opener(verify_tls=False)
-            text, page_url = _fetch_html_with_portal_session(document.source_url, fallback_opener, timeout=30)
-            opener = fallback_opener
+            text, page_url = _fetch_html_with_portal_session(source_url, opener, timeout=30)
+        except Exception as exc:
+            if not _is_tls_certificate_error(exc):
+                return []
+            try:
+                fallback_opener = _build_document_opener(verify_tls=False)
+                text, page_url = _fetch_html_with_portal_session(source_url, fallback_opener, timeout=30)
+                opener = fallback_opener
+            except Exception:
+                return []
+        candidates = []
+        try:
+            page = html.fromstring(text)
         except Exception:
-            return []
-    candidates: list[PlanningDocument] = []
-    try:
-        page = html.fromstring(text)
-    except Exception:
-        page = None
-    if page is not None:
-        candidates.extend(
-            PlanningDocument(title=title, url=normalize_url(urljoin(page_url, href)), source_url=page_url)
-            for href, title in iter_document_links(page, page_url)
-        )
-    candidates.extend(fetch_publisher_document_list(text, page_url, opener))
-    candidates.extend(fetch_atrium_document_list(text, page_url))
-    candidates.extend(fetch_enterprise_document_list(text, page_url, opener))
-    candidates.extend(fetch_arcus_salesforce_document_list(text, page_url, opener))
-    candidates.extend(fetch_arcus_public_register_file_list(text, page_url, opener))
-    candidates.extend(fetch_arcus_files_public_document_list(text, page_url, opener))
+            page = None
+        if page is not None:
+            candidates.extend(
+                PlanningDocument(title=title, url=normalize_url(urljoin(page_url, href)), source_url=page_url)
+                for href, title in iter_document_links(page, page_url)
+            )
+        candidates.extend(fetch_publisher_document_list(text, page_url, opener))
+        candidates.extend(fetch_atrium_document_list(text, page_url))
+        candidates.extend(fetch_enterprise_document_list(text, page_url, opener))
+        candidates.extend(fetch_arcus_salesforce_document_list(text, page_url, opener))
+        candidates.extend(fetch_arcus_public_register_file_list(text, page_url, opener))
+        candidates.extend(fetch_arcus_files_public_document_list(text, page_url, opener))
+        if cache is not None:
+            cache[source_url] = candidates
     wanted = _comparable_title(document.title)
     matching = [
         candidate.url
@@ -3353,6 +3663,15 @@ def _progress(callback: ProgressCallback | None, completed: int, total: int) -> 
 def _captured(callback: CapturedCallback | None, count: int) -> None:
     if callback:
         callback(count)
+
+
+def _document_progress(
+    callback: DocumentProgressCallback | None,
+    completed: int,
+    total: int,
+) -> None:
+    if callback:
+        callback(completed, total)
 
 
 def _enrichment_progress(

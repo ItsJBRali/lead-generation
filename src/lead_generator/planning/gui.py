@@ -280,7 +280,10 @@ class LeadGeneratorApp(ctk.CTk):
         self.cancel_button.configure(state="normal")
         self.progress_bar.set(0)
         self._set_captured(0)
-        self._set_enrichment_progress(0, 0, requested=config.download_application_files)
+        if config.download_application_files:
+            self._set_document_progress(0, 0, requested=True)
+        else:
+            self._set_enrichment_progress(0, 0, requested=False)
         self._clear_log()
         self._append_log("Starting search...")
 
@@ -319,6 +322,9 @@ class LeadGeneratorApp(ctk.CTk):
                 log=lambda message: self.messages.put(("log", message)),
                 progress=lambda complete, total: self.messages.put(("progress", (complete, total))),
                 captured=lambda count: self.messages.put(("captured", count)),
+                document_progress=lambda complete, total: self.messages.put(
+                    ("documents", (complete, total))
+                ),
                 enrichment_progress=lambda complete, total: self.messages.put(
                     ("enrichment", (complete, total))
                 ),
@@ -346,6 +352,9 @@ class LeadGeneratorApp(ctk.CTk):
                 self._set_progress(int(completed), int(total))
             elif kind == "captured":
                 self._set_captured(int(payload))
+            elif kind == "documents":
+                completed, total = payload
+                self._set_document_progress(int(completed), int(total), requested=True)
             elif kind == "enrichment":
                 completed, total = payload
                 self._set_enrichment_progress(int(completed), int(total), requested=True)
@@ -367,6 +376,13 @@ class LeadGeneratorApp(ctk.CTk):
 
     def _set_captured(self, captured: int) -> None:
         self.captured_label.configure(text=f"{captured} relevant applications captured")
+
+    def _set_document_progress(self, completed: int, total: int, *, requested: bool) -> None:
+        if requested:
+            text = f"{completed} of {total} applications downloaded"
+        else:
+            text = "Document downloads not requested"
+        self.enrichment_label.configure(text=text)
 
     def _set_enrichment_progress(self, completed: int, total: int, *, requested: bool) -> None:
         if requested:
