@@ -4,9 +4,30 @@ import argparse
 import json
 from datetime import date
 
+from lead_generator.planning.adapters.agile import AgileCouncilConfig, AgilePlanningScraper
+from lead_generator.planning.adapters.civica import CivicaCouncilConfig, CivicaPlanningScraper
 from lead_generator.planning.adapters.idox import IdoxCouncilConfig, IdoxPublicAccessScraper
+from lead_generator.planning.adapters.northgate import NorthgateCouncilConfig, NorthgatePlanningScraper
 from lead_generator.planning.adapters.ocella import OcellaCouncilConfig, OcellaPlanningScraper
 from lead_generator.planning.http import CouncilHttpClient
+
+
+def add_labelled_portal_parser(subparsers: argparse._SubParsersAction, name: str, help_text: str) -> None:
+    portal = subparsers.add_parser(name, help=help_text)
+    portal.add_argument("--authority", required=True, help="Council or planning authority name.")
+    portal.add_argument("--base-url", required=True, help="Council planning-register base URL.")
+    portal.add_argument("--listing-url", required=True, help="Listing/search results URL to parse.")
+    portal.add_argument("--limit", type=int, help="Maximum applications to return.")
+    portal.add_argument(
+        "--fetch-details",
+        action="store_true",
+        help="Fetch each detail page after discovering IDs.",
+    )
+    portal.add_argument(
+        "--fetch-documents",
+        action="store_true",
+        help="Include document attachment metadata from application pages.",
+    )
 
 
 def main() -> None:
@@ -52,6 +73,21 @@ def main() -> None:
         action="store_true",
         help="Include document attachment metadata from application pages.",
     )
+    add_labelled_portal_parser(
+        subparsers,
+        "civica",
+        "Scrape a Civica / Authority Public Access planning register.",
+    )
+    add_labelled_portal_parser(
+        subparsers,
+        "agile",
+        "Scrape an Agile Applications / APAS planning register.",
+    )
+    add_labelled_portal_parser(
+        subparsers,
+        "northgate",
+        "Scrape a Northgate Planning Explorer planning register.",
+    )
 
     args = parser.parse_args()
 
@@ -87,6 +123,26 @@ def main() -> None:
         scraper = OcellaPlanningScraper(
             OcellaCouncilConfig(authority=args.authority, base_url=args.base_url)
         )
+        discovery = scraper.discover_ids(listing_url=args.listing_url, limit=args.limit)
+        if args.fetch_details:
+            discovery.applications = [
+                scraper.fetch_application(
+                    application.uid,
+                    application.url,
+                    include_documents=args.fetch_documents,
+                )
+                for application in discovery.applications
+            ]
+        print(json.dumps(discovery.to_dict(), indent=2, sort_keys=True))
+
+    if args.portal in ("civica", "agile", "northgate"):
+        scraper_classes = {
+            "civica": (CivicaCouncilConfig, CivicaPlanningScraper),
+            "agile": (AgileCouncilConfig, AgilePlanningScraper),
+            "northgate": (NorthgateCouncilConfig, NorthgatePlanningScraper),
+        }
+        config_class, scraper_class = scraper_classes[args.portal]
+        scraper = scraper_class(config_class(authority=args.authority, base_url=args.base_url))
         discovery = scraper.discover_ids(listing_url=args.listing_url, limit=args.limit)
         if args.fetch_details:
             discovery.applications = [

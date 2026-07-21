@@ -17,6 +17,7 @@ class PlanningDocument:
     date_published: str | None = None
     file_size: str | None = None
     description: str | None = None
+    source_url: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {key: value for key, value in asdict(self).items() if value not in (None, "", {})}

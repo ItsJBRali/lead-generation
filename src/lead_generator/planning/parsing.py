@@ -32,8 +32,12 @@ def parse_council_date(value: str | None) -> str | None:
 
     for fmt in (
         "%d/%m/%Y",
+        "%d/%m/%y",
         "%d-%m-%Y",
+        "%d-%m-%y",
         "%Y-%m-%d",
+        "%d-%B-%Y",
+        "%d-%b-%Y",
         "%d %B %Y",
         "%d %b %Y",
         "%a %d %b %Y",

@@ -4,6 +4,8 @@ __pycache__/
 .venv/
 venv/
 dist/
+!dist/
+!dist/PlanningLeadGenerator.exe
 build/
 *.egg-info/
 .env

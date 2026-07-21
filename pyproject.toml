@@ -9,11 +9,18 @@ description = "Lead generation tooling for UK planning application data."
 requires-python = ">=3.11"
 dependencies = [
     "certifi>=2024.8.30",
+    "customtkinter>=5.2.2",
     "lxml>=4.9",
+    "selenium>=4.34",
+    "tzdata>=2025.2",
 ]
 
 [project.scripts]
 planning-scrape = "lead_generator.planning.cli:main"
+planning-leads-gui = "lead_generator.planning.gui:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"lead_generator.planning.data" = ["planning_authorities.geojson"]

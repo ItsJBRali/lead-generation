@@ -22,3 +22,9 @@ class PlanningScraper(ABC):
         include_documents: bool = False,
     ) -> PlanningApplication:
         """Fetch and normalize one application detail page."""
+
+    def close(self) -> None:
+        client = getattr(self, "http", None)
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
