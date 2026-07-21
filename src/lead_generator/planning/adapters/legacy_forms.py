@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import json
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 
 from lxml import html
@@ -192,6 +192,16 @@ class TascomiPlanningScraper(NativeListingScraper):
         end_date: date | None,
         limit: int | None,
     ) -> list[PlanningApplication]:
+        if self._is_complete_week_range(start_date, end_date):
+            weekly_applications = self._search_received_weeks(
+                listing_url,
+                start_date=start_date,
+                end_date=end_date,
+                limit=limit,
+            )
+            if weekly_applications is not None:
+                return weekly_applications
+
         response = self.http.get(listing_url)
         document = html.fromstring(response.text)
         form = first(document.xpath("//form[.//input[@name='received_date_from'] or .//input[@name='valid_date_from']]"))
@@ -262,6 +272,65 @@ class TascomiPlanningScraper(NativeListingScraper):
                 ),
             }
         return applications[:limit] if limit is not None else applications
+
+    def _search_received_weeks(
+        self,
+        listing_url: str,
+        *,
+        start_date: date,
+        end_date: date,
+        limit: int | None,
+    ) -> list[PlanningApplication] | None:
+        weekly_url = replace_query_action(listing_url, "getReceivedWeeklyList")
+        applications: list[PlanningApplication] = []
+        seen: set[str] = set()
+        week_start = start_date
+
+        while week_start <= end_date:
+            page = self.http.get(weekly_url)
+            document = html.fromstring(page.text)
+            form = first(document.xpath("//form[.//input[@name='week']]"))
+            if form is None:
+                return None
+
+            data = self._form_defaults(form)
+            data["week"] = week_start.strftime("%d-%m-%Y")
+            data["fa"] = "getReceivedWeeklyList"
+            response = self.http.post_form(self._absolute_action(page.url, form), data)
+            for application in parse_header_tables(
+                response.text,
+                response.url,
+                self.authority,
+                self.family,
+            ):
+                key = (application.reference or application.uid).casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                if not (application.date_received or application.date_validated):
+                    application.date_received = week_start.isoformat()
+                application.raw = {
+                    **(application.raw or {}),
+                    "detail_complete": True,
+                    "date_range_filtered": True,
+                    "portal_week": week_start.isoformat(),
+                }
+                applications.append(application)
+                if limit is not None and len(applications) >= limit:
+                    return applications
+            week_start += timedelta(days=7)
+
+        return applications
+
+    @staticmethod
+    def _is_complete_week_range(start_date: date | None, end_date: date | None) -> bool:
+        if start_date is None or end_date is None or end_date < start_date:
+            return False
+        return (
+            start_date.weekday() == 0
+            and end_date.weekday() == 6
+            and ((end_date - start_date).days + 1) % 7 == 0
+        )
 
 
 class EnterpriseStorePlanningScraper(NativeListingScraper):

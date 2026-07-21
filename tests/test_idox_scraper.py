@@ -98,6 +98,19 @@ class FakeAdvancedSearchFailureHttpClient(FakeHttpClient):
         return super().get(url)
 
 
+class FakeEmptyAdvancedSearchHttpClient(FakeAdvancedSearchHttpClient):
+    def get(self, url: str) -> FetchResponse:
+        if "action=weeklyList" in url:
+            return FakeHttpClient.get(self, url)
+        return super().get(url)
+
+    def post_form(self, url: str, data: dict[str, str]) -> FetchResponse:
+        self.posts.append((url, data))
+        if "advancedSearchResults.do" in url:
+            return FetchResponse(url=url, status_code=200, text="<html><body>No results found.</body></html>")
+        return FetchResponse(url=url, status_code=200, text=(FIXTURES / "idox_listing.html").read_text(encoding="utf-8"))
+
+
 class IdoxPublicAccessScraperTest(unittest.TestCase):
     def setUp(self) -> None:
         self.scraper = IdoxPublicAccessScraper(IdoxCouncilConfig(authority="Example Council", base_url="https://planning.example.gov.uk"))
@@ -245,6 +258,24 @@ class IdoxPublicAccessScraperTest(unittest.TestCase):
         self.assertEqual(http.posts[0][1]["date(applicationReceivedStart)"], "21/05/2026")
         self.assertEqual(http.posts[0][1]["date(applicationReceivedEnd)"], "20/06/2026")
         self.assertNotIn("searchCriteria.dateReceivedStart", http.posts[0][1])
+
+    def test_empty_advanced_search_retries_the_selected_weekly_list(self) -> None:
+        http = FakeEmptyAdvancedSearchHttpClient()
+        scraper = IdoxPublicAccessScraper(
+            IdoxCouncilConfig(authority="Example Council", base_url="https://planning.example.gov.uk"),
+            http_client=http,
+        )
+
+        discovery = scraper.discover_ids(
+            listing_url="https://planning.example.gov.uk/online-applications/search.do?action=advanced",
+            start_date=date(2026, 7, 13),
+            end_date=date(2026, 7, 19),
+        )
+
+        self.assertEqual(len(discovery.applications), 2)
+        self.assertEqual(http.posts[1][1]["week"], "13 Jul 2026")
+        self.assertTrue(all(app.raw["date_range_filtered"] for app in discovery.applications))
+        self.assertTrue(all(app.raw["portal_week"] == "2026-07-13" for app in discovery.applications))
 
     def test_advanced_search_failure_falls_back_to_weekly_list(self) -> None:
         http = FakeAdvancedSearchFailureHttpClient()

@@ -109,6 +109,21 @@ class LeadSearchTest(unittest.TestCase):
             "https://idoxcloud.nuneatonandbedworth.gov.uk/planning/index.html?fa=search",
         )
 
+    def test_builtin_catalogue_uses_east_hampshires_new_public_planning_portal(self) -> None:
+        catalogue = load_authority_catalogue(Path("src/lead_generator/planning/data/planning_authorities.geojson"))
+        properties = next(
+            feature["properties"]
+            for feature in catalogue["features"]
+            if feature["properties"]["authority"] == "East Hampshire"
+        )
+
+        self.assertEqual(properties["portal_family"], "tascomi")
+        self.assertEqual(properties["scraper_type"], "Tascomi")
+        self.assertEqual(
+            properties["listing_url"],
+            "https://publicaccess.easthants.gov.uk/planning/index.html?fa=search",
+        )
+
     def test_builtin_catalogue_includes_all_active_non_ni_authority_types(self) -> None:
         catalogue = load_authority_catalogue(Path("src/lead_generator/planning/data/planning_authorities.geojson"))
         authorities = {feature["properties"]["authority"] for feature in catalogue["features"]}
@@ -605,6 +620,44 @@ class LeadSearchTest(unittest.TestCase):
         planit.assert_called_once_with("Example", date(2026, 6, 8), date(2026, 6, 14))
         self.assertEqual([application.reference for application in applications], ["26/01723/NMC"])
         self.assertEqual(applications[0].raw["source"], "planit_fallback")
+
+    def test_portal_filtered_weekly_result_is_not_removed_by_received_date(self) -> None:
+        from lead_generator.planning.models import DiscoveryResult
+
+        class WeeklyScraper:
+            def discover_ids(self, **kwargs):
+                return DiscoveryResult(
+                    authority="Example",
+                    source_url="https://planning.example.gov.uk/weekly",
+                    applications=[
+                        PlanningApplication(
+                            authority="Example",
+                            uid="APP1",
+                            url="https://planning.example.gov.uk/application/APP1",
+                            reference="26/00001/FUL",
+                            date_received="2026-06-30",
+                            date_validated="2026-07-14",
+                            raw={"detail_complete": True, "date_range_filtered": True},
+                        )
+                    ],
+                )
+
+        target = CouncilTarget(
+            authority="Example",
+            portal_family="idox",
+            scraper_type="Idox",
+            base_url="https://planning.example.gov.uk",
+            listing_url="https://planning.example.gov.uk/search",
+            geometry={},
+        )
+
+        with (
+            patch("lead_generator.planning.leads.planning_scraper_for_target", return_value=WeeklyScraper()),
+            patch("lead_generator.planning.leads.discover_planit_applications", return_value=[]),
+        ):
+            applications = discover_portal_applications(target, date(2026, 7, 13), date(2026, 7, 19))
+
+        self.assertEqual([application.reference for application in applications], ["26/00001/FUL"])
 
     def test_discover_portal_applications_supplements_failed_details_from_planit(self) -> None:
         from lead_generator.planning.models import DiscoveryResult

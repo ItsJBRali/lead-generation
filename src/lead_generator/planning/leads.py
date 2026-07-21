@@ -205,6 +205,13 @@ PLANIT_FIRST_AUTHORITIES = {
 }
 
 CURRENT_PORTAL_OVERRIDES = {
+    "East Hampshire": {
+        "portal_family": "tascomi",
+        "scraper_type": "Tascomi",
+        "base_url": "https://publicaccess.easthants.gov.uk/planning/",
+        "listing_url": "https://publicaccess.easthants.gov.uk/planning/index.html?fa=search",
+        "planning_url": "https://publicaccess.easthants.gov.uk/planning/index.html?fa=search",
+    },
     "Nuneaton": {
         "portal_family": "tascomi",
         "scraper_type": "Tascomi",
@@ -996,7 +1003,7 @@ def discover_portal_applications(target: CouncilTarget, start_date: date, end_da
                 continue
             seen.add(key)
             application_date = application.date_received or application.date_validated
-            if application_date:
+            if application_date and not (application.raw or {}).get("date_range_filtered"):
                 received = _parse_iso_date(application_date)
                 if received is not None and (received < start_date or received > end_date):
                     continue

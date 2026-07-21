@@ -596,6 +596,39 @@ class NonIdoxScraperTest(unittest.TestCase):
         self.assertIn("fa=getApplication", discovery.applications[0].url)
         self.assertIn("id=233493", discovery.applications[0].url)
 
+    def test_tascomi_complete_week_uses_the_weekly_received_list(self) -> None:
+        weekly_url = "https://planning.example.gov.uk/planning/index.html?fa=getReceivedWeeklyList"
+        http = FakeLegacyFormsHttpClient(
+            {
+                f"get:{weekly_url}": """
+                <form method="post">
+                  <input name="week"><input type="hidden" name="fa" value="getReceivedWeeklyList">
+                </form>
+                """,
+                f"post:{weekly_url}": """
+                <table>
+                  <tr><th>Application Reference</th><th>Location Details</th><th>Proposal</th><th>View</th></tr>
+                  <tr><td>PL/1930/26</td><td>1 High Street HA1 1AA</td><td>Install entrance gates</td><td><button class="view_application" data-id="233493">View</button></td></tr>
+                </table>
+                """,
+            }
+        )
+        scraper = TascomiPlanningScraper(
+            LegacyFormsCouncilConfig("Harrow", "https://planning.example.gov.uk"),
+            http_client=http,
+        )
+
+        discovery = scraper.discover_ids(
+            listing_url="https://planning.example.gov.uk/planning/index.html?fa=search",
+            start_date=date(2026, 7, 13),
+            end_date=date(2026, 7, 19),
+        )
+
+        self.assertEqual([app.reference for app in discovery.applications], ["PL/1930/26"])
+        self.assertEqual(http.posts[0][1]["week"], "13-07-2026")
+        self.assertEqual(discovery.applications[0].raw["portal_week"], "2026-07-13")
+        self.assertTrue(discovery.applications[0].raw["date_range_filtered"])
+
     def test_tascomi_search_fetches_all_ajax_result_pages(self) -> None:
         class PaginatedTascomiHttpClient(FakeLegacyFormsHttpClient):
             def post_form(self, url, data, headers=None):

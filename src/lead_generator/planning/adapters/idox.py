@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 
 from lxml import html
@@ -83,12 +83,23 @@ class IdoxPublicAccessScraper(PlanningScraper):
 
     def _discover_ids(self, *, listing_url: str | None = None, start_date: date | None = None, end_date: date | None = None, limit: int | None = None) -> DiscoveryResult:
         if listing_url and (start_date or end_date):
-            response = self._fetch_advanced_search(listing_url, start_date=start_date, end_date=end_date)
+            try:
+                response = self._fetch_advanced_search(listing_url, start_date=start_date, end_date=end_date)
+            except CouncilFetchError:
+                if not self._is_complete_week_range(start_date, end_date):
+                    raise
+                return self._discover_weekly_range(start_date, end_date, limit=limit)
         elif listing_url:
             response = self.http.get(listing_url)
         else:
-            response = self._fetch_weekly_list(start_date=start_date, end_date=end_date)
+            return self._discover_weekly_range(start_date, end_date, limit=limit)
         applications = self._parse_listing_pages(response, limit=limit)
+        if (
+            not applications
+            and listing_url
+            and self._is_complete_week_range(start_date, end_date)
+        ):
+            return self._discover_weekly_range(start_date, end_date, limit=limit)
         if limit is not None:
             applications = applications[:limit]
         return DiscoveryResult(authority=self.authority, source_url=response.url, applications=applications)
@@ -268,26 +279,92 @@ class IdoxPublicAccessScraper(PlanningScraper):
         data = self._form_defaults(form)
         data.setdefault("searchType", "Application")
         data.setdefault("dateType", "DC_Validated")
+        if start_date:
+            data["week"] = self._weekly_option_value(form, start_date)
         return self.http.post_form(urljoin(response.url, form.get("action")), data)
 
+    def _discover_weekly_range(
+        self,
+        start_date: date | None,
+        end_date: date | None,
+        *,
+        limit: int | None,
+    ) -> DiscoveryResult:
+        week_starts = self._weekly_start_dates(start_date, end_date)
+        applications: list[PlanningApplication] = []
+        seen: set[str] = set()
+        source_url = self.build_weekly_list_url(start_date=start_date, end_date=end_date)
+
+        for week_start in week_starts:
+            week_end = week_start + timedelta(days=6) if week_start else end_date
+            response = self._fetch_weekly_list(start_date=week_start, end_date=week_end)
+            source_url = response.url
+            remaining = None if limit is None else max(limit - len(applications), 0)
+            if remaining == 0:
+                break
+            for application in self._parse_listing_pages(response, limit=remaining):
+                if limit is not None and len(applications) >= limit:
+                    break
+                if application.uid in seen:
+                    continue
+                seen.add(application.uid)
+                application.raw = {
+                    **(application.raw or {}),
+                    "date_range_filtered": True,
+                    "portal_week": week_start.isoformat() if week_start else "current",
+                }
+                applications.append(application)
+            if limit is not None and len(applications) >= limit:
+                break
+        return DiscoveryResult(authority=self.authority, source_url=source_url, applications=applications)
+
+    def _weekly_start_dates(
+        self,
+        start_date: date | None,
+        end_date: date | None,
+    ) -> list[date | None]:
+        if start_date is None:
+            return [None]
+        final_date = end_date or start_date
+        week_start = start_date - timedelta(days=start_date.weekday())
+        weeks: list[date | None] = []
+        while week_start <= final_date:
+            weeks.append(week_start)
+            week_start += timedelta(days=7)
+        return weeks
+
+    def _weekly_option_value(self, form: html.HtmlElement, week_start: date) -> str:
+        expected = week_start.strftime("%d %b %Y")
+        for option in form.xpath(".//select[@name='week']/option"):
+            value = option.get("value")
+            label = clean_text(" ".join(option.itertext()))
+            if expected.casefold() in {(value or "").casefold(), (label or "").casefold()}:
+                return value if value is not None else expected
+        return expected
+
+    @staticmethod
+    def _is_complete_week_range(start_date: date | None, end_date: date | None) -> bool:
+        if start_date is None or end_date is None or end_date < start_date:
+            return False
+        return (
+            start_date.weekday() == 0
+            and end_date.weekday() == 6
+            and ((end_date - start_date).days + 1) % 7 == 0
+        )
+
     def _fetch_advanced_search(self, listing_url: str, *, start_date: date | None = None, end_date: date | None = None):
-        try:
-            response = self.http.get(listing_url)
-            document = html.fromstring(response.text)
-            forms = document.xpath("//form[contains(@action, 'advancedSearchResults.do') or contains(@action, 'searchResults.do')]")
-            if not forms:
-                params = self._advanced_search_dates(start_date=start_date, end_date=end_date)
-                return self.http.get(urljoin(response.url, "advancedSearchResults.do?action=firstPage"), params)
-            form = forms[0]
-            data = self._form_defaults(form)
-            data.update(self._advanced_search_dates(start_date=start_date, end_date=end_date, form_data=data))
-            data.setdefault("searchType", "Application")
-            action = form.get("action") or "advancedSearchResults.do?action=firstPage"
-            return self.http.post_form(urljoin(response.url, action), data)
-        except CouncilFetchError:
-            if start_date or end_date:
-                return self._fetch_weekly_list(start_date=start_date, end_date=end_date)
-            raise
+        response = self.http.get(listing_url)
+        document = html.fromstring(response.text)
+        forms = document.xpath("//form[contains(@action, 'advancedSearchResults.do') or contains(@action, 'searchResults.do')]")
+        if not forms:
+            params = self._advanced_search_dates(start_date=start_date, end_date=end_date)
+            return self.http.get(urljoin(response.url, "advancedSearchResults.do?action=firstPage"), params)
+        form = forms[0]
+        data = self._form_defaults(form)
+        data.update(self._advanced_search_dates(start_date=start_date, end_date=end_date, form_data=data))
+        data.setdefault("searchType", "Application")
+        action = form.get("action") or "advancedSearchResults.do?action=firstPage"
+        return self.http.post_form(urljoin(response.url, action), data)
 
     def _advanced_search_dates(
         self,
