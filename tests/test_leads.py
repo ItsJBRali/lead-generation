@@ -15,6 +15,7 @@ from unittest.mock import patch
 from lxml import html
 
 from lead_generator.planning.adapters.generic import GenericLabelledPlanningScraper
+from lead_generator.planning.enrichment import ContactEnrichment
 from lead_generator.planning.leads import (
     CouncilSearchDegradedError,
     CouncilTarget,
@@ -831,8 +832,23 @@ class LeadSearchTest(unittest.TestCase):
                 ),
             ]
 
-            with patch("lead_generator.planning.leads.discover_portal_applications", return_value=applications):
-                result = run_lead_search(config)
+            enrichment_counts: list[tuple[int, int]] = []
+            with (
+                patch("lead_generator.planning.leads.discover_portal_applications", return_value=applications),
+                patch(
+                    "lead_generator.planning.leads.enrich_application_folder",
+                    return_value=ContactEnrichment(
+                        architect_company_names=["Example Architects Ltd"],
+                        email_addresses=["studio@example-architects.co.uk"],
+                    ),
+                ),
+            ):
+                result = run_lead_search(
+                    config,
+                    enrichment_progress=lambda completed, total: enrichment_counts.append(
+                        (completed, total)
+                    ),
+                )
 
             self.assertEqual(result.leads_found, 1)
             self.assertTrue(result.csv_path.exists())
@@ -843,6 +859,10 @@ class LeadSearchTest(unittest.TestCase):
             self.assertIn("https://planning.example.gov.uk/detail/ABC123", csv_text)
             self.assertIn("24/01234/FUL", csv_text)
             self.assertNotIn("24/99999/FUL", csv_text)
+            self.assertIn("Architect / Company Name", csv_text)
+            self.assertIn("Example Architects Ltd", csv_text)
+            self.assertIn("studio@example-architects.co.uk", csv_text)
+            self.assertEqual(enrichment_counts, [(0, 1), (1, 1)])
             self.assertTrue(result.failure_csv_path.exists())
             self.assertTrue((result.output_dir / "Example Council" / "24 01234 FUL").exists())
             self.assertTrue((result.output_dir / "selected_councils.geojson").exists())

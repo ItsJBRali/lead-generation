@@ -60,6 +60,12 @@ from lead_generator.planning.adapters import (
 )
 from lead_generator.planning.adapters.civica import fetch_civica_documents_from_raw
 from lead_generator.planning.adapters.generic import GenericCouncilConfig, GenericLabelledPlanningScraper
+from lead_generator.planning.enrichment import (
+    ENRICHMENT_CSV_FIELDS,
+    FAILED_ENRICHMENT_VALUE,
+    empty_enrichment_row,
+    enrich_application_folder,
+)
 from lead_generator.planning.models import PlanningApplication, PlanningDocument
 from lead_generator.planning.http import CouncilBrowserClient, monitor_council_requests
 from lead_generator.planning.parsing import clean_text
@@ -152,6 +158,7 @@ EXCLUDED_PROPOSAL_PREFIXES = (
 LogCallback = Callable[[str], None]
 ProgressCallback = Callable[[int, int], None]
 CapturedCallback = Callable[[int], None]
+EnrichmentProgressCallback = Callable[[int, int], None]
 CancelCallback = Callable[[], bool]
 
 USER_AGENT = (
@@ -192,7 +199,15 @@ MAX_RETRY_AFTER_SECONDS = 60.0
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 20.0
 REQUEST_THROTTLE_SECONDS = 0.25
 PLANIT_REQUEST_THROTTLE_SECONDS = 1.5
-APPLICATION_CSV_FIELDS = ["Reference", "address", "application link", "proposal", "date received", "council"]
+APPLICATION_CSV_FIELDS = [
+    "Reference",
+    "address",
+    "application link",
+    "proposal",
+    "date received",
+    "council",
+    *ENRICHMENT_CSV_FIELDS,
+]
 FAILURE_CSV_FIELDS = ["council", "portal_family", "scraper_type", "listing_url", "reason"]
 HISTORY_CSV_FIELDS = [
     "Search Date",
@@ -425,6 +440,16 @@ class DownloadedFile:
     filename: str | None = None
 
 
+@dataclass(slots=True)
+class EnrichmentJob:
+    reference: str
+    folder: Path
+    row: dict[str, str]
+    applicant_name: str | None = None
+    agent_name: str | None = None
+    site_address: str | None = None
+
+
 class CouncilSearchDegradedError(RuntimeError):
     """The council service responded, but its search could not be completed."""
 
@@ -555,6 +580,7 @@ def run_lead_search(
     log: LogCallback | None = None,
     progress: ProgressCallback | None = None,
     captured: CapturedCallback | None = None,
+    enrichment_progress: EnrichmentProgressCallback | None = None,
     should_cancel: CancelCallback | None = None,
 ) -> LeadSearchResult:
     started_at = datetime.now()
@@ -571,6 +597,7 @@ def run_lead_search(
     initialise_csv(failure_csv_path, FAILURE_CSV_FIELDS)
 
     rows: list[dict[str, str]] = []
+    enrichment_jobs: list[EnrichmentJob] = []
     saved_references: set[str] = set()
     total_applications = 0
     captured_documents = 0
@@ -626,10 +653,12 @@ def run_lead_search(
             saved_references.add(reference)
         return True
 
-    def save_row(row: dict[str, str]) -> None:
+    def save_row(row: dict[str, str], enrichment_job: EnrichmentJob | None = None) -> None:
         current = 0
         with lock:
             rows.append(row)
+            if enrichment_job:
+                enrichment_jobs.append(enrichment_job)
             append_csv_row(csv_path, APPLICATION_CSV_FIELDS, row)
             current = len(rows)
         _captured(captured, current)
@@ -754,19 +783,30 @@ def run_lead_search(
                         lead_folder = create_lead_folder(output_dir, target.authority, application)
                         downloaded_count = download_pdf_documents(application.documents, lead_folder, log=log)
                     else:
+                        lead_folder = None
                         downloaded_count = 0
                     if config.download_application_files and downloaded_count:
                         add_captured_document_application(reference)
-                    save_row(
-                        {
-                            "Reference": reference,
-                            "address": application.address or "",
-                            "application link": application_link(application),
-                            "proposal": application.description or "",
-                            "date received": application.date_received or application.date_validated or "",
-                            "council": target.authority,
-                        }
-                    )
+                    row = {
+                        "Reference": reference,
+                        "address": application.address or "",
+                        "application link": application_link(application),
+                        "proposal": application.description or "",
+                        "date received": application.date_received or application.date_validated or "",
+                        "council": target.authority,
+                        **empty_enrichment_row(requested=config.download_application_files),
+                    }
+                    enrichment_job = None
+                    if lead_folder is not None:
+                        enrichment_job = EnrichmentJob(
+                            reference=reference,
+                            folder=lead_folder,
+                            row=row,
+                            applicant_name=application.applicant_name,
+                            agent_name=application.agent_name,
+                            site_address=application.address,
+                        )
+                    save_row(row, enrichment_job)
                     if config.download_application_files:
                         _log(log, f"{target.authority}: saved {application.reference or application.uid} ({downloaded_count} documents downloaded)")
                     else:
@@ -864,6 +904,46 @@ def run_lead_search(
             f"Starting final retry pass for {len(deferred_tasks)} deferred councils after all other searches finished",
         )
         run_search_phase(list(deferred_tasks), final_attempt=True)
+
+    if config.download_application_files:
+        total_enrichment_jobs = len(enrichment_jobs)
+        _enrichment_progress(enrichment_progress, 0, total_enrichment_jobs)
+        if total_enrichment_jobs:
+            _log(log, f"Starting PDF enrichment for {total_enrichment_jobs} captured applications")
+        enriched_count = 0
+        for job in enrichment_jobs:
+            if should_cancel and should_cancel():
+                cancelled = True
+                _log(log, "PDF enrichment cancelled; remaining rows retain Failed enrichment values")
+                break
+            try:
+                _log(log, f"Enriching {job.reference} from downloaded PDFs")
+                enrichment = enrich_application_folder(
+                    job.folder,
+                    applicant_name=job.applicant_name,
+                    agent_name=job.agent_name,
+                    site_address=job.site_address,
+                    log=lambda message, reference=job.reference: _log(
+                        log,
+                        f"{reference}: {message}",
+                    ),
+                )
+                enrichment_row = enrichment.to_csv_row()
+                job.row.update(enrichment_row)
+                populated_fields = sum(
+                    value != FAILED_ENRICHMENT_VALUE for value in enrichment_row.values()
+                )
+                _log(
+                    log,
+                    f"{job.reference}: enrichment complete ({populated_fields} of 4 fields populated)",
+                )
+            except Exception as exc:  # pragma: no cover - malformed live PDFs vary widely
+                _log(log, f"{job.reference}: PDF enrichment failed: {exc}")
+            enriched_count += 1
+            write_csv(csv_path, rows)
+            _enrichment_progress(enrichment_progress, enriched_count, total_enrichment_jobs)
+        if not enrichment_jobs:
+            write_csv(csv_path, rows)
 
     if cancelled:
         completion = "Cancelled"
@@ -1733,8 +1813,10 @@ def download_pdf_documents(
 
 
 def write_csv(csv_path: Path, rows: list[dict[str, str]]) -> None:
-    initialise_csv(csv_path, APPLICATION_CSV_FIELDS)
-    append_csv_rows(csv_path, APPLICATION_CSV_FIELDS, rows)
+    temporary_path = csv_path.with_name(f".{csv_path.name}.tmp")
+    initialise_csv(temporary_path, APPLICATION_CSV_FIELDS)
+    append_csv_rows(temporary_path, APPLICATION_CSV_FIELDS, rows)
+    temporary_path.replace(csv_path)
 
 
 def append_search_history(
@@ -3271,3 +3353,12 @@ def _progress(callback: ProgressCallback | None, completed: int, total: int) -> 
 def _captured(callback: CapturedCallback | None, count: int) -> None:
     if callback:
         callback(count)
+
+
+def _enrichment_progress(
+    callback: EnrichmentProgressCallback | None,
+    completed: int,
+    total: int,
+) -> None:
+    if callback:
+        callback(completed, total)

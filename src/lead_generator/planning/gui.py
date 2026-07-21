@@ -179,11 +179,17 @@ class LeadGeneratorApp(ctk.CTk):
         self.progress_label.grid(row=0, column=0, sticky="w")
         self.captured_label = ctk.CTkLabel(progress_text_row, text="0 relevant applications captured", text_color="#cbd5e1")
         self.captured_label.grid(row=0, column=1, sticky="e")
+        self.enrichment_label = ctk.CTkLabel(
+            status_panel,
+            text="0 of 0 applications enriched",
+            text_color="#9ca3af",
+        )
+        self.enrichment_label.grid(row=1, column=0, padx=16, pady=(0, 6), sticky="w")
         self.progress_bar = ctk.CTkProgressBar(status_panel, height=14, corner_radius=10)
-        self.progress_bar.grid(row=1, column=0, padx=16, pady=(0, 16), sticky="ew")
+        self.progress_bar.grid(row=2, column=0, padx=16, pady=(0, 16), sticky="ew")
         self.progress_bar.set(0)
         button_row = ctk.CTkFrame(status_panel, fg_color="transparent")
-        button_row.grid(row=0, column=1, rowspan=2, padx=16, pady=14, sticky="e")
+        button_row.grid(row=0, column=1, rowspan=3, padx=16, pady=14, sticky="e")
         self.run_button = ctk.CTkButton(
             button_row,
             text="Start search",
@@ -274,6 +280,7 @@ class LeadGeneratorApp(ctk.CTk):
         self.cancel_button.configure(state="normal")
         self.progress_bar.set(0)
         self._set_captured(0)
+        self._set_enrichment_progress(0, 0, requested=config.download_application_files)
         self._clear_log()
         self._append_log("Starting search...")
 
@@ -312,6 +319,9 @@ class LeadGeneratorApp(ctk.CTk):
                 log=lambda message: self.messages.put(("log", message)),
                 progress=lambda complete, total: self.messages.put(("progress", (complete, total))),
                 captured=lambda count: self.messages.put(("captured", count)),
+                enrichment_progress=lambda complete, total: self.messages.put(
+                    ("enrichment", (complete, total))
+                ),
                 should_cancel=lambda: self.cancel_requested,
             )
             self.messages.put(("done", result))
@@ -320,7 +330,7 @@ class LeadGeneratorApp(ctk.CTk):
 
     def _cancel_run(self) -> None:
         self.cancel_requested = True
-        self._append_log("Cancelling after the current council...")
+        self._append_log("Cancelling after the current operation...")
         self.cancel_button.configure(state="disabled")
 
     def _poll_messages(self) -> None:
@@ -336,6 +346,9 @@ class LeadGeneratorApp(ctk.CTk):
                 self._set_progress(int(completed), int(total))
             elif kind == "captured":
                 self._set_captured(int(payload))
+            elif kind == "enrichment":
+                completed, total = payload
+                self._set_enrichment_progress(int(completed), int(total), requested=True)
             elif kind == "done":
                 self._finish_run()
                 self._append_log(f"Output folder: {payload.output_dir}")
@@ -354,6 +367,13 @@ class LeadGeneratorApp(ctk.CTk):
 
     def _set_captured(self, captured: int) -> None:
         self.captured_label.configure(text=f"{captured} relevant applications captured")
+
+    def _set_enrichment_progress(self, completed: int, total: int, *, requested: bool) -> None:
+        if requested:
+            text = f"{completed} of {total} applications enriched"
+        else:
+            text = "PDF enrichment not requested"
+        self.enrichment_label.configure(text=text)
 
     def _finish_run(self) -> None:
         self.run_button.configure(state="normal")

@@ -42,6 +42,14 @@ class FakeLogBox:
         self.calls.append(("see", index))
 
 
+class FakeLabel:
+    def __init__(self) -> None:
+        self.text = ""
+
+    def configure(self, *, text: str) -> None:
+        self.text = text
+
+
 def test_run_log_preserves_users_visible_line_while_new_messages_arrive() -> None:
     log_box = FakeLogBox(bottom_fraction=0.6)
 
@@ -57,3 +65,29 @@ def test_run_log_continues_following_latest_message_when_already_at_bottom() -> 
     LeadGeneratorApp._append_log(SimpleNamespace(log_box=log_box), "Council complete")
 
     assert ("see", "end") in log_box.calls
+
+
+def test_enrichment_progress_shows_application_count() -> None:
+    label = FakeLabel()
+
+    LeadGeneratorApp._set_enrichment_progress(
+        SimpleNamespace(enrichment_label=label),
+        3,
+        8,
+        requested=True,
+    )
+
+    assert label.text == "3 of 8 applications enriched"
+
+
+def test_enrichment_progress_explains_when_not_requested() -> None:
+    label = FakeLabel()
+
+    LeadGeneratorApp._set_enrichment_progress(
+        SimpleNamespace(enrichment_label=label),
+        0,
+        0,
+        requested=False,
+    )
+
+    assert label.text == "PDF enrichment not requested"
