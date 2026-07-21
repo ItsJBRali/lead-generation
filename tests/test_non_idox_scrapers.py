@@ -158,6 +158,20 @@ class FakeAgileHttpClient:
                 status_code=200,
                 text='{"name":"Dudley Metropolitan Borough Council","code":"DUDLEY","url":"dudley","id":359}',
             )
+        if "/document" in url:
+            return FetchResponse(
+                url=url,
+                status_code=200,
+                text="""
+                [{
+                  "documentHash": "HASH001",
+                  "name": "Proposed gates.pdf",
+                  "description": "Proposed entrance gates",
+                  "mediaDescription": "Submitted Drawing",
+                  "receivedDate": "2026-06-10T00:00:00"
+                }]
+                """,
+            )
         return FetchResponse(
             url=url,
             status_code=200,
@@ -1045,6 +1059,23 @@ class NonIdoxScraperTest(unittest.TestCase):
             "https://planning.agileapplications.co.uk/dudley/application-details/76428",
         )
         self.assertTrue(application.raw["detail_complete"])
+
+    def test_agile_fetch_documents_uses_public_document_hash_url(self) -> None:
+        scraper = AgilePlanningScraper(
+            AgileCouncilConfig("Dudley", "https://planning.agileapplications.co.uk/dudley/"),
+            http_client=FakeAgileHttpClient(),
+        )
+
+        documents = scraper.fetch_documents("76428", client_code="DUDLEY")
+
+        self.assertEqual(len(documents), 1)
+        self.assertEqual(documents[0].title, "Proposed gates.pdf")
+        self.assertEqual(documents[0].document_type, "Submitted Drawing")
+        self.assertEqual(documents[0].date_published, "2026-06-10")
+        self.assertEqual(
+            documents[0].url,
+            "https://planningapi.agileapplications.co.uk//api/application/document/DUDLEY/HASH001",
+        )
 
     def test_legacy_agile_apas_search_uses_registered_date_form(self) -> None:
         http = FakeLegacyAgileHttpClient()

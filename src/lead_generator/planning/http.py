@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from datetime import datetime, timezone
 from http.cookiejar import CookieJar
 from dataclasses import dataclass
@@ -474,6 +475,57 @@ class CouncilBrowserClient:
             raise
         except Exception as exc:
             raise CouncilFetchError(f"Browser fallback could not submit {url}: {exc}") from exc
+
+    def get_bytes(
+        self,
+        url: str,
+        params: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> BinaryFetchResponse:
+        """Fetch a file inside the active browser session used by JavaScript-only portals."""
+        del headers
+        if params:
+            separator = "&" if "?" in url else "?"
+            url = f"{url}{separator}{urlencode(params)}"
+        driver = self._ensure_driver()
+        try:
+            result = driver.execute_async_script(
+                """
+                const done = arguments[arguments.length - 1];
+                fetch(arguments[0], {credentials: 'same-origin'})
+                    .then(async (response) => {
+                        const bytes = new Uint8Array(await response.arrayBuffer());
+                        let binary = '';
+                        const chunkSize = 0x8000;
+                        for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+                            binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+                        }
+                        done({
+                            status: response.status,
+                            url: response.url,
+                            body: btoa(binary)
+                        });
+                    })
+                    .catch((error) => done({error: String(error)}));
+                """,
+                url,
+            )
+            _report_request_activity()
+            if not isinstance(result, dict) or result.get("error"):
+                detail = result.get("error") if isinstance(result, dict) else "no response"
+                raise CouncilFetchError(f"Browser fallback download failed for {url}: {detail}")
+            status_code = int(result.get("status") or 0)
+            if status_code >= 400:
+                raise CouncilFetchError(f"HTTP {status_code} while fetching {url}")
+            return BinaryFetchResponse(
+                url=str(result.get("url") or url),
+                status_code=status_code or 200,
+                body=base64.b64decode(str(result.get("body") or "")),
+            )
+        except CouncilFetchError:
+            raise
+        except Exception as exc:
+            raise CouncilFetchError(f"Browser fallback could not download {url}: {exc}") from exc
 
     def _post_ajax(self, url: str, data: dict[str, str]) -> FetchResponse:
         driver = self._ensure_driver()

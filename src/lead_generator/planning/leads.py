@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import csv
 import json
 import re
@@ -60,7 +61,7 @@ from lead_generator.planning.adapters import (
 from lead_generator.planning.adapters.civica import fetch_civica_documents_from_raw
 from lead_generator.planning.adapters.generic import GenericCouncilConfig, GenericLabelledPlanningScraper
 from lead_generator.planning.models import PlanningApplication, PlanningDocument
-from lead_generator.planning.http import monitor_council_requests
+from lead_generator.planning.http import CouncilBrowserClient, monitor_council_requests
 from lead_generator.planning.parsing import clean_text
 from lead_generator.planning.scheduler import (
     PlatformAwareScheduler,
@@ -183,8 +184,11 @@ COUNCIL_SEARCH_INACTIVITY_TIMEOUT_SECONDS = 120.0
 COUNCIL_SEARCH_MAX_ELAPSED_SECONDS = 1200.0
 COUNCIL_SEARCH_HEARTBEAT_SECONDS = 30.0
 DOCUMENT_DOWNLOAD_DELAY_SECONDS = 0.0
+DOCUMENT_DOWNLOAD_RETRY_DELAY_SECONDS = 10.0
+DOCUMENT_DOWNLOAD_ATTEMPTS = 5
+MAX_CONCURRENT_DOCUMENT_BATCHES = 2
 RATE_LIMIT_HTTP_CODES = {429, 503}
-MAX_RETRY_AFTER_SECONDS = 20.0
+MAX_RETRY_AFTER_SECONDS = 60.0
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 20.0
 REQUEST_THROTTLE_SECONDS = 0.25
 PLANIT_REQUEST_THROTTLE_SECONDS = 1.5
@@ -204,6 +208,9 @@ HISTORY_CSV_FIELDS = [
 ]
 _REQUEST_THROTTLE_LOCK = threading.Lock()
 _LAST_REQUEST_AT: dict[str, float] = {}
+_REQUEST_COOLDOWN_UNTIL: dict[str, float] = {}
+_REQUEST_HOST_LOCKS: dict[str, threading.Lock] = {}
+_DOCUMENT_DOWNLOAD_GATE = threading.BoundedSemaphore(MAX_CONCURRENT_DOCUMENT_BATCHES)
 _PLANIT_CONCURRENCY_GATE = threading.BoundedSemaphore(1)
 
 PLANIT_AUTHORITY_ALIASES = {
@@ -748,7 +755,7 @@ def run_lead_search(
                         downloaded_count = download_pdf_documents(application.documents, lead_folder, log=log)
                     else:
                         downloaded_count = 0
-                    if config.download_application_files and application.documents:
+                    if config.download_application_files and downloaded_count:
                         add_captured_document_application(reference)
                     save_row(
                         {
@@ -1357,26 +1364,67 @@ def enrich_planit_application(application: PlanningApplication) -> PlanningAppli
 
 
 def enrich_application_documents(application: PlanningApplication) -> PlanningApplication:
-    if application.documents:
-        return application
+    documents: list[PlanningDocument] = list(application.documents)
+    seen: set[str] = {document.url for document in documents}
+
+    if (application.raw or {}).get("portal_family") == "agile":
+        try:
+            parts = urlsplit(application.url)
+            path_parts = [part for part in parts.path.split("/") if part]
+            slug = path_parts[0] if path_parts else ""
+            scraper = AgilePlanningScraper(
+                AgileCouncilConfig(authority=application.authority, base_url=f"{parts.scheme}://{parts.netloc}/{slug}/")
+            )
+            agile_documents = scraper.fetch_documents(
+                application.uid,
+                client_code=str((application.raw or {}).get("client_code") or "") or None,
+            )
+            for document in agile_documents:
+                document.source_url = application.url
+                if document.url not in seen:
+                    seen.add(document.url)
+                    documents.append(document)
+        except Exception:
+            pass
+
     civica_documents = fetch_civica_documents_from_raw(application.raw or {}, source_url=application.url)
-    if civica_documents:
-        application.documents = civica_documents
-        return application
-    documents: list[PlanningDocument] = []
-    seen: set[str] = set()
+    for document in civica_documents:
+        if document.url not in seen:
+            seen.add(document.url)
+            documents.append(document)
     for docs_url in application_document_source_urls(application):
         try:
             fetched = fetch_planit_documents(docs_url)
         except Exception:
             continue
+        expanded: list[PlanningDocument] = []
         for document in fetched:
+            if "runthirdpartysearch" in document.url.casefold():
+                try:
+                    nested_documents = fetch_planit_documents(document.url)
+                except Exception:
+                    nested_documents = []
+                expanded.extend(nested_documents or [document])
+            else:
+                expanded.append(document)
+        for document in expanded:
             if document.url in seen:
                 continue
             seen.add(document.url)
             documents.append(document)
-    if documents:
-        application.documents = documents
+
+    usable_documents = [document for document in documents if _looks_like_downloadable_document(document)]
+    if not usable_documents and (application.raw or {}).get("portal_family") == "tascomi":
+        try:
+            browser_documents = fetch_browser_document_list(application.url)
+        except Exception:
+            browser_documents = []
+        for document in browser_documents:
+            if document.url not in seen:
+                seen.add(document.url)
+                documents.append(document)
+
+    application.documents = documents
     return application
 
 
@@ -1397,6 +1445,17 @@ def application_document_source_urls(application: PlanningApplication) -> list[s
             candidates.append(url)
 
     raw = application.raw or {}
+    portal_family = str(raw.get("portal_family") or "").casefold()
+    reference = application.reference or application.uid
+    if portal_family == "bath_planning_api" and reference:
+        parts = urlsplit(application.url)
+        add(urlunsplit((parts.scheme, parts.netloc, f"/planningdocuments={quote(reference, safe='')}", "", "")), allow_listing=True)
+    if portal_family == "socrata" and application.authority.casefold() == "camden" and application.uid:
+        add(
+            "https://planningrecords.camden.gov.uk/NECSWS/Redirection/redirect.aspx?"
+            + urlencode({"linkid": "EXDC", "PARAM0": application.uid}),
+            allow_listing=True,
+        )
     add(raw.get("docs_url"), allow_listing=True)
     for value in (raw.get("portal_url"), application.url, raw.get("source_url"), application.source_url):
         derived = document_source_url_from_application_url(str(value)) if value else None
@@ -1472,6 +1531,16 @@ def fetch_planit_documents(docs_url: str) -> list[PlanningDocument]:
             continue
         seen.add(publisher_document.url)
         documents.append(publisher_document)
+    for atrium_document in fetch_atrium_document_list(text, page_url):
+        if atrium_document.url in seen:
+            continue
+        seen.add(atrium_document.url)
+        documents.append(atrium_document)
+    for enterprise_document in fetch_enterprise_document_list(text, page_url, opener):
+        if enterprise_document.url in seen:
+            continue
+        seen.add(enterprise_document.url)
+        documents.append(enterprise_document)
     for arcus_document in fetch_arcus_salesforce_document_list(text, page_url, opener):
         if arcus_document.url in seen:
             continue
@@ -1487,6 +1556,33 @@ def fetch_planit_documents(docs_url: str) -> list[PlanningDocument]:
             continue
         seen.add(arcus_document.url)
         documents.append(arcus_document)
+    return documents
+
+
+def fetch_browser_document_list(page_url: str) -> list[PlanningDocument]:
+    browser = CouncilBrowserClient(timeout_seconds=60)
+    try:
+        response = browser.get(page_url)
+    finally:
+        browser.close()
+    document = html.fromstring(response.text)
+    documents: list[PlanningDocument] = []
+    for anchor in document.xpath("//a[@href]"):
+        href = anchor.get("href") or ""
+        if "fa=downloaddocument" not in href.casefold():
+            continue
+        row = (anchor.xpath("ancestor::tr[1]") or [anchor])[0]
+        description = clean_text(" ".join(row.xpath(".//*[@data-field-name='description']//text()")))
+        document_type = clean_text(" ".join(row.xpath(".//*[@data-field-name='document_type']//text()")))
+        title = description or document_type or document_title_from_url(href)
+        documents.append(
+            PlanningDocument(
+                title=title,
+                url=normalize_url(urljoin(response.url, href)),
+                document_type=document_type,
+                source_url=response.url,
+            )
+        )
     return documents
 
 
@@ -1576,26 +1672,63 @@ def download_pdf_documents(
     *,
     log: LogCallback | None = None,
 ) -> int:
+    document_list = list(documents)
     downloaded = 0
-    for index, document in enumerate(documents, start=1):
-        if not _looks_like_downloadable_document(document):
-            _log(log, f"Skipped excluded document link: {document.title}")
-            continue
-        try:
+    deferred: list[tuple[int, PlanningDocument, Exception]] = []
+    browser: CouncilBrowserClient | None = None
+    browser_source_url: str | None = None
+
+    def download_one(index: int, document: PlanningDocument) -> None:
+        nonlocal browser, browser_source_url, downloaded
+        if _requires_browser_download(document):
+            if browser is None:
+                browser = CouncilBrowserClient(timeout_seconds=60)
+            if document.source_url and browser_source_url != document.source_url:
+                browser.get(document.source_url)
+                browser_source_url = document.source_url
+            response = browser.get_bytes(document.url)
+            downloaded_file = DownloadedFile(
+                payload=response.body,
+                final_url=response.url,
+                content_type=_content_type_from_name(document.title),
+            )
+        else:
             downloaded_file = download_document_file(document)
-            filename = document_filename(document, downloaded_file, fallback=f"document-{index}")
-            path = _unique_path(destination / filename)
-            path.write_bytes(downloaded_file.payload)
-            downloaded += 1
-            if DOCUMENT_DOWNLOAD_DELAY_SECONDS:
-                sleep(DOCUMENT_DOWNLOAD_DELAY_SECONDS)
-        except HTTPError as exc:
-            if exc.code == 404:
-                _log(log, f"Skipped unavailable document link: {document.title}")
-            else:
-                _log(log, f"Could not download {document.title}: HTTP {exc.code}")
-        except Exception as exc:  # pragma: no cover - network resilience
-            _log(log, f"Could not download {document.title}: {exc}")
+        filename = document_filename(document, downloaded_file, fallback=f"document-{index}")
+        path = _unique_path(destination / filename)
+        path.write_bytes(downloaded_file.payload)
+        downloaded += 1
+        if DOCUMENT_DOWNLOAD_DELAY_SECONDS:
+            sleep(DOCUMENT_DOWNLOAD_DELAY_SECONDS)
+
+    with _DOCUMENT_DOWNLOAD_GATE:
+        try:
+            for index, document in enumerate(document_list, start=1):
+                if not _looks_like_downloadable_document(document):
+                    _log(log, f"Skipped excluded document link: {document.title}")
+                    continue
+                try:
+                    download_one(index, document)
+                except Exception as exc:  # pragma: no cover - network resilience
+                    deferred.append((index, document, exc))
+
+            if deferred:
+                _log(log, f"Retrying {len(deferred)} deferred document download(s) after a cooldown")
+                sleep(DOCUMENT_DOWNLOAD_RETRY_DELAY_SECONDS)
+                for index, document, first_error in deferred:
+                    try:
+                        download_one(index, document)
+                    except HTTPError as exc:
+                        if exc.code == 404:
+                            _log(log, f"Skipped unavailable document link: {document.title}")
+                        else:
+                            _log(log, f"Could not download {document.title}: HTTP {exc.code}")
+                    except Exception as exc:  # pragma: no cover - network resilience
+                        final_error = exc or first_error
+                        _log(log, f"Could not download {document.title}: {final_error}")
+        finally:
+            if browser is not None:
+                browser.close()
     return downloaded
 
 
@@ -1695,14 +1828,18 @@ def _download_document_file(document: PlanningDocument) -> DownloadedFile:
         headers = {"User-Agent": USER_AGENT}
         if document.source_url:
             headers["Referer"] = document.source_url
-        request = Request(url, headers=headers)
-        for attempt in range(4):
+        request = _document_request(url, headers)
+        for attempt in range(DOCUMENT_DOWNLOAD_ATTEMPTS):
             try:
                 _throttle_request(url)
                 with opener.open(request, timeout=30) as response:
                     payload = response.read()
                     content_type = response.headers.get("Content-Type", "").lower()
                     final_url = response.geturl() if hasattr(response, "geturl") else url
+                    if _is_atrium_binary_url(url):
+                        encoded = json.loads(payload.decode("utf-8", errors="replace"))
+                        payload = base64.b64decode(encoded)
+                        content_type = _content_type_from_name(document.title)
                     if _is_downloaded_file(payload, content_type, final_url):
                         return DownloadedFile(
                             payload=payload,
@@ -1718,9 +1855,12 @@ def _download_document_file(document: PlanningDocument) -> DownloadedFile:
                 last_error = exc
                 if exc.code == 404:
                     break
-                if exc.code not in RATE_LIMIT_HTTP_CODES or attempt == 3:
+                if exc.code not in RATE_LIMIT_HTTP_CODES or attempt == DOCUMENT_DOWNLOAD_ATTEMPTS - 1:
                     raise
-                sleep(_retry_delay_seconds(exc, 5.0 * (attempt + 1)))
+                delay = _retry_delay_seconds(exc, min(5.0 * (2**attempt), 45.0))
+                _set_request_cooldown(url, delay)
+                sleep(delay)
+                _clear_request_cooldown(url)
                 _skip_next_throttle(url)
             except Exception as exc:
                 last_error = exc
@@ -1742,6 +1882,44 @@ def _download_document_file(document: PlanningDocument) -> DownloadedFile:
                     break
                 break
     raise last_error or RuntimeError(f"Could not download {document.url}")
+
+
+def _document_request(url: str, headers: dict[str, str]) -> Request:
+    if not _is_atrium_binary_url(url):
+        return Request(url, headers=headers)
+    parts = urlsplit(url)
+    data = urlencode(dict(parse_qsl(parts.query, keep_blank_values=True))).encode("utf-8")
+    endpoint = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+    return Request(
+        endpoint,
+        data=data,
+        headers={
+            **headers,
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "X-Requested-With": "XMLHttpRequest",
+        },
+        method="POST",
+    )
+
+
+def _is_atrium_binary_url(url: str) -> bool:
+    return urlsplit(url).path.casefold().endswith("/document/getfilebinary")
+
+
+def _requires_browser_download(document: PlanningDocument) -> bool:
+    return "fa=downloaddocument" in document.url.casefold()
+
+
+def _content_type_from_name(name: str | None) -> str:
+    extension = Path((name or "").replace("\\", "/")).suffix.casefold()
+    return {
+        ".pdf": "application/pdf",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".doc": "application/msword",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    }.get(extension, "application/octet-stream")
 
 
 def source_document_candidates(document: PlanningDocument, opener) -> list[str]:
@@ -1769,6 +1947,8 @@ def source_document_candidates(document: PlanningDocument, opener) -> list[str]:
             for href, title in iter_document_links(page, page_url)
         )
     candidates.extend(fetch_publisher_document_list(text, page_url, opener))
+    candidates.extend(fetch_atrium_document_list(text, page_url))
+    candidates.extend(fetch_enterprise_document_list(text, page_url, opener))
     candidates.extend(fetch_arcus_salesforce_document_list(text, page_url, opener))
     candidates.extend(fetch_arcus_public_register_file_list(text, page_url, opener))
     candidates.extend(fetch_arcus_files_public_document_list(text, page_url, opener))
@@ -1932,18 +2112,119 @@ def fetch_publisher_document_list(text: str, page_url: str, opener) -> list[Plan
     for row in rows:
         if not isinstance(row, list) or len(row) < 2:
             continue
-        link = next((str(value) for value in reversed(row) if isinstance(value, str) and _is_document_href(value)), None)
+        link_index = next(
+            (index for index in range(len(row) - 1, -1, -1) if isinstance(row[index], str) and _is_document_href(row[index])),
+            None,
+        )
+        link = str(row[link_index]) if link_index is not None else None
         if not link:
             continue
         if context_path and link.startswith("/"):
             link = f"{context_path}{link}"
-        title = clean_text(str(row[3] if len(row) > 3 and row[3] else row[0] or "Document"))
+        title_value = next(
+            (
+                row[index]
+                for index in range((link_index or 0) - 1, -1, -1)
+                if isinstance(row[index], str)
+                and clean_text(row[index])
+                and not re.fullmatch(r"\d{1,2}/\d{1,2}/\d{4}", clean_text(row[index]) or "")
+            ),
+            "Document",
+        )
+        title = clean_text(str(title_value)) or "Document"
         documents.append(
             PlanningDocument(
                 title=title,
                 url=normalize_url(urljoin(page_url, link)),
                 document_type=clean_text(str(row[0])) if row and row[0] else None,
                 date_published=clean_text(str(row[1])) if len(row) > 1 and row[1] else None,
+                source_url=page_url,
+            )
+        )
+    return documents
+
+
+def fetch_atrium_document_list(text: str, page_url: str) -> list[PlanningDocument]:
+    try:
+        document = html.fromstring(text)
+    except Exception:
+        return []
+    documents: list[PlanningDocument] = []
+    endpoint = urljoin(page_url, "/Document/GetFileBinary")
+    for row in document.xpath("//tr[@data-module and @data-recordnumber and @data-planid and @data-imageid]"):
+        filename = row.get("data-filename") or "Document"
+        title = Path(filename.replace("\\", "/")).name or "Document"
+        params = {
+            "module": row.get("data-module") or "",
+            "recordNumber": row.get("data-recordnumber") or "",
+            "planID": _integer_string(row.get("data-planid")),
+            "imageID": _integer_string(row.get("data-imageid")),
+            "isPlan": str((row.get("data-storedindatabase") or "").casefold() == "true").casefold(),
+        }
+        documents.append(
+            PlanningDocument(
+                title=title,
+                url=f"{endpoint}?{urlencode(params)}",
+                source_url=page_url,
+            )
+        )
+    return documents
+
+
+def _integer_string(value: str | None) -> str:
+    try:
+        return str(int(float(value or "0")))
+    except ValueError:
+        return "0"
+
+
+def fetch_enterprise_document_list(text: str, page_url: str, opener) -> list[PlanningDocument]:
+    try:
+        document = html.fromstring(text)
+    except Exception:
+        return []
+    endpoints = document.xpath("//*[@id='divDisplayDocumentsUrl']/@data-url")
+    if not endpoints:
+        return []
+    application_number = (parse_qsl(urlsplit(page_url).query) and dict(parse_qsl(urlsplit(page_url).query)).get("applicationNumber"))
+    if not application_number:
+        application_number = clean_text(" ".join(document.xpath("//*[@id='spnApplicationId']//text()")))
+    if not application_number:
+        return []
+    endpoint = urljoin(page_url, endpoints[0])
+    query = urlencode(
+        {
+            "applicationNumber": application_number,
+            "currentPageIndex": "0",
+            "IsDatePublishSortedDescending": "false",
+            "pageSize": "1000",
+        }
+    )
+    request = Request(
+        f"{endpoint}?{query}",
+        data=b"",
+        headers={"User-Agent": USER_AGENT, "Referer": page_url, "X-Requested-With": "XMLHttpRequest"},
+        method="POST",
+    )
+    try:
+        with _open_url_with_retry(request, timeout=45, opener=opener) as response:
+            fragment = response.read().decode("utf-8", errors="replace")
+    except Exception:
+        return []
+    try:
+        fragment_document = html.fromstring(fragment)
+    except Exception:
+        return []
+    documents: list[PlanningDocument] = []
+    for anchor in fragment_document.xpath("//a[@href]"):
+        href = anchor.get("href") or ""
+        if "displaysearchdocument" not in href.casefold():
+            continue
+        title = clean_text(" ".join(anchor.itertext())) or document_title_from_url(href)
+        documents.append(
+            PlanningDocument(
+                title=title,
+                url=normalize_url(urljoin(page_url, href)),
                 source_url=page_url,
             )
         )
@@ -2254,8 +2535,9 @@ def _document_links_from_html(payload: bytes, page_url: str) -> list[str]:
         match = re.search(r"url\s*=\s*([^;]+)", content, flags=re.IGNORECASE)
         if match:
             links.append(urljoin(page_url, match.group(1).strip(" '\"")))
-    for href in re.findall(r"(?:window\.)?location(?:\.href)?\s*=\s*['\"]([^'\"]+)['\"]", text, flags=re.IGNORECASE):
-        links.append(urljoin(page_url, href))
+    redirect_url = _html_redirect_url(text, page_url)
+    if redirect_url:
+        links.append(redirect_url)
     return list(dict.fromkeys(normalize_url(link) for link in links))
 
 
@@ -2339,6 +2621,11 @@ def _is_generic_site_document(href: str | None, title: str | None) -> bool:
         "user-guide",
         "adobe",
         "acrobat",
+        "/documentproduction/letters/documentqueue",
+        "/onlineplanning/getonlinedocumentscount",
+        "/onlineplanning/getonlinedocuments",
+        "/onlineplanning/getcommentattachments",
+        "/onlinedisplaydocument/opencommentattachment",
     )
     return any(token in text for token in generic_tokens)
 
@@ -2355,7 +2642,10 @@ def _is_application_tab_href(href: str | None) -> bool:
     if not href:
         return False
     lowered = href.strip().lower()
-    return "applicationdetails.do" in lowered and "activetab=documents" in lowered
+    parts = urlsplit(lowered)
+    return (
+        "applicationdetails.do" in lowered and "activetab=documents" in lowered
+    ) or parts.fragment in {"tabdocuments", "documents"}
 
 
 def normalize_url(url: str) -> str:
@@ -2541,13 +2831,31 @@ def _build_document_opener(*, verify_tls: bool = True, tls_compat: bool = False)
 
 
 def _fetch_html_with_portal_session(url: str, opener, *, timeout: float) -> tuple[str, str]:
-    request = Request(url, headers={"User-Agent": USER_AGENT})
-    with _open_url_with_retry(request, timeout=timeout, opener=opener) as response:
-        text = response.read().decode("utf-8", errors="replace")
-        page_url = response.geturl()
-    accept_url = _disclaimer_accept_url(text, page_url)
-    if accept_url:
-        accept_request = Request(accept_url, data=b"", headers={"User-Agent": USER_AGENT}, method="POST")
+    page_url = url
+    text = ""
+    for _ in range(4):
+        request = Request(page_url, headers={"User-Agent": USER_AGENT})
+        with _open_url_with_retry(request, timeout=timeout, opener=opener) as response:
+            text = response.read().decode("utf-8", errors="replace")
+            page_url = response.geturl()
+        redirect_url = _html_redirect_url(text, page_url)
+        if not redirect_url or redirect_url == page_url:
+            break
+        page_url = redirect_url
+
+    accept_form = _disclaimer_accept_form(text, page_url)
+    if accept_form:
+        accept_url, accept_data = accept_form
+        accept_request = Request(
+            accept_url,
+            data=urlencode(accept_data).encode("utf-8"),
+            headers={
+                "User-Agent": USER_AGENT,
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Referer": page_url,
+            },
+            method="POST",
+        )
         with _open_url_with_retry(accept_request, timeout=timeout, opener=opener) as response:
             text = response.read().decode("utf-8", errors="replace")
             page_url = response.geturl()
@@ -2572,6 +2880,11 @@ def _fetch_html_document_page(url: str, *, timeout: float):
 
 
 def _disclaimer_accept_url(text: str, page_url: str) -> str | None:
+    accept_form = _disclaimer_accept_form(text, page_url)
+    return accept_form[0] if accept_form else None
+
+
+def _disclaimer_accept_form(text: str, page_url: str) -> tuple[str, dict[str, str]] | None:
     try:
         document = html.fromstring(text)
     except Exception:
@@ -2579,8 +2892,33 @@ def _disclaimer_accept_url(text: str, page_url: str) -> str | None:
     for form in document.xpath("//form[@action]"):
         action = form.get("action") or ""
         if "/disclaimer/accept" in action.casefold():
-            return urljoin(page_url, action)
+            data = {
+                input_node.get("name"): input_node.get("value") or ""
+                for input_node in form.xpath(".//input[@name]")
+            }
+            return urljoin(page_url, action), data
     return None
+
+
+def _html_redirect_url(text: str, page_url: str) -> str | None:
+    try:
+        document = html.fromstring(text)
+    except Exception:
+        document = None
+    if document is not None:
+        refresh_values = document.xpath(
+            "//meta[translate(@http-equiv, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')='refresh']/@content"
+        )
+        for value in refresh_values:
+            match = re.search(r"url\s*=\s*([^;]+)", value, flags=re.IGNORECASE)
+            if match:
+                return normalize_url(urljoin(page_url, match.group(1).strip(" '\"")))
+    match = re.search(
+        r"(?:window\.|document\.)?location(?:\.href)?\s*=\s*['\"]([^'\"]+)['\"]",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return normalize_url(urljoin(page_url, match.group(1))) if match else None
 
 
 def _fetch_json_with_retry(url: str) -> dict[str, object]:
@@ -2622,12 +2960,38 @@ def _throttle_request(url: str) -> None:
         return
     delay = PLANIT_REQUEST_THROTTLE_SECONDS if netloc.endswith("planit.org.uk") else REQUEST_THROTTLE_SECONDS
     with _REQUEST_THROTTLE_LOCK:
-        now = monotonic()
-        wait = delay - (now - _LAST_REQUEST_AT.get(netloc, 0.0))
-        if wait > 0:
-            sleep(wait)
+        host_lock = _REQUEST_HOST_LOCKS.setdefault(netloc, threading.Lock())
+    with host_lock:
+        with _REQUEST_THROTTLE_LOCK:
             now = monotonic()
-        _LAST_REQUEST_AT[netloc] = now
+            ready_at = max(
+                _LAST_REQUEST_AT.get(netloc, 0.0) + delay,
+                _REQUEST_COOLDOWN_UNTIL.get(netloc, 0.0),
+            )
+            wait = max(ready_at - now, 0.0)
+        if wait:
+            sleep(wait)
+        with _REQUEST_THROTTLE_LOCK:
+            _LAST_REQUEST_AT[netloc] = monotonic()
+
+
+def _set_request_cooldown(url: str, seconds: float) -> None:
+    netloc = urlsplit(url).netloc.casefold()
+    if not netloc:
+        return
+    with _REQUEST_THROTTLE_LOCK:
+        _REQUEST_COOLDOWN_UNTIL[netloc] = max(
+            _REQUEST_COOLDOWN_UNTIL.get(netloc, 0.0),
+            monotonic() + max(seconds, 0.0),
+        )
+
+
+def _clear_request_cooldown(url: str) -> None:
+    netloc = urlsplit(url).netloc.casefold()
+    if not netloc:
+        return
+    with _REQUEST_THROTTLE_LOCK:
+        _REQUEST_COOLDOWN_UNTIL.pop(netloc, None)
 
 
 def _skip_next_throttle(url: str) -> None:
@@ -2683,6 +3047,7 @@ def _looks_like_downloadable_document(document: PlanningDocument) -> bool:
         bool(document.url)
         and (
             _is_document_href(document.url)
+            or "runthirdpartysearch" in document.url.casefold()
             or any(extension in text for extension in _known_file_extensions())
             or (document.document_type or "").casefold() in {"pdf", "document", "drawing", "plan", "supporting_document", "image"}
         )

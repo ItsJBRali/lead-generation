@@ -436,6 +436,17 @@ class IdoxPublicAccessScraper(PlanningScraper):
         return clean_text(" ".join(anchor.itertext()))
 
     def _extract_reference(self, anchor: html.HtmlElement, row_text: str | None) -> str | None:
+        if row_text:
+            labelled_match = re.search(
+                r"\b(?:Ref(?:erence)?\.?\s*(?:No\.?)?|Application\s+(?:No\.?|Number|Reference))\s*:\s*"
+                rf"({IDOX_REFERENCE_RE.pattern})",
+                row_text,
+                flags=re.IGNORECASE,
+            )
+            if labelled_match:
+                nested_match = IDOX_REFERENCE_RE.search(labelled_match.group(1))
+                if nested_match:
+                    return nested_match.group(0)
         for value in (clean_text(" ".join(anchor.itertext())), row_text):
             if value:
                 match = IDOX_REFERENCE_RE.search(value)

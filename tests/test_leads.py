@@ -37,6 +37,7 @@ from lead_generator.planning.leads import (
     fetch_arcus_public_register_file_list,
     fetch_arcus_files_public_document_list,
     fetch_arcus_salesforce_document_list,
+    fetch_atrium_document_list,
     fetch_publisher_document_list,
     iter_document_links,
     load_authority_catalogue,
@@ -1824,6 +1825,73 @@ class LeadSearchTest(unittest.TestCase):
             self.assertTrue((Path(directory) / "Existing and proposed elevations.pdf").exists())
             self.assertFalse((Path(directory) / "Existing elevations.pdf").exists())
             self.assertFalse((Path(directory) / "Viewer.exe").exists())
+
+    def test_fetch_atrium_document_list_builds_binary_document_requests(self) -> None:
+        page = """
+        <table><tr data-module="PLA" data-recordnumber="25895"
+          data-planid="370930.0000" data-imageid="5.0000"
+          data-storedindatabase="False"
+          data-filename="\\\\server\\docs\\ApplicationFormRedacted.pdf">
+          <td><button class="viewDocument">View</button></td>
+        </tr></table>
+        """
+
+        documents = fetch_atrium_document_list(
+            page,
+            "https://planning.example.gov.uk/Planning/Display?applicationNumber=26/00001/FUL",
+        )
+
+        self.assertEqual(len(documents), 1)
+        self.assertEqual(documents[0].title, "ApplicationFormRedacted.pdf")
+        self.assertIn("/Document/GetFileBinary?", documents[0].url)
+        self.assertIn("planID=370930", documents[0].url)
+        self.assertIn("isPlan=false", documents[0].url)
+
+    def test_publisher_document_list_uses_stable_name_before_session_bound_link(self) -> None:
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return json.dumps(
+                    {
+                        "data": [
+                            [
+                                "21/07/2026",
+                                "Drawing",
+                                "Proposed entrance gates",
+                                "/docs/SESSION1/Document-SESSION1.pdf",
+                                "",
+                            ]
+                        ]
+                    }
+                ).encode()
+
+        class FakeOpener:
+            def open(self, request, timeout):
+                return FakeResponse()
+
+        page = """
+        <script>
+          var ctx = "/publisher";
+          var table = {"url": "/publisher/mvc/getDocumentList;jsessionid=ABC"};
+        </script>
+        """
+
+        documents = fetch_publisher_document_list(
+            page,
+            "https://planning.example.gov.uk/publisher/mvc/listDocuments",
+            FakeOpener(),
+        )
+
+        self.assertEqual(documents[0].title, "Proposed entrance gates")
+        self.assertEqual(
+            documents[0].url,
+            "https://planning.example.gov.uk/publisher/docs/SESSION1/Document-SESSION1.pdf",
+        )
 
     def test_document_download_retries_viewer_url_as_download_url(self) -> None:
         class FakeResponse:

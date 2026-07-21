@@ -16,7 +16,7 @@ from lead_generator.planning.adapters.generic import (
     GenericLabelledPlanningScraper,
 )
 from lead_generator.planning.http import CouncilFetchError, CouncilHttpClient, FetchResponse
-from lead_generator.planning.models import DiscoveryResult, PlanningApplication
+from lead_generator.planning.models import DiscoveryResult, PlanningApplication, PlanningDocument
 from lead_generator.planning.parsing import clean_text, extract_postcode, parse_council_date
 
 
@@ -117,7 +117,37 @@ class AgilePlanningScraper(GenericLabelledPlanningScraper):
             raise ValueError("Agile application detail response was not a JSON object")
         application = self._application_from_record(payload, url or self.config.base_url, slug, client_code)
         application.raw = {**application.raw, "detail_complete": True}
+        if include_documents:
+            application.documents = self.fetch_documents(uid, client_code=client_code)
         return application
+
+    def fetch_documents(self, uid: str, *, client_code: str | None = None) -> list[PlanningDocument]:
+        slug = self._client_slug or self._slug_from_url(self.config.base_url)
+        code = client_code or self._client_code or self._lookup_client_code(slug)
+        response_text, response_url = self._api_get(
+            f"application/{quote(str(uid), safe='')}/document",
+            {},
+            code,
+        )
+        payload = self._json(response_text, response_url)
+        if not isinstance(payload, list):
+            return []
+        documents: list[PlanningDocument] = []
+        for record in payload:
+            if not isinstance(record, dict) or not record.get("documentHash"):
+                continue
+            name = self._first_value(record, "name", "description", "mediaDescription") or "Document"
+            document_hash = quote(str(record["documentHash"]), safe="")
+            documents.append(
+                PlanningDocument(
+                    title=name,
+                    url=f"{self.API_URL}application/document/{quote(code, safe='')}/{document_hash}",
+                    document_type=self._first_value(record, "mediaDescription"),
+                    date_published=self._date_value(record, "receivedDate"),
+                    description=self._first_value(record, "description"),
+                )
+            )
+        return documents
 
     def parse_listing(self, html_text: str, page_url: str) -> list[PlanningApplication]:
         applications = super().parse_listing(html_text, page_url)
@@ -257,27 +287,31 @@ class AgilePlanningScraper(GenericLabelledPlanningScraper):
             request_path = f"{request_path}?{query}"
         response_url = f"{base.scheme}://{base.netloc}{request_path}"
 
-        context = ssl.create_default_context()
-        if not self.http.verify_tls:
-            context = ssl._create_unverified_context()
-        connection = http.client.HTTPSConnection(
-            base.netloc,
-            timeout=self.http.timeout_seconds,
-            context=context,
-        )
-        try:
-            connection.putrequest("GET", request_path, skip_accept_encoding=True)
-            for key, value in self._api_headers(client_code).items():
-                connection.putheader(key, value)
-            connection.endheaders()
-            response = connection.getresponse()
-            body = response.read()
-            text = body.decode(response.headers.get_content_charset() or "utf-8", errors="replace")
-            if response.status >= 400:
-                raise CouncilFetchError(f"HTTP {response.status} while fetching {response_url}")
-            return text, response_url
-        finally:
-            connection.close()
+        verify_options = (self.http.verify_tls, False) if self.http.verify_tls else (False,)
+        for verify_tls in verify_options:
+            context = ssl.create_default_context() if verify_tls else ssl._create_unverified_context()
+            connection = http.client.HTTPSConnection(
+                base.netloc,
+                timeout=self.http.timeout_seconds,
+                context=context,
+            )
+            try:
+                connection.putrequest("GET", request_path, skip_accept_encoding=True)
+                for key, value in self._api_headers(client_code).items():
+                    connection.putheader(key, value)
+                connection.endheaders()
+                response = connection.getresponse()
+                body = response.read()
+                text = body.decode(response.headers.get_content_charset() or "utf-8", errors="replace")
+                if response.status >= 400:
+                    raise CouncilFetchError(f"HTTP {response.status} while fetching {response_url}")
+                return text, response_url
+            except ssl.SSLCertVerificationError:
+                if not verify_tls:
+                    raise
+            finally:
+                connection.close()
+        raise CouncilFetchError(f"Could not establish a secure connection to {response_url}")
 
     def _application_from_record(
         self,

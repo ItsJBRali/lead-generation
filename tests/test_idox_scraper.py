@@ -186,6 +186,30 @@ class IdoxPublicAccessScraperTest(unittest.TestCase):
         self.assertEqual(application.date_validated, "2026-07-10")
         self.assertTrue(application.raw["detail_complete"])
 
+    def test_parse_listing_prefers_labelled_reference_over_reference_in_proposal(self) -> None:
+        listing_html = """
+        <html><body><ul>
+          <li class="searchresult">
+            <a class="summaryLink" href="/online-applications/applicationDetails.do?keyVal=ABC123XYZ">
+              <div class="summaryLinkTextClamp">Discharge relating to permission 24/03619/FUL for a new access</div>
+            </a>
+            <p class="address">1 Example Road</p>
+            <p class="metaInfo">Ref. No: 26/02374/DIS | Received: Mon 13 Jul 2026</p>
+          </li>
+        </ul></body></html>
+        """
+
+        application = self.scraper.parse_listing(
+            listing_html,
+            "https://planning.example.gov.uk/online-applications/advancedSearchResults.do?action=firstPage",
+        )[0]
+
+        self.assertEqual(application.reference, "26/02374/DIS")
+        self.assertEqual(
+            application.description,
+            "Discharge relating to permission 24/03619/FUL for a new access",
+        )
+
     def test_parse_listing_recognizes_reference_with_letters_before_year(self) -> None:
         listing_html = """
         <html><body><ul>
