@@ -128,6 +128,23 @@ EXCLUDED_PROPOSAL_PHRASES = (
     "removal of condition",
     "partial approval of",
     "noise assessment",
+    "holly -",
+    "please note this is not a planning application",
+    "application for approval of details",
+    "details submitted to satisfy",
+    "display for temporary period",
+    "adjoining consultation",
+    "pending decision",
+    "1 x apple",
+    "consultation by",
+    "consultation request",
+    "details of tree",
+)
+
+EXCLUDED_PROPOSAL_PREFIXES = (
+    "details of condition",
+    "detail of condition",
+    "removal condition",
 )
 
 
@@ -1506,6 +1523,10 @@ def proposal_is_excluded(proposal: str | None) -> bool:
     if normalized.startswith("t1"):
         return True
     if normalized.startswith("g1"):
+        return True
+    if normalized.startswith(EXCLUDED_PROPOSAL_PREFIXES):
+        return True
+    if re.search(r"\bcondition\s+\d+\b", normalized):
         return True
     if "retrospective" in normalized and not re.search(r"\bpart\b", normalized):
         return True

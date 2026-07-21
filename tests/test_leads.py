@@ -248,6 +248,18 @@ class LeadSearchTest(unittest.TestCase):
             "Removal of condition 2 for boundary gates",
             "Partial approval of details for entrance gates",
             "Noise Assessment for new automated gates",
+            "Works to Holly - install replacement boundary gates",
+            "Please note this is not a planning application for new gates",
+            "Application for approval of details for the access gates",
+            "Details submitted to satisfy the approved boundary treatment",
+            "Display for temporary period beside the entrance gates",
+            "Adjoining consultation for a gated development",
+            "Pending decision for the proposed access gates",
+            "Fell 1 x apple beside the entrance gates",
+            "Consultation by the adjoining authority for new gates",
+            "Consultation request regarding boundary gates",
+            "Details of tree works beside the proposed gates",
+            "Installation of gates pursuant to Condition 17",
         ]
 
         for proposal in excluded_proposals:
@@ -259,7 +271,6 @@ class LeadSearchTest(unittest.TestCase):
                     description=proposal,
                     date_received="2026-06-12",
                 )
-
                 self.assertFalse(
                     application_matches(
                         application,
@@ -268,6 +279,46 @@ class LeadSearchTest(unittest.TestCase):
                         ["gates", "access", "boundary"],
                     )
                 )
+
+    def test_application_matches_excludes_new_start_only_proposal_phrases(self) -> None:
+        excluded_proposals = [
+            "Details of condition approval for replacement gates",
+            "Detail of condition submission for boundary gates",
+            "Removal condition application for entrance gates",
+        ]
+        for proposal in excluded_proposals:
+            with self.subTest(proposal=proposal):
+                application = PlanningApplication(
+                    authority="Example",
+                    uid="1",
+                    url="https://example.test",
+                    description=proposal,
+                    date_received="2026-06-12",
+                )
+                self.assertFalse(
+                    application_matches(
+                        application,
+                        date(2026, 6, 1),
+                        date(2026, 6, 30),
+                        ["gates"],
+                    )
+                )
+
+        non_prefixed = PlanningApplication(
+            authority="Example",
+            uid="2",
+            url="https://example.test",
+            description="Replacement gates following details of condition approval",
+            date_received="2026-06-12",
+        )
+        self.assertTrue(
+            application_matches(
+                non_prefixed,
+                date(2026, 6, 1),
+                date(2026, 6, 30),
+                ["gates"],
+            )
+        )
 
     def test_application_matches_excludes_retrospective_unless_part_retrospective(self) -> None:
         retrospective = PlanningApplication(
