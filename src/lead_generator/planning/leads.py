@@ -1904,15 +1904,10 @@ def fetch_planit_documents(
             continue
         seen.add(absolute_url)
         documents.append(PlanningDocument(title=title, url=normalize_url(absolute_url), source_url=page_url))
-    try:
-        publisher_documents = fetch_publisher_document_list(text, page_url, opener)
-    except DocumentDiscoveryTransientError as exc:
-        if discovery_result is None:
-            raise
-        discovery_result.failed_sources.append(
-            DocumentSourceFailure(exc.source_url, str(exc))
-        )
-        publisher_documents = []
+    publisher_documents = _fetch_optional_document_source(
+        lambda: fetch_publisher_document_list(text, page_url, opener),
+        discovery_result,
+    )
     for publisher_document in publisher_documents:
         if publisher_document.url in seen:
             continue
@@ -1923,27 +1918,58 @@ def fetch_planit_documents(
             continue
         seen.add(atrium_document.url)
         documents.append(atrium_document)
-    for enterprise_document in fetch_enterprise_document_list(text, page_url, opener):
+    enterprise_documents = _fetch_optional_document_source(
+        lambda: fetch_enterprise_document_list(text, page_url, opener),
+        discovery_result,
+    )
+    for enterprise_document in enterprise_documents:
         if enterprise_document.url in seen:
             continue
         seen.add(enterprise_document.url)
         documents.append(enterprise_document)
-    for arcus_document in fetch_arcus_salesforce_document_list(text, page_url, opener):
+    arcus_salesforce_documents = _fetch_optional_document_source(
+        lambda: fetch_arcus_salesforce_document_list(text, page_url, opener),
+        discovery_result,
+    )
+    for arcus_document in arcus_salesforce_documents:
         if arcus_document.url in seen:
             continue
         seen.add(arcus_document.url)
         documents.append(arcus_document)
-    for arcus_document in fetch_arcus_public_register_file_list(text, page_url, opener):
+    arcus_public_register_documents = _fetch_optional_document_source(
+        lambda: fetch_arcus_public_register_file_list(text, page_url, opener),
+        discovery_result,
+    )
+    for arcus_document in arcus_public_register_documents:
         if arcus_document.url in seen:
             continue
         seen.add(arcus_document.url)
         documents.append(arcus_document)
-    for arcus_document in fetch_arcus_files_public_document_list(text, page_url, opener):
+    arcus_files_public_documents = _fetch_optional_document_source(
+        lambda: fetch_arcus_files_public_document_list(text, page_url, opener),
+        discovery_result,
+    )
+    for arcus_document in arcus_files_public_documents:
         if arcus_document.url in seen:
             continue
         seen.add(arcus_document.url)
         documents.append(arcus_document)
     return documents
+
+
+def _fetch_optional_document_source(
+    fetch: Callable[[], list[PlanningDocument]],
+    discovery_result: DocumentDiscoveryResult | None,
+) -> list[PlanningDocument]:
+    try:
+        return fetch()
+    except DocumentDiscoveryTransientError as exc:
+        if discovery_result is None:
+            raise
+        discovery_result.failed_sources.append(
+            DocumentSourceFailure(exc.source_url, str(exc))
+        )
+        return []
 
 
 def fetch_browser_document_list(page_url: str) -> list[PlanningDocument]:
@@ -2729,12 +2755,12 @@ def fetch_enterprise_document_list(text: str, page_url: str, opener) -> list[Pla
     try:
         with _open_url_with_retry(request, timeout=45, opener=opener) as response:
             fragment = response.read().decode("utf-8", errors="replace")
-    except Exception:
-        return []
-    try:
         fragment_document = html.fromstring(fragment)
-    except Exception:
-        return []
+    except Exception as exc:
+        raise DocumentDiscoveryTransientError(
+            endpoint,
+            f"Enterprise document list failed: {exc}",
+        ) from exc
     documents: list[PlanningDocument] = []
     for anchor in fragment_document.xpath("//a[@href]"):
         href = anchor.get("href") or ""
@@ -2749,6 +2775,49 @@ def fetch_enterprise_document_list(text: str, page_url: str, opener) -> list[Pla
             )
         )
     return documents
+
+
+def _fetch_arcus_aura_actions(
+    request: Request,
+    endpoint: str,
+    opener,
+    source_name: str,
+) -> list[dict[str, object]]:
+    try:
+        with _open_url_with_retry(request, timeout=45, opener=opener) as response:
+            response_text = response.read().decode("utf-8", errors="replace")
+        payload_data = json.loads(response_text)
+    except Exception as exc:
+        raise DocumentDiscoveryTransientError(
+            endpoint,
+            f"{source_name} document list failed: {exc}",
+        ) from exc
+    actions = payload_data.get("actions") if isinstance(payload_data, dict) else None
+    if (
+        not isinstance(actions, list)
+        or not actions
+        or any(not isinstance(action, dict) for action in actions)
+    ):
+        raise DocumentDiscoveryTransientError(
+            endpoint,
+            f"{source_name} document list returned invalid data",
+        )
+    return actions
+
+
+def _arcus_action_return_value(
+    actions: list[dict[str, object]],
+    endpoint: str,
+    source_name: str,
+) -> object:
+    action = actions[0]
+    state = action.get("state")
+    if state is not None and state != "SUCCESS":
+        raise DocumentDiscoveryTransientError(
+            endpoint,
+            f"{source_name} document list returned state {state}",
+        )
+    return action.get("returnValue")
 
 
 def fetch_arcus_salesforce_document_list(text: str, page_url: str, opener) -> list[PlanningDocument]:
@@ -2803,19 +2872,25 @@ def fetch_arcus_salesforce_document_list(text: str, page_url: str, opener) -> li
         },
         method="POST",
     )
-    try:
-        with _open_url_with_retry(request, timeout=45, opener=opener) as response:
-            response_text = response.read().decode("utf-8", errors="replace")
-    except Exception:
-        return []
-    try:
-        payload_data = json.loads(response_text)
-    except json.JSONDecodeError:
-        return []
-    records: list[dict[str, object]] = []
-    for action in payload_data.get("actions", []):
-        if isinstance(action, dict) and isinstance(action.get("returnValue"), list):
-            records.extend(action["returnValue"])
+    actions = _fetch_arcus_aura_actions(
+        request,
+        endpoint,
+        opener,
+        "Arcus Salesforce",
+    )
+    return_value = _arcus_action_return_value(
+        actions,
+        endpoint,
+        "Arcus Salesforce",
+    )
+    if not isinstance(return_value, list) or any(
+        not isinstance(item, dict) for item in return_value
+    ):
+        raise DocumentDiscoveryTransientError(
+            endpoint,
+            "Arcus Salesforce document list returned invalid data",
+        )
+    records = list(return_value)
     return _salesforce_content_version_documents(records, page_url)
 
 
@@ -2871,22 +2946,30 @@ def fetch_arcus_public_register_file_list(text: str, page_url: str, opener) -> l
         },
         method="POST",
     )
-    try:
-        with _open_url_with_retry(request, timeout=45, opener=opener) as response:
-            response_text = response.read().decode("utf-8", errors="replace")
-    except Exception:
-        return []
-    try:
-        payload_data = json.loads(response_text)
-    except json.JSONDecodeError:
-        return []
-    records: list[dict[str, object]] = []
-    for action in payload_data.get("actions", []):
-        if not isinstance(action, dict):
-            continue
-        return_value = action.get("returnValue")
-        if isinstance(return_value, dict) and isinstance(return_value.get("returnValue"), list):
-            records.extend(item for item in return_value["returnValue"] if isinstance(item, dict))
+    actions = _fetch_arcus_aura_actions(
+        request,
+        endpoint,
+        opener,
+        "Arcus public register",
+    )
+    return_value = _arcus_action_return_value(
+        actions,
+        endpoint,
+        "Arcus public register",
+    )
+    records_value = (
+        return_value.get("returnValue")
+        if isinstance(return_value, dict)
+        else None
+    )
+    if not isinstance(records_value, list) or any(
+        not isinstance(item, dict) for item in records_value
+    ):
+        raise DocumentDiscoveryTransientError(
+            endpoint,
+            "Arcus public register document list returned invalid data",
+        )
+    records = list(records_value)
     return _salesforce_content_version_documents(records, page_url)
 
 
@@ -2963,22 +3046,25 @@ def fetch_arcus_files_public_document_list(text: str, page_url: str, opener) -> 
         },
         method="POST",
     )
-    try:
-        with _open_url_with_retry(request, timeout=45, opener=opener) as response:
-            response_text = response.read().decode("utf-8", errors="replace")
-    except Exception:
-        return []
-    try:
-        payload_data = json.loads(response_text)
-    except json.JSONDecodeError:
-        return []
-    records: list[dict[str, object]] = []
-    for action in payload_data.get("actions", []):
-        if not isinstance(action, dict):
-            continue
-        return_value = action.get("returnValue")
-        if isinstance(return_value, list):
-            records.extend(item for item in return_value if isinstance(item, dict))
+    actions = _fetch_arcus_aura_actions(
+        request,
+        endpoint,
+        opener,
+        "Arcus FilesPublic",
+    )
+    return_value = _arcus_action_return_value(
+        actions,
+        endpoint,
+        "Arcus FilesPublic",
+    )
+    if not isinstance(return_value, list) or any(
+        not isinstance(item, dict) for item in return_value
+    ):
+        raise DocumentDiscoveryTransientError(
+            endpoint,
+            "Arcus FilesPublic document list returned invalid data",
+        )
+    records = list(return_value)
     return _salesforce_content_version_documents(records, page_url)
 
 

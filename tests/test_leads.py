@@ -47,6 +47,8 @@ from lead_generator.planning.leads import (
     fetch_arcus_files_public_document_list,
     fetch_arcus_salesforce_document_list,
     fetch_atrium_document_list,
+    fetch_enterprise_document_list,
+    fetch_planit_documents,
     fetch_publisher_document_list,
     iter_document_links,
     load_authority_catalogue,
@@ -2738,6 +2740,157 @@ class LeadSearchTest(unittest.TestCase):
                     page_url,
                     object(),
                 )
+
+    def test_fetch_planit_documents_records_enterprise_failure_and_keeps_direct_links(self) -> None:
+        page_url = "https://planning.example.test/application?applicationNumber=26%2F001"
+        endpoint = "https://planning.example.test/documents/list"
+        page_html = f"""
+            <html><body>
+              <a href="/documents/direct-plan.pdf">Direct plan.pdf</a>
+              <div id="divDisplayDocumentsUrl" data-url="{endpoint}"></div>
+            </body></html>
+        """
+        unavailable = HTTPError(endpoint, 503, "Unavailable", {}, None)
+        discovery = DocumentDiscoveryResult()
+
+        with (
+            patch(
+                "lead_generator.planning.leads._fetch_html_document_page",
+                return_value=(page_html, page_url, object()),
+            ),
+            patch("lead_generator.planning.leads._open_url_with_retry", side_effect=unavailable),
+        ):
+            documents = fetch_planit_documents(page_url, discovery_result=discovery)
+
+        self.assertIn("Direct plan.pdf", [document.title for document in documents])
+        self.assertEqual([failure.source_url for failure in discovery.failed_sources], [endpoint])
+        self.assertIn("503", discovery.failed_sources[0].reason)
+
+    def test_fetch_planit_documents_propagates_enterprise_failure_without_collector(self) -> None:
+        page_url = "https://planning.example.test/application?applicationNumber=26%2F001"
+        endpoint = "https://planning.example.test/documents/list"
+        page_html = f'<div id="divDisplayDocumentsUrl" data-url="{endpoint}"></div>'
+        unavailable = HTTPError(endpoint, 503, "Unavailable", {}, None)
+
+        with (
+            patch(
+                "lead_generator.planning.leads._fetch_html_document_page",
+                return_value=(page_html, page_url, object()),
+            ),
+            patch("lead_generator.planning.leads._open_url_with_retry", side_effect=unavailable),
+        ):
+            with self.assertRaisesRegex(DocumentDiscoveryTransientError, "documents/list"):
+                fetch_planit_documents(page_url)
+
+    def test_fetch_enterprise_document_list_propagates_malformed_fragment(self) -> None:
+        class EmptyResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return b""
+
+        page_url = "https://planning.example.test/application?applicationNumber=26%2F001"
+        endpoint = "https://planning.example.test/documents/list"
+        page_html = f'<div id="divDisplayDocumentsUrl" data-url="{endpoint}"></div>'
+
+        with patch(
+            "lead_generator.planning.leads._open_url_with_retry",
+            return_value=EmptyResponse(),
+        ):
+            with self.assertRaisesRegex(DocumentDiscoveryTransientError, "documents/list"):
+                fetch_enterprise_document_list(page_html, page_url, object())
+
+    def test_fetch_planit_documents_records_all_arcus_failures_and_keeps_direct_links(self) -> None:
+        boot = {
+            "mode": "PROD",
+            "app": "siteforce:napiliApp",
+            "fwuid": "FWUID",
+            "loaded": {"APPLICATION@markup://siteforce:napiliApp": "APPHASH"},
+            "pathPrefix": "/pr",
+        }
+        page_url = "https://planning.example.test/pr/s/planning-application/a0iABC/pl202600001"
+        page_html = (
+            '<a href="/documents/direct-plan.pdf">Direct plan.pdf</a>'
+            f'<script src="/pr/s/sfsites/l/{quote(json.dumps(boot, separators=(",", ":")), safe="")}/bootstrap.js"></script>'
+        )
+        unavailable = HTTPError(page_url, 503, "Unavailable", {}, None)
+        discovery = DocumentDiscoveryResult()
+
+        with (
+            patch(
+                "lead_generator.planning.leads._fetch_html_document_page",
+                return_value=(page_html, page_url, object()),
+            ),
+            patch("lead_generator.planning.leads._open_url_with_retry", side_effect=unavailable),
+        ):
+            documents = fetch_planit_documents(page_url, discovery_result=discovery)
+
+        self.assertIn("Direct plan.pdf", [document.title for document in documents])
+        self.assertEqual(len(discovery.failed_sources), 3)
+        failed_urls = [failure.source_url for failure in discovery.failed_sources]
+        self.assertTrue(any("findContentVersionsForPlanning=1" in url for url in failed_urls))
+        self.assertTrue(any("aura.ApexAction.execute=1" in url for url in failed_urls))
+        self.assertTrue(any("arcshared.FilesPublicCont.getFiles=1" in url for url in failed_urls))
+
+    def test_arcus_document_list_fetchers_propagate_malformed_and_invalid_json(self) -> None:
+        class FakeResponse:
+            def __init__(self, payload: bytes) -> None:
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return self.payload
+
+        boot = {
+            "mode": "PROD",
+            "app": "siteforce:napiliApp",
+            "fwuid": "FWUID",
+            "loaded": {"APPLICATION@markup://siteforce:napiliApp": "APPHASH"},
+            "pathPrefix": "/pr",
+        }
+        page_html = f'<script src="/pr/s/sfsites/l/{quote(json.dumps(boot, separators=(",", ":")), safe="")}/bootstrap.js"></script>'
+        page_url = "https://planning.example.test/pr/s/planning-application/a0iABC/pl202600001"
+        fetchers = (
+            fetch_arcus_salesforce_document_list,
+            fetch_arcus_public_register_file_list,
+            fetch_arcus_files_public_document_list,
+        )
+
+        for fetcher in fetchers:
+            for payload in (b"not-json", b'{"actions": {}}'):
+                with self.subTest(fetcher=fetcher.__name__, payload=payload):
+                    with patch(
+                        "lead_generator.planning.leads._open_url_with_retry",
+                        return_value=FakeResponse(payload),
+                    ):
+                        with self.assertRaises(DocumentDiscoveryTransientError):
+                            fetcher(page_html, page_url, object())
+
+    def test_dynamic_document_fetchers_ignore_unadvertised_sources(self) -> None:
+        page_url = "https://planning.example.test/application"
+        fetchers = (
+            fetch_enterprise_document_list,
+            fetch_arcus_salesforce_document_list,
+            fetch_arcus_public_register_file_list,
+            fetch_arcus_files_public_document_list,
+        )
+
+        with patch(
+            "lead_generator.planning.leads._open_url_with_retry",
+            side_effect=AssertionError("No dynamic endpoint should be requested"),
+        ):
+            for fetcher in fetchers:
+                with self.subTest(fetcher=fetcher.__name__):
+                    self.assertEqual(fetcher("<html></html>", page_url, object()), [])
 
     def test_fetch_arcus_salesforce_document_list_reads_aura_rows(self) -> None:
         class FakeResponse:
