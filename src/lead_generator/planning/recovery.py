@@ -307,7 +307,10 @@ def _existing_file_matches_document(path: Path, document: PlanningDocument) -> b
     if Path(expected_name).suffix:
         return False
     existing_path = Path(existing_name)
-    return bool(existing_path.suffix) and existing_path.stem.casefold() == expected_name
+    return (
+        existing_path.suffix.casefold() == ".pdf"
+        and existing_path.stem.casefold() == expected_name
+    )
 
 
 def recover_search_output(

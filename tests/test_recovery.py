@@ -6,6 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from lead_generator.planning.enrichment import ContactEnrichment
 from lead_generator.planning.leads import (
     APPLICATION_CSV_FIELDS,
@@ -479,6 +481,54 @@ def test_recovery_matches_extensionless_title_to_existing_pdf_only(tmp_path: Pat
         recover_search_output(tmp_path)
 
     assert captured == [unrelated]
+
+
+@pytest.mark.parametrize(
+    ("existing_suffix", "expected_download"),
+    [
+        (".txt", True),
+        (".exe", True),
+        (".PDF", False),
+    ],
+)
+def test_extensionless_title_only_matches_existing_pdf(
+    tmp_path: Path,
+    existing_suffix: str,
+    expected_download: bool,
+) -> None:
+    row = _row()
+    initialise_csv(tmp_path / "applications.csv", APPLICATION_CSV_FIELDS)
+    append_csv_row(tmp_path / "applications.csv", APPLICATION_CSV_FIELDS, row)
+    catalogue = json.loads(_catalogue_json("Example Council"))
+    folder = tmp_path / "Example Council" / "REF-1"
+    folder.mkdir(parents=True)
+    (folder / f"Proposed Elevations{existing_suffix}").write_bytes(b"existing")
+    document = PlanningDocument(
+        "Proposed Elevations",
+        "https://docs.test/proposed-elevations.pdf",
+    )
+    captured: list[PlanningDocument] = []
+
+    def fake_download(documents, destination, **kwargs):
+        batch = list(documents)
+        captured.extend(batch)
+        return DocumentDownloadBatchResult(downloaded_count=len(batch))
+
+    with (
+        patch("lead_generator.planning.recovery.load_authority_catalogue", return_value=catalogue),
+        patch(
+            "lead_generator.planning.recovery.discover_application_documents",
+            return_value=DocumentDiscoveryResult(
+                documents=[document],
+                successful_sources=[row["application link"]],
+            ),
+        ),
+        patch("lead_generator.planning.recovery._download_pdf_documents_once", side_effect=fake_download),
+        patch("lead_generator.planning.recovery.enrich_application_folder", return_value=ContactEnrichment()),
+    ):
+        recover_search_output(tmp_path)
+
+    assert captured == ([document] if expected_download else [])
 
 
 def test_recovery_summary_counts_each_unresolved_failure_entry(tmp_path: Path) -> None:
