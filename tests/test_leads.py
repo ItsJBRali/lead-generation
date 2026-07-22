@@ -2194,6 +2194,20 @@ class LeadSearchTest(unittest.TestCase):
 
         self.assertIn(expected, planit_document_source_urls(application))
 
+    def test_bath_document_source_uses_active_application_host(self) -> None:
+        application = PlanningApplication(
+            authority="Bath and North East Somerset",
+            uid="26/1049/FUL",
+            reference="26/1049/FUL",
+            url="https://planning.bathnes.gov.uk/application/26-1049-FUL",
+            raw={"portal_family": "bath_planning_api"},
+        )
+
+        self.assertIn(
+            "https://planning.bathnes.gov.uk/planningdocuments=26%2F1049%2FFUL",
+            planit_document_source_urls(application),
+        )
+
     def test_associated_document_source_reads_wandsworth_link_once(self) -> None:
         page_url = "https://planning2.wandsworth.gov.uk/planningcase/CaseDetails.aspx?case=2026/2589"
         markup = """
