@@ -17,6 +17,7 @@ from lead_generator.planning.leads import (
     DOCUMENT_DOWNLOAD_RETRY_DELAY_SECONDS,
     CouncilTarget,
     DocumentDownloadBatchResult,
+    DocumentDownloadFailure,
     DocumentDiscoveryResult,
     DocumentSourceFailure,
     _download_pdf_documents_once,
@@ -80,6 +81,9 @@ class _RecoveryItem:
     pending_documents: list[PlanningDocument] = field(default_factory=list)
     successful_sources: set[str] = field(default_factory=set)
     discovery_failures: list[DocumentSourceFailure] = field(default_factory=list)
+    download_failures: dict[str, DocumentDownloadFailure] = field(default_factory=dict)
+    processing_failures: list[DocumentSourceFailure] = field(default_factory=list)
+    setup_failed: bool = False
     enrichment: ContactEnrichment | None = None
 
 
@@ -121,9 +125,9 @@ def _application_from_row(
     row: dict[str, str],
     catalogue: dict[str, CouncilTarget],
 ) -> PlanningApplication:
-    council = (row.get("council") or "").strip()
-    reference = (row.get("Reference") or "").strip()
-    application_link = (row.get("application link") or "").strip()
+    council = _row_text(row, "council")
+    reference = _row_text(row, "Reference")
+    application_link = _row_text(row, "application link")
     target = catalogue.get(council.casefold())
     if target is None:
         parsed = urlsplit(application_link)
@@ -156,9 +160,9 @@ def _application_from_row(
         uid=uid or reference,
         url=application_link or target.base_url,
         reference=reference,
-        address=row.get("address") or None,
-        description=row.get("proposal") or None,
-        date_received=row.get("date received") or None,
+        address=_row_text(row, "address") or None,
+        description=_row_text(row, "proposal") or None,
+        date_received=_row_text(row, "date received") or None,
         source_url=target.listing_url,
         raw=raw,
     )
@@ -180,6 +184,50 @@ def _recovery_item(
     return _RecoveryItem(dict(row), application, folder)
 
 
+def _row_text(row: dict[str, str], key: str) -> str:
+    value = row.get(key)
+    return "" if value is None else str(value).strip()
+
+
+def _failed_recovery_item(
+    row: dict[str, str],
+    catalogue: dict[str, CouncilTarget],
+    output_dir: Path,
+    exc: Exception,
+) -> _RecoveryItem:
+    try:
+        application = _application_from_row(row, catalogue)
+    except Exception:
+        council = _row_text(row, "council")
+        reference = _row_text(row, "Reference")
+        application_link = _row_text(row, "application link")
+        application = PlanningApplication(
+            authority=council,
+            uid=reference or "unknown",
+            url=application_link,
+            reference=reference,
+            address=_row_text(row, "address") or None,
+            description=_row_text(row, "proposal") or None,
+            date_received=_row_text(row, "date received") or None,
+        )
+    reference = application.reference or application.uid or "unknown"
+    folder = (
+        output_dir
+        / sanitize_path_part(application.authority or "Unknown Council")
+        / sanitize_path_part(reference)
+    )
+    source = application.url or f"input row {reference}"
+    return _RecoveryItem(
+        original_row=dict(row),
+        application=application,
+        folder=folder,
+        processing_failures=[
+            DocumentSourceFailure(source, f"application folder setup failed: {exc}")
+        ],
+        setup_failed=True,
+    )
+
+
 def _recover_documents(
     item: _RecoveryItem,
     *,
@@ -195,20 +243,20 @@ def _recover_documents(
     item.successful_sources.update(discovery.successful_sources)
     item.discovery_failures = list(discovery.failed_sources)
 
-    existing_names = {
-        sanitize_path_part(path.name).casefold()
+    existing_paths = [
+        path
         for path in item.folder.iterdir()
         if path.is_file()
-    }
+    ]
     pending_by_url = {document.url: document for document in item.pending_documents}
     for document in discovery.documents:
         if not _looks_like_downloadable_document(document):
             continue
         if document.url in item.processed_document_urls or document.url in pending_by_url:
             continue
-        expected_name = sanitize_path_part(document.title).casefold()
-        if expected_name in existing_names:
+        if any(_existing_file_matches_document(path, document) for path in existing_paths):
             item.processed_document_urls.add(document.url)
+            item.download_failures.pop(document.url, None)
             continue
         pending_by_url[document.url] = document
 
@@ -224,17 +272,42 @@ def _recover_documents(
             defer_transient=not final_attempt,
         )
     except Exception as exc:
-        item.discovery_failures.append(
-            DocumentSourceFailure(item.application.url, f"document download failed: {exc}")
-        )
         batch = DocumentDownloadBatchResult(
             transient_documents=[] if final_attempt else attempted,
+            failures=[
+                DocumentDownloadFailure(
+                    document,
+                    f"document download failed: {exc}",
+                )
+                for document in attempted
+            ],
         )
     transient_urls = {document.url for document in batch.transient_documents}
+    failed_urls = {failure.document.url for failure in batch.failures}
+    for failure in batch.failures:
+        item.download_failures[failure.document.url] = failure
+    successful_urls = {
+        document.url
+        for document in attempted
+        if document.url not in transient_urls and document.url not in failed_urls
+    }
+    for url in successful_urls:
+        item.download_failures.pop(url, None)
     item.processed_document_urls.update(
-        document.url for document in attempted if document.url not in transient_urls
+        successful_urls
     )
     item.pending_documents = list(batch.transient_documents)
+
+
+def _existing_file_matches_document(path: Path, document: PlanningDocument) -> bool:
+    existing_name = sanitize_path_part(path.name).casefold()
+    expected_name = sanitize_path_part(document.title).casefold()
+    if existing_name == expected_name:
+        return True
+    if Path(expected_name).suffix:
+        return False
+    existing_path = Path(existing_name)
+    return bool(existing_path.suffix) and existing_path.stem.casefold() == expected_name
 
 
 def recover_search_output(
@@ -250,12 +323,20 @@ def recover_search_output(
     with original_csv.open(newline="", encoding="utf-8-sig") as handle:
         input_rows = [dict(row) for row in csv.DictReader(handle)]
     catalogue = _catalogue_index(load_authority_catalogue())
-    items = [_recovery_item(row, catalogue, output_dir) for row in input_rows]
+    items: list[_RecoveryItem] = []
+    for row in input_rows:
+        try:
+            item = _recovery_item(row, catalogue, output_dir)
+        except Exception as exc:
+            item = _failed_recovery_item(row, catalogue, output_dir, exc)
+        items.append(item)
 
     deferred_items: list[_RecoveryItem] = []
     for item in items:
+        if item.setup_failed:
+            continue
         _recover_documents(item, final_attempt=False, log=log)
-        if item.pending_documents or item.discovery_failures:
+        if item.pending_documents or item.discovery_failures or item.download_failures:
             deferred_items.append(item)
 
     if deferred_items and _wait_for_document_retry_cooldown(
@@ -268,6 +349,9 @@ def recover_search_output(
             _recover_documents(item, final_attempt=True, log=log)
 
     for item in items:
+        if item.setup_failed:
+            item.enrichment = ContactEnrichment()
+            continue
         try:
             item.enrichment = enrich_application_folder(
                 item.folder,
@@ -276,7 +360,7 @@ def recover_search_output(
             )
         except Exception as exc:
             item.enrichment = ContactEnrichment()
-            item.discovery_failures.append(
+            item.processing_failures.append(
                 DocumentSourceFailure(item.application.url, f"enrichment failed: {exc}")
             )
 
@@ -288,7 +372,7 @@ def recover_search_output(
     return RecoverySummary(
         rows_processed=len(items),
         applications_with_documents=sum(_folder_has_permitted_pdf(item.folder) for item in items),
-        discovery_failures=sum(bool(item.discovery_failures) for item in items),
+        discovery_failures=sum(len(_unresolved_failures(item)) for item in items),
         corrected_csv_path=corrected_path,
         audit_csv_path=audit_path,
     )
@@ -332,13 +416,26 @@ def _remaining_failed_fields(enrichment: ContactEnrichment) -> str:
 
 
 def _discovery_status(item: _RecoveryItem) -> str:
-    if item.discovery_failures:
+    failures = _unresolved_failures(item)
+    if failures:
         failures = " | ".join(
             f"{failure.source_url}: {failure.reason}"
-            for failure in item.discovery_failures
+            for failure in failures
         )
         return f"Partial/Failed: {failures}"
     return f"Completed: {len(item.successful_sources)} source(s) checked"
+
+
+def _unresolved_failures(item: _RecoveryItem) -> list[DocumentSourceFailure]:
+    download_failures = [
+        DocumentSourceFailure(failure.document.url, failure.reason)
+        for failure in item.download_failures.values()
+    ]
+    return [
+        *item.discovery_failures,
+        *download_failures,
+        *item.processing_failures,
+    ]
 
 
 def _folder_has_permitted_pdf(folder: Path) -> bool:

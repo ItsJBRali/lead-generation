@@ -2428,6 +2428,48 @@ class LeadSearchTest(unittest.TestCase):
         self.assertEqual(result.downloaded_count, 0)
         self.assertEqual(result.transient_documents, documents)
 
+    def test_document_batch_reports_permanent_and_final_transient_failures(self) -> None:
+        documents = [
+            PlanningDocument(
+                title="Missing plan.pdf",
+                url="https://documents.example.gov.uk/missing.pdf",
+            ),
+            PlanningDocument(
+                title="Rate limited plan.pdf",
+                url="https://planning.example.gov.uk/docs/rate-limited.pdf",
+            ),
+            PlanningDocument(
+                title="Blocked sibling plan.pdf",
+                url="https://planning.example.gov.uk/docs/blocked-sibling.pdf",
+            ),
+        ]
+
+        def fail_download(document, **kwargs):
+            code = 404 if "missing" in document.url else 503
+            raise HTTPError(document.url, code, "Unavailable", {}, None)
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch(
+                "lead_generator.planning.leads.download_document_file",
+                side_effect=fail_download,
+            ) as download_file:
+                result = _download_pdf_documents_once(
+                    documents,
+                    Path(directory),
+                    defer_transient=False,
+                )
+
+        self.assertEqual(download_file.call_count, 2)
+        self.assertEqual(result.transient_documents, [])
+        self.assertEqual(
+            [(failure.document, failure.reason) for failure in result.failures],
+            [
+                (documents[0], "HTTP 404"),
+                (documents[1], "HTTP 503"),
+                (documents[2], "portal remained unavailable"),
+            ],
+        )
+
     def test_document_rate_limit_backoff_stops_when_cancelled(self) -> None:
         document = PlanningDocument(
             title="Proposed plan.pdf",

@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from lead_generator.planning.enrichment import ContactEnrichment
@@ -19,6 +20,7 @@ from lead_generator.planning.leads import (
 from lead_generator.planning.models import PlanningApplication, PlanningDocument
 from lead_generator.planning.recovery import (
     _application_from_row,
+    _recovery_item,
     recover_search_output,
 )
 
@@ -322,3 +324,181 @@ def test_recovery_isolates_row_errors_and_categorizes_missing_drawings(tmp_path:
     assert "no eligible drawing published" in audit_rows[0]["Remaining Failed Fields"]
     assert audit_rows[1]["Document Discovery Status"] == "Completed: 1 source(s) checked"
     assert summary.discovery_failures == 1
+
+
+def test_recovery_reports_a_document_that_permanently_failed_to_download(tmp_path: Path) -> None:
+    row = _row()
+    initialise_csv(tmp_path / "applications.csv", APPLICATION_CSV_FIELDS)
+    append_csv_row(tmp_path / "applications.csv", APPLICATION_CSV_FIELDS, row)
+    catalogue = json.loads(_catalogue_json("Example Council"))
+    document = PlanningDocument(
+        "Proposed Elevations.pdf",
+        "https://docs.test/proposed-elevations.pdf",
+    )
+    discovery = DocumentDiscoveryResult(
+        documents=[document],
+        successful_sources=[row["application link"]],
+    )
+    failed_batch = SimpleNamespace(
+        downloaded_count=0,
+        transient_documents=[],
+        failures=[SimpleNamespace(document=document, reason="HTTP 404")],
+    )
+
+    with (
+        patch("lead_generator.planning.recovery.load_authority_catalogue", return_value=catalogue),
+        patch("lead_generator.planning.recovery.discover_application_documents", return_value=discovery),
+        patch("lead_generator.planning.recovery._download_pdf_documents_once", return_value=failed_batch),
+        patch("lead_generator.planning.recovery._wait_for_document_retry_cooldown", return_value=False),
+        patch("lead_generator.planning.recovery.enrich_application_folder", return_value=ContactEnrichment()),
+    ):
+        summary = recover_search_output(tmp_path)
+
+    with summary.audit_csv_path.open(encoding="utf-8") as handle:
+        audit_row = next(csv.DictReader(handle))
+    assert audit_row["Document Discovery Status"] == (
+        "Partial/Failed: https://docs.test/proposed-elevations.pdf: HTTP 404"
+    )
+    assert summary.discovery_failures == 1
+
+
+def test_recovery_clears_a_download_failure_after_successful_final_retry(tmp_path: Path) -> None:
+    row = _row()
+    initialise_csv(tmp_path / "applications.csv", APPLICATION_CSV_FIELDS)
+    append_csv_row(tmp_path / "applications.csv", APPLICATION_CSV_FIELDS, row)
+    catalogue = json.loads(_catalogue_json("Example Council"))
+    document = PlanningDocument(
+        "Proposed Elevations.pdf",
+        "https://docs.test/proposed-elevations.pdf",
+    )
+    discovery = DocumentDiscoveryResult(
+        documents=[document],
+        successful_sources=[row["application link"]],
+    )
+    download_calls = 0
+
+    def fake_download(documents, destination, **kwargs):
+        nonlocal download_calls
+        download_calls += 1
+        attempted = list(documents)
+        if download_calls == 1:
+            return SimpleNamespace(
+                downloaded_count=0,
+                transient_documents=[],
+                failures=[SimpleNamespace(document=attempted[0], reason="HTTP 503")],
+            )
+        (destination / "Proposed Elevations.pdf").write_bytes(b"%PDF-1.4")
+        return SimpleNamespace(downloaded_count=1, transient_documents=[], failures=[])
+
+    with (
+        patch("lead_generator.planning.recovery.load_authority_catalogue", return_value=catalogue),
+        patch("lead_generator.planning.recovery.discover_application_documents", return_value=discovery),
+        patch("lead_generator.planning.recovery._download_pdf_documents_once", side_effect=fake_download),
+        patch("lead_generator.planning.recovery._wait_for_document_retry_cooldown", return_value=True),
+        patch("lead_generator.planning.recovery.enrich_application_folder", return_value=ContactEnrichment()),
+    ):
+        summary = recover_search_output(tmp_path)
+
+    with summary.audit_csv_path.open(encoding="utf-8") as handle:
+        audit_row = next(csv.DictReader(handle))
+    assert download_calls == 2
+    assert audit_row["Document Discovery Status"] == "Completed: 1 source(s) checked"
+    assert summary.discovery_failures == 0
+
+
+def test_recovery_isolates_application_folder_construction_per_row(tmp_path: Path) -> None:
+    rows = [_row(reference) for reference in ("REF-1", "REF-2")]
+    initialise_csv(tmp_path / "applications.csv", APPLICATION_CSV_FIELDS)
+    append_csv_rows(tmp_path / "applications.csv", APPLICATION_CSV_FIELDS, rows)
+    original_text = (tmp_path / "applications.csv").read_text(encoding="utf-8")
+    catalogue = json.loads(_catalogue_json("Example Council"))
+
+    def fail_first_folder(row, targets, output_dir):
+        if row["Reference"] == "REF-1":
+            raise OSError("folder access denied")
+        return _recovery_item(row, targets, output_dir)
+
+    with (
+        patch("lead_generator.planning.recovery.load_authority_catalogue", return_value=catalogue),
+        patch("lead_generator.planning.recovery._recovery_item", side_effect=fail_first_folder),
+        patch(
+            "lead_generator.planning.recovery.discover_application_documents",
+            return_value=DocumentDiscoveryResult(successful_sources=[rows[1]["application link"]]),
+        ),
+        patch("lead_generator.planning.recovery.enrich_application_folder", return_value=ContactEnrichment()),
+    ):
+        summary = recover_search_output(tmp_path)
+
+    assert (tmp_path / "applications.csv").read_text(encoding="utf-8") == original_text
+    with summary.corrected_csv_path.open(encoding="utf-8") as handle:
+        corrected_rows = list(csv.DictReader(handle))
+    with summary.audit_csv_path.open(encoding="utf-8") as handle:
+        audit_rows = list(csv.DictReader(handle))
+    assert [row["Reference"] for row in corrected_rows] == ["REF-1", "REF-2"]
+    assert [row["Reference"] for row in audit_rows] == ["REF-1", "REF-2"]
+    assert audit_rows[0]["Document Discovery Status"].endswith(
+        "application folder setup failed: folder access denied"
+    )
+    assert audit_rows[1]["Document Discovery Status"] == "Completed: 1 source(s) checked"
+
+
+def test_recovery_matches_extensionless_title_to_existing_pdf_only(tmp_path: Path) -> None:
+    row = _row()
+    initialise_csv(tmp_path / "applications.csv", APPLICATION_CSV_FIELDS)
+    append_csv_row(tmp_path / "applications.csv", APPLICATION_CSV_FIELDS, row)
+    catalogue = json.loads(_catalogue_json("Example Council"))
+    folder = tmp_path / "Example Council" / "REF-1"
+    folder.mkdir(parents=True)
+    (folder / "Proposed Elevations.pdf").write_bytes(b"%PDF-1.4")
+    existing = PlanningDocument(
+        "Proposed Elevations",
+        "https://docs.test/proposed-elevations.pdf",
+    )
+    unrelated = PlanningDocument(
+        "Proposed Elevations Revised",
+        "https://docs.test/proposed-elevations-revised.pdf",
+    )
+    captured: list[PlanningDocument] = []
+
+    def fake_download(documents, destination, **kwargs):
+        captured.extend(documents)
+        return DocumentDownloadBatchResult(downloaded_count=len(captured))
+
+    with (
+        patch("lead_generator.planning.recovery.load_authority_catalogue", return_value=catalogue),
+        patch(
+            "lead_generator.planning.recovery.discover_application_documents",
+            return_value=DocumentDiscoveryResult(
+                documents=[existing, unrelated],
+                successful_sources=[row["application link"]],
+            ),
+        ),
+        patch("lead_generator.planning.recovery._download_pdf_documents_once", side_effect=fake_download),
+        patch("lead_generator.planning.recovery.enrich_application_folder", return_value=ContactEnrichment()),
+    ):
+        recover_search_output(tmp_path)
+
+    assert captured == [unrelated]
+
+
+def test_recovery_summary_counts_each_unresolved_failure_entry(tmp_path: Path) -> None:
+    row = _row()
+    initialise_csv(tmp_path / "applications.csv", APPLICATION_CSV_FIELDS)
+    append_csv_row(tmp_path / "applications.csv", APPLICATION_CSV_FIELDS, row)
+    catalogue = json.loads(_catalogue_json("Example Council"))
+    discovery = DocumentDiscoveryResult(
+        failed_sources=[
+            DocumentSourceFailure("https://docs.test/source-a", "HTTP 503"),
+            DocumentSourceFailure("https://docs.test/source-b", "HTTP 504"),
+        ]
+    )
+
+    with (
+        patch("lead_generator.planning.recovery.load_authority_catalogue", return_value=catalogue),
+        patch("lead_generator.planning.recovery.discover_application_documents", return_value=discovery),
+        patch("lead_generator.planning.recovery._wait_for_document_retry_cooldown", return_value=False),
+        patch("lead_generator.planning.recovery.enrich_application_folder", return_value=ContactEnrichment()),
+    ):
+        summary = recover_search_output(tmp_path)
+
+    assert summary.discovery_failures == 2

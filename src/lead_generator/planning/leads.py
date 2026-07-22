@@ -447,6 +447,13 @@ class DownloadedFile:
 class DocumentDownloadBatchResult:
     downloaded_count: int = 0
     transient_documents: list[PlanningDocument] = field(default_factory=list)
+    failures: list[DocumentDownloadFailure] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentDownloadFailure:
+    document: PlanningDocument
+    reason: str
 
 
 class DocumentDiscoveryTransientError(RuntimeError):
@@ -2219,6 +2226,12 @@ def _download_pdf_documents_once(
                     if defer_transient:
                         result.transient_documents.append(document)
                     else:
+                        result.failures.append(
+                            DocumentDownloadFailure(
+                                document,
+                                "portal remained unavailable",
+                            )
+                        )
                         _log(
                             log,
                             f"Could not download {document.title}: portal remained unavailable",
@@ -2237,11 +2250,15 @@ def _download_pdf_documents_once(
                             result.transient_documents.append(document)
                             continue
                     if isinstance(exc, HTTPError) and exc.code == 404:
+                        reason = "HTTP 404"
                         _log(log, f"Skipped unavailable document link: {document.title}")
                     elif isinstance(exc, HTTPError):
+                        reason = f"HTTP {exc.code}"
                         _log(log, f"Could not download {document.title}: HTTP {exc.code}")
                     else:
+                        reason = str(exc) or type(exc).__name__
                         _log(log, f"Could not download {document.title}: {exc}")
+                    result.failures.append(DocumentDownloadFailure(document, reason))
         finally:
             if browser is not None:
                 browser.close()
