@@ -44,10 +44,6 @@ def _has_narrative_marker(value: str) -> bool:
     return any(phrase in normalized for phrase in NARRATIVE_PHRASES)
 
 
-def _is_management_plan(value: str) -> bool:
-    return "management plan" in _phrase_text(value)
-
-
 def preclassify_drawing_source(filename: str) -> DrawingSourceDecision:
     name = Path(filename).stem
     if _has_narrative_marker(name):
@@ -68,11 +64,7 @@ def classify_drawing_source(filename: str, text: str) -> DrawingSourceDecision:
         (text[:CLASSIFICATION_TEXT_LIMIT], text[-CLASSIFICATION_TEXT_LIMIT:])
     )
     combined = f"{Path(filename).stem}\n{bounded_text}"
-    if (
-        _has_narrative_marker(Path(filename).stem)
-        or _has_narrative_marker(title_text)
-        or _is_management_plan(bounded_text)
-    ):
+    if _has_narrative_marker(Path(filename).stem) or _has_narrative_marker(title_text):
         return DrawingSourceDecision(False, False, "narrative document marker")
     filename_tokens = _tokens(Path(filename).stem)
     tokens = _tokens(combined)

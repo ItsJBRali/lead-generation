@@ -172,10 +172,14 @@ def test_management_plan_never_enriches_even_with_drawing_markers() -> None:
     assert preclassify_drawing_source(filename).needs_text is False
     assert classify_drawing_source(filename, text).eligible is False
     assert classify_drawing_source(
+        "Document 123.pdf",
+        "MANAGEMENT PLAN\nPROPOSED PLAN\nDRAWING NUMBER M-101\nSCALE 1:100",
+    ).eligible is False
+    assert classify_drawing_source(
         "Proposed Site Plan.pdf",
         "\n".join(["PROPOSED SITE PLAN DRAWING NUMBER P-101 SCALE 1:100 REV P1"] * 31)
-        + "\nLandscape Management Plan",
-    ).eligible is False
+        + "\nRefer to Landscape Management Plan",
+    ).eligible is True
 
     with tempfile.TemporaryDirectory() as directory:
         folder = Path(directory)
