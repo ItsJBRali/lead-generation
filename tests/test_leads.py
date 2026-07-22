@@ -2305,6 +2305,25 @@ class LeadSearchTest(unittest.TestCase):
             [("/files/proposed-elevations.pdf", "Proposed elevations")],
         )
 
+    def test_document_links_filter_resolved_exeter_navigation_url(self) -> None:
+        page_url = (
+            "https://exeter.gov.uk/planning-services/permissions-and-applications/"
+            "related-documents/?appref=26%2F1049%2FFUL"
+        )
+        markup = html.fromstring(
+            """
+            <html><body>
+              <a href="Related Documents">MyExeter</a>
+              <a href="26_1049_FUL-Proposed_Plan.pdf">Proposed plan</a>
+            </body></html>
+            """
+        )
+
+        self.assertEqual(
+            list(iter_document_links(markup, page_url)),
+            [("26_1049_FUL-Proposed_Plan.pdf", "Proposed plan")],
+        )
+
     def test_associated_document_chain_is_bounded_and_does_not_loop(self) -> None:
         root_url = "https://planning.example.gov.uk/summary/ABC123"
         plans_url = (

@@ -2735,11 +2735,11 @@ def iter_document_links(document: html.HtmlElement, page_url: str) -> Iterable[t
         title = _document_link_title(" ".join(anchor.itertext()), absolute_url)
         if not title:
             continue
-        if _is_generic_site_document(href, title):
+        if _is_generic_site_document(absolute_url, title):
             continue
         if not _is_document_href(href) and not _is_document_link_text(title, href):
             continue
-        if not _is_document_href(href) and _is_application_tab_href(href):
+        if _is_application_tab_href(absolute_url):
             continue
         yield href, title
     for attr in ("data-disabled-link", "data-link", "data-url", "data-href"):
@@ -2757,7 +2757,9 @@ def iter_document_links(document: html.HtmlElement, page_url: str) -> Iterable[t
             title = re.sub(r"^link\s*\(\s*download\s*\)\s*", "", title, flags=re.IGNORECASE).strip()
             if not title:
                 continue
-            if _is_generic_site_document(href, title):
+            if _is_generic_site_document(absolute_url, title):
+                continue
+            if _is_application_tab_href(absolute_url):
                 continue
             yield href, title
     for element in document.xpath("//*[@onclick]"):
@@ -2767,7 +2769,9 @@ def iter_document_links(document: html.HtmlElement, page_url: str) -> Iterable[t
             title = _document_link_title(" ".join(element.itertext()), absolute_url)
             if not title:
                 continue
-            if _is_generic_site_document(href, title):
+            if _is_generic_site_document(absolute_url, title):
+                continue
+            if _is_application_tab_href(absolute_url):
                 continue
             yield href, title
     for form in document.xpath("//form[@action]"):
@@ -2790,6 +2794,8 @@ def iter_document_links(document: html.HtmlElement, page_url: str) -> Iterable[t
             continue
         if _is_generic_site_document(href, title):
             continue
+        if _is_application_tab_href(href):
+            continue
         yield href, title
     for element in document.xpath("//iframe[@src] | //embed[@src] | //object[@data]"):
         href = element.get("src") or element.get("data")
@@ -2799,7 +2805,9 @@ def iter_document_links(document: html.HtmlElement, page_url: str) -> Iterable[t
         title = _document_link_title(None, absolute_url)
         if not title:
             continue
-        if _is_generic_site_document(href, title):
+        if _is_generic_site_document(absolute_url, title):
+            continue
+        if _is_application_tab_href(absolute_url):
             continue
         yield href, title
 
