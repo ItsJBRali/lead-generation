@@ -1958,33 +1958,16 @@ def fetch_planit_documents(
             continue
         seen.add(enterprise_document.url)
         documents.append(enterprise_document)
-    arcus_salesforce_documents = _fetch_optional_document_source(
-        lambda: fetch_arcus_salesforce_document_list(text, page_url, opener),
-        discovery_result,
-    )
-    for arcus_document in arcus_salesforce_documents:
-        if arcus_document.url in seen:
-            continue
-        seen.add(arcus_document.url)
-        documents.append(arcus_document)
-    arcus_public_register_documents = _fetch_optional_document_source(
-        lambda: fetch_arcus_public_register_file_list(text, page_url, opener),
-        discovery_result,
-    )
-    for arcus_document in arcus_public_register_documents:
-        if arcus_document.url in seen:
-            continue
-        seen.add(arcus_document.url)
-        documents.append(arcus_document)
-    arcus_files_public_documents = _fetch_optional_document_source(
-        lambda: fetch_arcus_files_public_document_list(text, page_url, opener),
-        discovery_result,
-    )
-    for arcus_document in arcus_files_public_documents:
-        if arcus_document.url in seen:
-            continue
-        seen.add(arcus_document.url)
-        documents.append(arcus_document)
+    for fetch_arcus_documents in _arcus_document_source_fetchers(text, page_url):
+        arcus_documents = _fetch_optional_document_source(
+            lambda fetch=fetch_arcus_documents: fetch(text, page_url, opener),
+            discovery_result,
+        )
+        for arcus_document in arcus_documents:
+            if arcus_document.url in seen:
+                continue
+            seen.add(arcus_document.url)
+            documents.append(arcus_document)
     if follow_associated:
         for associated_url in _associated_document_source_urls(text, page_url):
             try:
@@ -2008,6 +1991,40 @@ def fetch_planit_documents(
                 seen.add(associated_document.url)
                 documents.append(associated_document)
     return documents
+
+
+def _arcus_document_source_fetchers(
+    text: str,
+    page_url: str,
+) -> tuple[Callable[[str, str, object], list[PlanningDocument]], ...]:
+    lowered_text = text.casefold()
+    explicit_sources = (
+        (
+            ("arc_content_version_viewer", "lc_arc_files_viewer"),
+            fetch_arcus_salesforce_document_list,
+        ),
+        (("pr_fileslistcont",), fetch_arcus_public_register_file_list),
+        (
+            ("markup://arcshared:filespublic", "arcshared.filespubliccont"),
+            fetch_arcus_files_public_document_list,
+        ),
+    )
+    advertised = [
+        (min(lowered_text.find(marker) for marker in markers if marker in lowered_text), fetcher)
+        for markers, fetcher in explicit_sources
+        if any(marker in lowered_text for marker in markers)
+    ]
+    if advertised:
+        return (min(advertised, key=lambda item: item[0])[1],)
+    path = urlsplit(page_url).path.casefold()
+    context = _salesforce_aura_context(text) or {}
+    if "/s/detail/" in path and context.get("app") == "siteforce:communityApp":
+        return (fetch_arcus_public_register_file_list,)
+    if "/s/papplication/" in path:
+        return (fetch_arcus_salesforce_document_list,)
+    if "/s/planning-application/" in path:
+        return (fetch_arcus_files_public_document_list,)
+    return ()
 
 
 def _associated_document_source_urls(html_text: str, page_url: str) -> list[str]:
@@ -2418,16 +2435,22 @@ def _download_document_file(
     opener = opener or _build_document_opener()
     verify_tls = True
     tls_compat = False
-    source_candidates: list[str] = []
-    if document.source_url:
-        source_candidates = source_document_candidates(
-            document,
-            opener,
-            cache=source_cache,
-        )
-    pending = deque([*source_candidates, *document_download_candidates(document.url)])
+    direct_candidates = document_download_candidates(document.url)
+    pending = deque(direct_candidates)
+    source_discovery_attempted = False
     seen: set[str] = set()
-    while pending:
+    while pending or (document.source_url and not source_discovery_attempted):
+        if not pending:
+            source_discovery_attempted = True
+            pending.extend(
+                source_document_candidates(
+                    document,
+                    opener,
+                    cache=source_cache,
+                )
+            )
+            seen.difference_update(direct_candidates)
+            pending.extend(direct_candidates)
         url = pending.popleft()
         if url in seen:
             continue
@@ -2481,16 +2504,12 @@ def _download_document_file(
                 if not tls_compat and _is_tls_compatibility_error(exc):
                     tls_compat = True
                     opener = _build_document_opener(tls_compat=True)
-                    if document.source_url:
-                        pending.extendleft(reversed(source_document_candidates(document, opener)))
                     seen.discard(url)
                     pending.appendleft(url)
                     break
                 if verify_tls and _is_tls_certificate_error(exc):
                     verify_tls = False
                     opener = _build_document_opener(verify_tls=False)
-                    if document.source_url:
-                        pending.extendleft(reversed(source_document_candidates(document, opener)))
                     seen.discard(url)
                     pending.appendleft(url)
                     break
@@ -2570,12 +2589,23 @@ def source_document_candidates(
                 PlanningDocument(title=title, url=normalize_url(urljoin(page_url, href)), source_url=page_url)
                 for href, title in iter_document_links(page, page_url)
             )
-        candidates.extend(fetch_publisher_document_list(text, page_url, opener))
+        candidates.extend(
+            _fetch_isolated_document_fallback(
+                lambda: fetch_publisher_document_list(text, page_url, opener)
+            )
+        )
         candidates.extend(fetch_atrium_document_list(text, page_url))
-        candidates.extend(fetch_enterprise_document_list(text, page_url, opener))
-        candidates.extend(fetch_arcus_salesforce_document_list(text, page_url, opener))
-        candidates.extend(fetch_arcus_public_register_file_list(text, page_url, opener))
-        candidates.extend(fetch_arcus_files_public_document_list(text, page_url, opener))
+        candidates.extend(
+            _fetch_isolated_document_fallback(
+                lambda: fetch_enterprise_document_list(text, page_url, opener)
+            )
+        )
+        for fetch_arcus_documents in _arcus_document_source_fetchers(text, page_url):
+            candidates.extend(
+                _fetch_isolated_document_fallback(
+                    lambda fetch=fetch_arcus_documents: fetch(text, page_url, opener)
+                )
+            )
         if cache is not None:
             cache[source_url] = candidates
     wanted = _comparable_title(document.title)
@@ -2588,6 +2618,15 @@ def source_document_candidates(
         or _comparable_title(candidate.title) in wanted
     ]
     return list(dict.fromkeys(matching))
+
+
+def _fetch_isolated_document_fallback(
+    fetch: Callable[[], list[PlanningDocument]],
+) -> list[PlanningDocument]:
+    try:
+        return fetch()
+    except Exception:
+        return []
 
 
 def document_download_candidates(url: str) -> list[str]:

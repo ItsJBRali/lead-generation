@@ -2508,7 +2508,7 @@ class LeadSearchTest(unittest.TestCase):
         self.assertIs(download_file.call_args.args[0], document)
         wait.assert_not_called()
 
-    def test_download_pdf_documents_reuses_source_page_session(self) -> None:
+    def test_download_pdf_documents_skip_source_page_when_direct_urls_work(self) -> None:
         source_url = (
             "https://planning.example.gov.uk/online-applications/"
             "applicationDetails.do?activeTab=documents&keyVal=ABC123"
@@ -2573,7 +2573,7 @@ class LeadSearchTest(unittest.TestCase):
                 downloaded = download_pdf_documents(documents, Path(directory))
 
         self.assertEqual(downloaded, 2)
-        self.assertEqual(opener.urls.count(source_url), 1)
+        self.assertEqual(opener.urls, [document.url for document in documents])
 
     def test_document_batch_defers_remaining_same_host_after_rate_limit(self) -> None:
         documents = [
@@ -2637,6 +2637,81 @@ class LeadSearchTest(unittest.TestCase):
                 (documents[2], "portal remained unavailable"),
             ],
         )
+
+    def test_document_batch_does_not_block_host_after_optional_source_failure(self) -> None:
+        source_url = "https://planning.example.gov.uk/pr/s/detail/a0iABC"
+        documents = [
+            PlanningDocument(
+                title="Stale plan.pdf",
+                url="https://planning.example.gov.uk/docs/stale-plan.pdf",
+                source_url=source_url,
+            ),
+            PlanningDocument(
+                title="Current elevations.pdf",
+                url="https://planning.example.gov.uk/docs/current-elevations.pdf",
+                source_url=source_url,
+            ),
+        ]
+
+        class FakeResponse:
+            headers = {"Content-Type": "application/pdf"}
+
+            def __init__(self, url: str) -> None:
+                self.url = url
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return b"%PDF-1.4"
+
+            def geturl(self) -> str:
+                return self.url
+
+        class FakeOpener:
+            def __init__(self) -> None:
+                self.urls: list[str] = []
+
+            def open(self, request, timeout):
+                self.urls.append(request.full_url)
+                if request.full_url == documents[0].url:
+                    not_found = HTTPError(request.full_url, 404, "Not Found", {}, None)
+                    not_found.close()
+                    raise not_found
+                return FakeResponse(request.full_url)
+
+        opener = FakeOpener()
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch("lead_generator.planning.leads._build_document_opener", return_value=opener),
+                patch(
+                    "lead_generator.planning.leads._fetch_html_with_portal_session",
+                    return_value=("<html></html>", source_url),
+                ),
+                patch(
+                    "lead_generator.planning.leads.fetch_publisher_document_list",
+                    side_effect=RuntimeError("optional source failed"),
+                ),
+                patch("lead_generator.planning.leads.fetch_enterprise_document_list", return_value=[]),
+                patch("lead_generator.planning.leads.fetch_arcus_salesforce_document_list", return_value=[]),
+                patch("lead_generator.planning.leads.fetch_arcus_public_register_file_list", return_value=[]),
+                patch("lead_generator.planning.leads.fetch_arcus_files_public_document_list", return_value=[]),
+            ):
+                result = _download_pdf_documents_once(
+                    documents,
+                    Path(directory),
+                    defer_transient=False,
+                )
+
+        self.assertEqual(result.downloaded_count, 1)
+        self.assertEqual(
+            [(failure.document, failure.reason) for failure in result.failures],
+            [(documents[0], "HTTP 404")],
+        )
+        self.assertIn(documents[1].url, opener.urls)
 
     def test_document_rate_limit_backoff_stops_when_cancelled(self) -> None:
         document = PlanningDocument(
@@ -2780,9 +2855,9 @@ class LeadSearchTest(unittest.TestCase):
 
             self.assertEqual(downloaded, 1)
             self.assertTrue((Path(directory) / "Proposed plan.pdf").exists())
-            self.assertEqual(opener.urls[0], document.source_url)
-            self.assertEqual(opener.urls[1], document.url)
-            self.assertIn("documentdownload.do", opener.urls[2])
+            self.assertEqual(opener.urls[0], document.url)
+            self.assertIn("documentdownload.do", opener.urls[1])
+            self.assertNotIn(document.source_url, opener.urls)
 
     def test_document_download_warms_source_page_cookie_session(self) -> None:
         class FakeResponse:
@@ -3078,7 +3153,134 @@ class LeadSearchTest(unittest.TestCase):
             with self.assertRaisesRegex(DocumentDiscoveryTransientError, "documents/list"):
                 fetch_enterprise_document_list(page_html, page_url, object())
 
-    def test_fetch_planit_documents_records_all_arcus_failures_and_keeps_direct_links(self) -> None:
+    def test_fetch_planit_documents_selects_public_register_for_community_detail(self) -> None:
+        class FakeResponse:
+            def __init__(self, payload: dict[str, object]) -> None:
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return json.dumps(self.payload).encode()
+
+        class FakeOpener:
+            def __init__(self) -> None:
+                self.urls: list[str] = []
+
+            def open(self, request, timeout):
+                self.urls.append(request.full_url)
+                if "aura.ApexAction.execute=1" in request.full_url:
+                    return FakeResponse(
+                        {
+                            "actions": [
+                                {
+                                    "state": "SUCCESS",
+                                    "returnValue": {
+                                        "returnValue": [
+                                            {
+                                                "Id": "068PUBLIC",
+                                                "Title": "Proposed elevations",
+                                                "FileExtension": "pdf",
+                                            }
+                                        ]
+                                    },
+                                }
+                            ]
+                        }
+                    )
+                if "findContentVersionsForPlanning=1" in request.full_url:
+                    return FakeResponse({"actions": []})
+                return FakeResponse(
+                    {
+                        "actions": [
+                            {
+                                "state": "ERROR",
+                                "returnValue": None,
+                                "error": [
+                                    {
+                                        "message": "You do not have access to the Apex class named 'FilesPublicCont'."
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                )
+
+        boot = {
+            "mode": "PROD",
+            "app": "siteforce:communityApp",
+            "fwuid": "FWUID",
+            "loaded": {"APPLICATION@markup://siteforce:communityApp": "APPHASH"},
+            "pathPrefix": "/pr",
+        }
+        page_url = "https://planning.example.test/pr/s/detail/a0iABC"
+        page_html = (
+            '<a href="/documents/direct-plan.pdf">Direct plan.pdf</a>'
+            f'<script src="/pr/s/sfsites/l/{quote(json.dumps(boot, separators=(",", ":")), safe="")}/bootstrap.js"></script>'
+        )
+        discovery = DocumentDiscoveryResult()
+        opener = FakeOpener()
+
+        with patch(
+            "lead_generator.planning.leads._fetch_html_document_page",
+            return_value=(page_html, page_url, opener),
+        ):
+            documents = fetch_planit_documents(page_url, discovery_result=discovery)
+
+        self.assertEqual(
+            [document.title for document in documents],
+            ["Direct plan.pdf", "Proposed elevations.pdf"],
+        )
+        self.assertEqual(discovery.failed_sources, [])
+        self.assertEqual(len(opener.urls), 1)
+        self.assertIn("aura.ApexAction.execute=1", opener.urls[0])
+
+    def test_fetch_planit_documents_selects_salesforce_viewer_for_papplication(self) -> None:
+        boot = {
+            "mode": "PROD",
+            "app": "siteforce:napiliApp",
+            "fwuid": "FWUID",
+            "loaded": {"APPLICATION@markup://siteforce:napiliApp": "APPHASH"},
+            "pathPrefix": "",
+        }
+        page_url = "https://planning.example.test/s/papplication/a1M123/f26100751"
+        page_html = f'<script src="/s/sfsites/l/{quote(json.dumps(boot, separators=(",", ":")), safe="")}/bootstrap.js"></script>'
+        expected = PlanningDocument(
+            title="Proposed site plan.pdf",
+            url="https://planning.example.test/sfc/servlet.shepherd/version/download/068PLAN",
+            source_url=page_url,
+        )
+
+        with (
+            patch(
+                "lead_generator.planning.leads._fetch_html_document_page",
+                return_value=(page_html, page_url, object()),
+            ),
+            patch(
+                "lead_generator.planning.leads.fetch_arcus_salesforce_document_list",
+                return_value=[expected],
+            ) as salesforce,
+            patch(
+                "lead_generator.planning.leads.fetch_arcus_public_register_file_list",
+                return_value=[],
+            ) as public_register,
+            patch(
+                "lead_generator.planning.leads.fetch_arcus_files_public_document_list",
+                return_value=[],
+            ) as files_public,
+        ):
+            documents = fetch_planit_documents(page_url)
+
+        self.assertEqual(documents, [expected])
+        salesforce.assert_called_once()
+        public_register.assert_not_called()
+        files_public.assert_not_called()
+
+    def test_fetch_planit_documents_selects_files_public_for_planning_application(self) -> None:
         boot = {
             "mode": "PROD",
             "app": "siteforce:napiliApp",
@@ -3087,28 +3289,102 @@ class LeadSearchTest(unittest.TestCase):
             "pathPrefix": "/pr",
         }
         page_url = "https://planning.example.test/pr/s/planning-application/a0iABC/pl202600001"
-        page_html = (
-            '<a href="/documents/direct-plan.pdf">Direct plan.pdf</a>'
-            f'<script src="/pr/s/sfsites/l/{quote(json.dumps(boot, separators=(",", ":")), safe="")}/bootstrap.js"></script>'
+        page_html = f'<script src="/pr/s/sfsites/l/{quote(json.dumps(boot, separators=(",", ":")), safe="")}/bootstrap.js"></script>'
+        expected = PlanningDocument(
+            title="Proposed floor plans.pdf",
+            url="https://planning.example.test/pr/sfc/servlet.shepherd/version/download/068FLOOR",
+            source_url=page_url,
         )
-        unavailable = HTTPError(page_url, 503, "Unavailable", {}, None)
-        discovery = DocumentDiscoveryResult()
 
         with (
             patch(
                 "lead_generator.planning.leads._fetch_html_document_page",
                 return_value=(page_html, page_url, object()),
             ),
-            patch("lead_generator.planning.leads._open_url_with_retry", side_effect=unavailable),
+            patch(
+                "lead_generator.planning.leads.fetch_arcus_salesforce_document_list",
+                return_value=[],
+            ) as salesforce,
+            patch(
+                "lead_generator.planning.leads.fetch_arcus_public_register_file_list",
+                return_value=[],
+            ) as public_register,
+            patch(
+                "lead_generator.planning.leads.fetch_arcus_files_public_document_list",
+                return_value=[expected],
+            ) as files_public,
         ):
-            documents = fetch_planit_documents(page_url, discovery_result=discovery)
+            documents = fetch_planit_documents(page_url)
 
-        self.assertIn("Direct plan.pdf", [document.title for document in documents])
-        self.assertEqual(len(discovery.failed_sources), 3)
-        failed_urls = [failure.source_url for failure in discovery.failed_sources]
-        self.assertTrue(any("findContentVersionsForPlanning=1" in url for url in failed_urls))
-        self.assertTrue(any("aura.ApexAction.execute=1" in url for url in failed_urls))
-        self.assertTrue(any("arcshared.FilesPublicCont.getFiles=1" in url for url in failed_urls))
+        self.assertEqual(documents, [expected])
+        salesforce.assert_not_called()
+        public_register.assert_not_called()
+        files_public.assert_called_once()
+
+    def test_fetch_planit_documents_prefers_explicit_arcus_component_metadata(self) -> None:
+        boot = {
+            "mode": "PROD",
+            "app": "siteforce:napiliApp",
+            "fwuid": "FWUID",
+            "loaded": {"APPLICATION@markup://siteforce:napiliApp": "APPHASH"},
+            "pathPrefix": "/pr",
+        }
+        page_url = "https://planning.example.test/pr/s/papplication/a0iABC/pl202600001"
+        page_html = (
+            '<div data-component="markup://arcshared:FilesPublic"></div>'
+            f'<script src="/pr/s/sfsites/l/{quote(json.dumps(boot, separators=(",", ":")), safe="")}/bootstrap.js"></script>'
+        )
+
+        with (
+            patch(
+                "lead_generator.planning.leads._fetch_html_document_page",
+                return_value=(page_html, page_url, object()),
+            ),
+            patch(
+                "lead_generator.planning.leads.fetch_arcus_salesforce_document_list",
+                return_value=[],
+            ) as salesforce,
+            patch(
+                "lead_generator.planning.leads.fetch_arcus_public_register_file_list",
+                return_value=[],
+            ) as public_register,
+            patch(
+                "lead_generator.planning.leads.fetch_arcus_files_public_document_list",
+                return_value=[],
+            ) as files_public,
+        ):
+            fetch_planit_documents(page_url)
+
+        salesforce.assert_not_called()
+        public_register.assert_not_called()
+        files_public.assert_called_once()
+
+    def test_fetch_planit_documents_does_not_guess_arcus_controller_for_unknown_route(self) -> None:
+        boot = {
+            "mode": "PROD",
+            "app": "siteforce:napiliApp",
+            "fwuid": "FWUID",
+            "loaded": {"APPLICATION@markup://siteforce:napiliApp": "APPHASH"},
+            "pathPrefix": "/pr",
+        }
+        page_url = "https://planning.example.test/pr/s/application/a0iABC"
+        page_html = f'<script src="/pr/s/sfsites/l/{quote(json.dumps(boot, separators=(",", ":")), safe="")}/bootstrap.js"></script>'
+
+        with (
+            patch(
+                "lead_generator.planning.leads._fetch_html_document_page",
+                return_value=(page_html, page_url, object()),
+            ),
+            patch("lead_generator.planning.leads.fetch_arcus_salesforce_document_list") as salesforce,
+            patch("lead_generator.planning.leads.fetch_arcus_public_register_file_list") as public_register,
+            patch("lead_generator.planning.leads.fetch_arcus_files_public_document_list") as files_public,
+        ):
+            documents = fetch_planit_documents(page_url)
+
+        self.assertEqual(documents, [])
+        salesforce.assert_not_called()
+        public_register.assert_not_called()
+        files_public.assert_not_called()
 
     def test_arcus_document_list_fetchers_propagate_malformed_and_invalid_json(self) -> None:
         class FakeResponse:
@@ -3353,6 +3629,140 @@ class LeadSearchTest(unittest.TestCase):
             "https://development.wiltshire.gov.uk/pr/sfc/servlet.shepherd/version/download/068WILTS",
         )
         self.assertEqual(documents[0].document_type, "Plans")
+
+    def test_arcus_document_download_uses_working_direct_url_before_source_page(self) -> None:
+        class FakeResponse:
+            headers = {"Content-Type": "application/pdf"}
+
+            def __init__(self, url: str) -> None:
+                self.url = url
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return b"%PDF-1.4"
+
+            def geturl(self) -> str:
+                return self.url
+
+        class FakeOpener:
+            def __init__(self) -> None:
+                self.urls: list[str] = []
+
+            def open(self, request, timeout):
+                self.urls.append(request.full_url)
+                if "/s/detail/" in request.full_url:
+                    raise AssertionError("source application page should not be requested")
+                return FakeResponse(request.full_url)
+
+        document = PlanningDocument(
+            title="Proposed elevations.pdf",
+            url="https://planning.example.test/pr/sfc/servlet.shepherd/version/download/068PLAN",
+            source_url="https://planning.example.test/pr/s/detail/a0iABC",
+        )
+        opener = FakeOpener()
+
+        downloaded = download_document_file(document, opener=opener)
+
+        self.assertEqual(downloaded.payload, b"%PDF-1.4")
+        self.assertEqual(opener.urls, [document.url])
+
+    def test_arcus_document_download_isolates_failed_fallback_and_uses_replacement(self) -> None:
+        class FakeResponse:
+            headers = {"Content-Type": "application/pdf"}
+
+            def __init__(self, url: str) -> None:
+                self.url = url
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return b"%PDF-1.4"
+
+            def geturl(self) -> str:
+                return self.url
+
+        class FakeOpener:
+            def __init__(self) -> None:
+                self.urls: list[str] = []
+
+            def open(self, request, timeout):
+                self.urls.append(request.full_url)
+                if request.full_url == document.url:
+                    not_found = HTTPError(request.full_url, 404, "Not Found", {}, None)
+                    not_found.close()
+                    raise not_found
+                return FakeResponse(request.full_url)
+
+        boot = {
+            "mode": "PROD",
+            "app": "siteforce:communityApp",
+            "fwuid": "FWUID",
+            "loaded": {"APPLICATION@markup://siteforce:communityApp": "APPHASH"},
+            "pathPrefix": "/pr",
+        }
+        source_url = "https://planning.example.test/pr/s/detail/a0iABC"
+        page_html = f'<script src="/pr/s/sfsites/l/{quote(json.dumps(boot, separators=(",", ":")), safe="")}/bootstrap.js"></script>'
+        document = PlanningDocument(
+            title="Proposed elevations.pdf",
+            url="https://planning.example.test/pr/sfc/servlet.shepherd/version/download/068STALE",
+            source_url=source_url,
+        )
+        replacement = PlanningDocument(
+            title=document.title,
+            url="https://planning.example.test/pr/sfc/servlet.shepherd/version/download/068CURRENT",
+            source_url=source_url,
+        )
+        optional_failure = DocumentDiscoveryTransientError(
+            "https://planning.example.test/publisher/documents",
+            "optional source unavailable",
+        )
+        opener = FakeOpener()
+
+        try:
+            with (
+                patch(
+                    "lead_generator.planning.leads._fetch_html_with_portal_session",
+                    return_value=(page_html, source_url),
+                ),
+                patch(
+                    "lead_generator.planning.leads.fetch_publisher_document_list",
+                    side_effect=optional_failure,
+                ),
+                patch(
+                    "lead_generator.planning.leads.fetch_enterprise_document_list",
+                    return_value=[],
+                ),
+                patch(
+                    "lead_generator.planning.leads.fetch_arcus_salesforce_document_list",
+                    return_value=[],
+                ) as salesforce,
+                patch(
+                    "lead_generator.planning.leads.fetch_arcus_public_register_file_list",
+                    return_value=[replacement],
+                ) as public_register,
+                patch(
+                    "lead_generator.planning.leads.fetch_arcus_files_public_document_list",
+                    return_value=[],
+                ) as files_public,
+            ):
+                downloaded = download_document_file(document, opener=opener)
+        except DocumentDiscoveryTransientError as exc:
+            self.fail(f"optional source failure escaped fallback isolation: {exc}")
+
+        self.assertEqual(downloaded.payload, b"%PDF-1.4")
+        self.assertEqual(opener.urls, [document.url, replacement.url])
+        salesforce.assert_not_called()
+        public_register.assert_called_once()
+        files_public.assert_not_called()
 
     def test_document_download_follows_html_intermediate_page(self) -> None:
         class FakeResponse:
