@@ -66,6 +66,7 @@ from lead_generator.planning.enrichment import (
     empty_enrichment_row,
     enrich_application_folder,
 )
+from lead_generator.planning.drawing_sources import is_existing_only_drawing_metadata
 from lead_generator.planning.models import PlanningApplication, PlanningDocument
 from lead_generator.planning.http import CouncilBrowserClient, monitor_council_requests
 from lead_generator.planning.parsing import clean_text
@@ -1821,15 +1822,22 @@ def application_document_source_urls(application: PlanningApplication) -> list[s
     raw = application.raw or {}
     portal_family = str(raw.get("portal_family") or "").casefold()
     reference = application.reference or application.uid
+    authority = application.authority.casefold()
+    if authority == "camden" and reference:
+        add(
+            "https://camdocs.camden.gov.uk/CMWebDrawer/PlanRec?"
+            + urlencode({"q": f'recContainer:"{reference}"'}),
+            allow_listing=True,
+        )
+    if authority == "exeter" and reference:
+        add(
+            "https://exeter.gov.uk/planning-services/permissions-and-applications/"
+            "related-documents?" + urlencode({"appref": reference}),
+            allow_listing=True,
+        )
     if portal_family == "bath_planning_api" and reference:
         parts = urlsplit(application.url)
         add(urlunsplit((parts.scheme, parts.netloc, f"/planningdocuments={quote(reference, safe='')}", "", "")), allow_listing=True)
-    if portal_family == "socrata" and application.authority.casefold() == "camden" and application.uid:
-        add(
-            "https://planningrecords.camden.gov.uk/NECSWS/Redirection/redirect.aspx?"
-            + urlencode({"linkid": "EXDC", "PARAM0": application.uid}),
-            allow_listing=True,
-        )
     add(raw.get("docs_url"), allow_listing=True)
     for value in (raw.get("portal_url"), application.url, raw.get("source_url"), application.source_url):
         derived = document_source_url_from_application_url(str(value)) if value else None
@@ -1892,6 +1900,7 @@ def _looks_like_listing_url(url: str) -> bool:
 def fetch_planit_documents(
     docs_url: str,
     *,
+    follow_associated: bool = True,
     discovery_result: DocumentDiscoveryResult | None = None,
 ) -> list[PlanningDocument]:
     text, page_url, opener = _fetch_html_document_page(docs_url, timeout=45)
@@ -1954,7 +1963,49 @@ def fetch_planit_documents(
             continue
         seen.add(arcus_document.url)
         documents.append(arcus_document)
+    if follow_associated:
+        for associated_url in _associated_document_source_urls(text, page_url):
+            try:
+                associated_documents = fetch_planit_documents(
+                    associated_url,
+                    follow_associated=False,
+                    discovery_result=discovery_result,
+                )
+            except Exception as exc:
+                if discovery_result is None:
+                    raise
+                discovery_result.failed_sources.append(
+                    DocumentSourceFailure(associated_url, str(exc))
+                )
+                continue
+            if discovery_result is not None and associated_url not in discovery_result.successful_sources:
+                discovery_result.successful_sources.append(associated_url)
+            for associated_document in associated_documents:
+                if associated_document.url in seen:
+                    continue
+                seen.add(associated_document.url)
+                documents.append(associated_document)
     return documents
+
+
+def _associated_document_source_urls(html_text: str, page_url: str) -> list[str]:
+    document = html.fromstring(html_text)
+    urls: list[str] = []
+    for anchor in document.xpath("//a[@href]"):
+        label = clean_text(" ".join(anchor.xpath(".//text()"))).casefold()
+        if not any(
+            marker in label
+            for marker in (
+                "associated application documents",
+                "view related documents",
+                "documents for this application",
+            )
+        ):
+            continue
+        url = normalize_url(urljoin(page_url, anchor.get("href") or ""))
+        if url and url != normalize_url(page_url) and url not in urls:
+            urls.append(url)
+    return urls
 
 
 def _fetch_optional_document_source(
@@ -3664,7 +3715,9 @@ def _is_excluded_document(document: PlanningDocument) -> bool:
     text = _document_filter_text(document)
     if ".exe" in text or _path_suffix(document.url) == ".exe":
         return True
-    return "existing" in text and "proposed" not in text
+    if "existing" in text and "proposed" not in text:
+        return not is_existing_only_drawing_metadata(text)
+    return False
 
 
 def _document_filter_text(document: PlanningDocument) -> str:

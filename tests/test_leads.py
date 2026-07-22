@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from datetime import date
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 from pathlib import Path
 from unittest.mock import patch
 
@@ -29,6 +29,7 @@ from lead_generator.planning.leads import (
     _discover_planit_applications_serial,
     _download_pdf_documents_once,
     _fetch_json_with_retry,
+    _associated_document_source_urls,
     application_in_geojson,
     application_matches_search_area,
     application_matches,
@@ -2166,6 +2167,51 @@ class LeadSearchTest(unittest.TestCase):
         )
         self.assertEqual(enriched.documents, documents)
 
+    def test_camden_document_source_uses_camdocs_reference_lookup(self) -> None:
+        application = PlanningApplication(
+            authority="Camden",
+            uid="2026/2898/P",
+            reference="2026/2898/P",
+            url="https://opendata.camden.gov.uk/resource/2eiu-s2cw.json",
+        )
+        expected = "https://camdocs.camden.gov.uk/CMWebDrawer/PlanRec?" + urlencode(
+            {"q": 'recContainer:"2026/2898/P"'}
+        )
+
+        self.assertIn(expected, planit_document_source_urls(application))
+
+    def test_exeter_document_source_uses_related_documents_lookup(self) -> None:
+        application = PlanningApplication(
+            authority="Exeter",
+            uid="26/1049/FUL",
+            reference="26/1049/FUL",
+            url="https://exeter.gov.uk/planning-services/permissions-and-applications/",
+        )
+        expected = (
+            "https://exeter.gov.uk/planning-services/permissions-and-applications/"
+            "related-documents?" + urlencode({"appref": "26/1049/FUL"})
+        )
+
+        self.assertIn(expected, planit_document_source_urls(application))
+
+    def test_associated_document_source_reads_wandsworth_link_once(self) -> None:
+        page_url = "https://planning2.wandsworth.gov.uk/planningcase/CaseDetails.aspx?case=2026/2589"
+        markup = """
+            <html><body>
+              <a href="/planningcase/comments.aspx?case=2026/2589">
+                View Associated Application Documents
+              </a>
+              <a href="/planningcase/comments.aspx?case=2026/2589">
+                View Associated Application Documents
+              </a>
+            </body></html>
+        """
+
+        self.assertEqual(
+            _associated_document_source_urls(markup, page_url),
+            ["https://planning2.wandsworth.gov.uk/planningcase/comments.aspx?case=2026/2589"],
+        )
+
     def test_enrich_application_documents_merges_documents_from_every_source(self) -> None:
         application = PlanningApplication(
             authority="Example",
@@ -2232,30 +2278,34 @@ class LeadSearchTest(unittest.TestCase):
         self.assertEqual(result.failed_sources[0].source_url, source_b)
         self.assertIn("503", result.failed_sources[0].reason)
 
-    def test_download_pdf_documents_skips_exe_and_existing_only_files(self) -> None:
+    def test_download_pdf_documents_allows_existing_only_drawings(self) -> None:
         documents = [
-            PlanningDocument(title="Existing elevations.pdf", url="https://planning.example.gov.uk/docs/existing-elevations.pdf"),
-            PlanningDocument(title="Existing and proposed elevations.pdf", url="https://planning.example.gov.uk/docs/existing-proposed-elevations.pdf"),
-            PlanningDocument(title="Viewer.exe", url="https://planning.example.gov.uk/docs/viewer.exe"),
+            PlanningDocument(title="Existing elevations.pdf", url="https://example.test/existing-elevations.pdf"),
+            PlanningDocument(title="Existing survey report.pdf", url="https://example.test/existing-survey.pdf"),
+            PlanningDocument(title="Existing and proposed elevations.pdf", url="https://example.test/combined.pdf"),
+            PlanningDocument(title="Viewer.exe", url="https://example.test/viewer.exe"),
         ]
 
         with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory)
             with patch(
                 "lead_generator.planning.leads.download_document_file",
                 return_value=DownloadedFile(
                     payload=b"%PDF-1.4",
-                    final_url="https://planning.example.gov.uk/docs/existing-proposed-elevations.pdf",
+                    final_url="https://example.test/file.pdf",
                     content_type="application/pdf",
                 ),
             ) as download_file:
-                downloaded = download_pdf_documents(documents, Path(directory))
+                downloaded = download_pdf_documents(documents, destination)
 
-            self.assertEqual(downloaded, 1)
-            download_file.assert_called_once()
-            self.assertIs(download_file.call_args.args[0], documents[1])
-            self.assertTrue((Path(directory) / "Existing and proposed elevations.pdf").exists())
-            self.assertFalse((Path(directory) / "Existing elevations.pdf").exists())
-            self.assertFalse((Path(directory) / "Viewer.exe").exists())
+            self.assertEqual(downloaded, 2)
+            self.assertEqual(
+                [call.args[0].title for call in download_file.call_args_list],
+                ["Existing elevations.pdf", "Existing and proposed elevations.pdf"],
+            )
+            self.assertTrue((destination / "Existing elevations.pdf").exists())
+            self.assertFalse((destination / "Existing survey report.pdf").exists())
+            self.assertFalse((destination / "Viewer.exe").exists())
 
     def test_download_pdf_documents_does_not_retry_permanent_404(self) -> None:
         document = PlanningDocument(
