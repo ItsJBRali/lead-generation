@@ -9,6 +9,11 @@ from typing import Callable, Iterable
 
 from pypdf import PdfReader
 
+from lead_generator.planning.drawing_sources import (
+    classify_drawing_source,
+    preclassify_drawing_source,
+)
+
 
 FAILED_ENRICHMENT_VALUE = "Failed"
 ENRICHMENT_CSV_FIELDS = [
@@ -81,7 +86,42 @@ CLIENT_ROLE_MARKERS = (
     "landowner",
     "property owner",
     "owner details",
+    "owner",
+    "contractor",
 )
+AUTHOR_ROLE_MARKERS = (
+    "architect",
+    "architecture",
+    "prepared by",
+    "drawn by",
+    "designed by",
+    "designer",
+)
+NAME_NOISE_MARKERS = (
+    "copyright",
+    "all rights reserved",
+    "checked by",
+    "approved by",
+    "surveyed",
+    "authorised",
+    "scale",
+    "revision",
+    "drawing status",
+    "for planning",
+)
+ADDRESS_STOP_TOKENS = {
+    "the",
+    "road",
+    "street",
+    "lane",
+    "drive",
+    "avenue",
+    "close",
+    "way",
+    "uk",
+    "united",
+    "kingdom",
+}
 COMPANY_END_RE = re.compile(
     r"(?i)\b(?:architects?|architecture|associates|consultants?|consulting|"
     r"surveyors?|engineers?|planning\s+(?:group|consultancy|services)|"
@@ -190,6 +230,10 @@ class ContactEnrichment:
     phone_numbers: list[str] = field(default_factory=list)
     email_addresses: list[str] = field(default_factory=list)
     company_addresses: list[str] = field(default_factory=list)
+    field_sources: dict[str, list[str]] = field(default_factory=dict)
+    eligible_documents: list[str] = field(default_factory=list)
+    unreadable_documents: list[str] = field(default_factory=list)
+    rejected_documents: dict[str, str] = field(default_factory=dict)
 
     def to_csv_row(self) -> dict[str, str]:
         return {
@@ -247,6 +291,7 @@ class _Exclusions:
         return any(
             _same_value(value, excluded)
             or bool(value_postcodes.intersection(_postcodes(excluded)))
+            or _similar_site_address(value, excluded)
             for excluded in self.addresses
         )
 
@@ -255,6 +300,13 @@ class _Accumulator:
     def __init__(self, exclusions: _Exclusions) -> None:
         self.result = ContactEnrichment()
         self.exclusions = exclusions
+        self.source_document: str | None = None
+
+    def _record_source(self, field_name: str) -> None:
+        if not self.source_document:
+            return
+        sources = self.result.field_sources.setdefault(field_name, [])
+        _append_unique(sources, self.source_document)
 
     def add_name(self, value: str | None) -> None:
         value = _clean_candidate(value)
@@ -266,6 +318,7 @@ class _Accumulator:
         ):
             return
         self.result.architect_company_names.append(value)
+        self._record_source("Architect / Company Name")
 
     def add_phone(self, value: str | None) -> None:
         value = _normalise_phone(value or "")
@@ -274,13 +327,17 @@ class _Accumulator:
             for existing in self.result.phone_numbers
         ):
             self.result.phone_numbers.append(value)
+            self._record_source("Phone Number")
 
     def add_email(self, value: str | None) -> None:
         value = (value or "").strip(" <>.,;:").casefold()
         if value.startswith("email-"):
             value = value.removeprefix("email-")
         if value and not _blocked_email(value):
+            before = len(self.result.email_addresses)
             _append_unique(self.result.email_addresses, value)
+            if len(self.result.email_addresses) > before:
+                self._record_source("Email Address")
 
     def add_address(self, value: str | None) -> None:
         value = _clean_candidate(value)
@@ -294,6 +351,7 @@ class _Accumulator:
         ):
             return
         self.result.company_addresses.append(value)
+        self._record_source("Company Address")
 
 
 def empty_enrichment_row(*, requested: bool) -> dict[str, str]:
@@ -319,47 +377,41 @@ def enrich_application_folder(
         key=lambda path: path.name.casefold(),
     ) if folder.exists() else []
 
-    documents: list[_PdfText] = []
     if not pdf_paths and log:
         log("No downloaded PDFs were available to enrich")
+    accumulator = _Accumulator(exclusions)
     for path in pdf_paths:
+        preliminary = preclassify_drawing_source(path.name)
+        if not preliminary.eligible and not preliminary.needs_text:
+            accumulator.result.rejected_documents[path.name] = preliminary.reason
+            continue
         try:
             if log:
                 log(f"Reading {path.name} for professional contact details")
             document = extract_pdf_text(path)
-            documents.append(document)
             if document.ocr_pages and log:
                 log(f"OCR read {document.ocr_pages} page(s) from {path.name}")
         except Exception as exc:  # pragma: no cover - malformed live documents vary widely
+            accumulator.result.rejected_documents[path.name] = f"read failed: {exc}"
             if log:
                 log(f"Could not read {path.name} for enrichment: {exc}")
-
-    agent_parties: list[_Party] = []
-    for document in documents:
-        if not document.application_form:
             continue
-        applicant, agent = extract_application_form_parties(document.text)
-        if applicant:
-            for value in applicant.exclusion_values():
-                if value == applicant.address:
-                    exclusions.add_address(value)
-                else:
-                    exclusions.add_party(value)
-        if agent and agent.display_name:
-            agent_parties.append(agent)
-
-    accumulator = _Accumulator(exclusions)
-    for party in agent_parties:
-        accumulator.add_name(party.display_name)
-        accumulator.add_address(party.address)
-    if agent_name:
-        accumulator.add_name(agent_name)
-
-    for document in documents:
         if document.application_form:
-            # Phone and email details from application forms are intentionally never used.
+            accumulator.result.rejected_documents[path.name] = "application form"
             continue
-        extract_professional_details(document.text, document.path.name, accumulator)
+        decision = classify_drawing_source(path.name, document.text)
+        if not decision.eligible:
+            accumulator.result.rejected_documents[path.name] = decision.reason
+            continue
+        accumulator.result.eligible_documents.append(path.name)
+        if not _meaningful_text(document.text):
+            accumulator.result.unreadable_documents.append(path.name)
+            continue
+        accumulator.source_document = path.name
+        try:
+            extract_professional_details(document.text, path.name, accumulator)
+        finally:
+            accumulator.source_document = None
 
     return accumulator.result
 
@@ -448,29 +500,27 @@ def extract_professional_details(text: str, filename: str, accumulator: _Accumul
         return
 
     for index, line in enumerate(lines):
+        has_contact_evidence = _title_block_contact_evidence(lines, index)
+        excluded_context = _client_context(lines, index) or _authority_context(lines, index)
         if PROFESSIONAL_CREDENTIAL_RE.search(line):
             credentialled_name = _name_before_credentials(lines, index)
-            if credentialled_name and not _client_context(lines, index):
+            if credentialled_name and not excluded_context:
                 accumulator.add_name(credentialled_name)
         labelled = PROFESSIONAL_LABEL_RE.match(line)
-        if labelled and _valid_labelled_name(labelled.group(1)) and not _client_context(lines, index):
+        if labelled and _valid_labelled_name(labelled.group(1)) and not excluded_context:
             accumulator.add_name(labelled.group(1))
-        if _looks_like_company(line) and _professional_context_score(lines, index, filename) >= 2:
+        if _looks_like_company(line) and has_contact_evidence and not excluded_context:
             accumulator.add_name(line)
 
         for email in EMAIL_RE.findall(line):
-            domain = email.rsplit("@", 1)[-1].casefold()
-            score = _professional_context_score(lines, index, filename)
-            if domain not in FREE_EMAIL_DOMAINS:
-                score += 2
-            if score >= 3 and not _client_context(lines, index):
+            if has_contact_evidence and not excluded_context:
                 accumulator.add_email(email)
                 company = _nearest_company(lines, index)
                 if company:
                     accumulator.add_name(company)
 
         for phone_match in PHONE_RE.finditer(line):
-            if _professional_context_score(lines, index, filename) >= 3 and not _client_context(lines, index):
+            if has_contact_evidence and not excluded_context:
                 accumulator.add_phone(phone_match.group(0))
                 company = _nearest_company(lines, index)
                 if company:
@@ -480,8 +530,8 @@ def extract_professional_details(text: str, filename: str, accumulator: _Accumul
             address = _address_around_postcode(lines, index)
             if (
                 address
-                and _professional_context_score(lines, index, filename) >= 2
-                and not _client_context(lines, index)
+                and has_contact_evidence
+                and not excluded_context
             ):
                 accumulator.add_address(address)
 
@@ -542,37 +592,85 @@ def _form_field(lines: list[str], *aliases: str) -> str:
     return ""
 
 
-def _professional_context_score(lines: list[str], index: int, filename: str) -> int:
-    nearby = " ".join(lines[max(0, index - 7):min(len(lines), index + 8)]).casefold()
-    close = " ".join(lines[max(0, index - 2):index + 1]).casefold()
-    score = 0
-    if any(marker in nearby for marker in PROFESSIONAL_ROLE_MARKERS):
-        score += 4
-    if any(_looks_like_company(line) for line in lines[max(0, index - 5):min(len(lines), index + 6)]):
-        score += 3
-    if any(marker in filename.casefold() for marker in ("drawing", "plan", "statement", "report", "letter")):
-        score += 1
-    if any(marker in close for marker in CLIENT_ROLE_MARKERS):
-        score -= 7
-    if any(marker in close for marker in ("planning authority", "council", "planning portal", "case officer")):
-        score -= 6
-    return score
-
-
 def _client_context(lines: list[str], index: int) -> bool:
-    close_lines = lines[max(0, index - 2):index + 1]
-    for line in close_lines:
+    window, start = _contact_window(lines, index)
+    role_labels: list[tuple[int, bool]] = []
+    for offset, line in enumerate(window[: index - start + 1]):
         folded = line.casefold().strip()
-        if any(re.match(rf"^{re.escape(marker)}\s*[:\-]", folded) for marker in CLIENT_ROLE_MARKERS):
-            return True
+        if _is_role_label(folded, CLIENT_ROLE_MARKERS):
+            role_labels.append((start + offset, True))
+        elif _is_role_label(folded, AUTHOR_ROLE_MARKERS):
+            role_labels.append((start + offset, False))
+    if role_labels:
+        return role_labels[-1][1]
+
+    window_text = " ".join(window).casefold()
+    if "consultant" in window_text and any(
+        marker in window_text for marker in ("project", "key notes", "keynote")
+    ):
+        return not any(marker in window_text for marker in AUTHOR_ROLE_MARKERS)
     return False
+
+
+def _contact_window(lines: list[str], index: int) -> tuple[list[str], int]:
+    start = max(0, index - 4)
+    return lines[start:min(len(lines), index + 5)], start
+
+
+def _has_professional_contact_evidence(lines: list[str], index: int) -> bool:
+    window, _start = _contact_window(lines, index)
+    text = " ".join(window).casefold()
+    has_role = any(marker in text for marker in PROFESSIONAL_ROLE_MARKERS)
+    has_company = any(_looks_like_company(line) for line in window)
+    has_contact = bool(
+        EMAIL_RE.search(text)
+        or any(_normalise_phone(match.group(0)) for match in PHONE_RE.finditer(text))
+        or POSTCODE_RE.search(text)
+    )
+    return has_role or (has_company and has_contact)
+
+
+def _title_block_contact_evidence(lines: list[str], index: int) -> bool:
+    if _has_professional_contact_evidence(lines, index):
+        return True
+    for anchor_index in range(max(0, index - 4), index):
+        if _has_professional_contact_evidence(lines, anchor_index):
+            return True
+    return any(
+        PROFESSIONAL_CREDENTIAL_RE.search(line)
+        and _name_before_credentials(lines, credential_index)
+        for credential_index, line in enumerate(lines[max(0, index - 5):index], start=max(0, index - 5))
+    )
+
+
+def _authority_context(lines: list[str], index: int) -> bool:
+    window, _start = _contact_window(lines, index)
+    text = " ".join(window).casefold()
+    return any(
+        marker in text
+        for marker in ("planning authority", "local authority", "council", "case officer")
+    )
+
+
+def _is_role_label(value: str, markers: tuple[str, ...]) -> bool:
+    normalized = _normalise_label(value)
+    return any(
+        normalized == _normalise_label(marker)
+        or normalized.startswith(f"{_normalise_label(marker)} ")
+        for marker in markers
+    )
 
 
 def _nearest_company(lines: list[str], index: int) -> str:
     candidates: list[tuple[int, str]] = []
     for candidate_index in range(max(0, index - 6), min(len(lines), index + 7)):
         candidate = lines[candidate_index]
-        if _looks_like_company(candidate) and not _client_context(lines, candidate_index):
+        if (
+            _looks_like_company(candidate)
+            and _has_professional_contact_evidence(lines, candidate_index)
+            and not _client_context(lines, candidate_index)
+            and not _authority_context(lines, candidate_index)
+        ):
             candidates.append((abs(candidate_index - index), candidate))
     return min(candidates, default=(0, ""))[1]
 
@@ -637,6 +735,7 @@ def _looks_like_company(value: str) -> bool:
     value = _clean_candidate(value)
     if (
         not value
+        or _is_name_noise(value)
         or len(value) > 100
         or len(value.split()) > 12
         or EMAIL_RE.search(value)
@@ -659,7 +758,7 @@ def _looks_like_company(value: str) -> bool:
 
 def _valid_labelled_name(value: str) -> bool:
     value = _clean_candidate(value)
-    if not value or len(value) > 100 or len(value.split()) > 12:
+    if not value or _is_name_noise(value) or len(value) > 100 or len(value.split()) > 12:
         return False
     if EMAIL_RE.search(value) or PHONE_RE.search(value):
         return False
@@ -667,6 +766,21 @@ def _valid_labelled_name(value: str) -> bool:
         marker in value.casefold()
         for marker in ("information relating", "all other relevant", "best practice", "the council")
     )
+
+
+def _is_name_noise(value: str) -> bool:
+    folded = _clean_candidate(value).casefold()
+    if not folded or any(marker in folded for marker in NAME_NOISE_MARKERS):
+        return True
+    if re.search(r"(?:^|\s)rev(?:ision)?\s*[:\-]", folded):
+        return True
+    if re.search(r"(?:^|\s)date\s*[:\-]", folded):
+        return True
+    labels = re.findall(
+        r"\b(?:(?:checked|approved|drawn)\s*by|scale|rev(?:ision)?|date)\s*:",
+        folded,
+    )
+    return len(labels) >= 2
 
 
 def _name_before_credentials(lines: list[str], index: int) -> str:
@@ -800,17 +914,24 @@ def _blocked_email(value: str) -> bool:
 
 
 def _normalise_phone(value: str) -> str:
-    value = re.sub(r"\s+", " ", value).strip(" .,;:-")
-    if re.search(r"\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b", value):
+    if re.search(r"\b\d{4,6}\.\d{3,}\b", value):
+        return ""
+    if re.search(r"(?:^|\s)0(?:[\s./-]+0){2,}(?:\s|$)", value):
+        return ""
+    if re.fullmatch(r"\s*\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\s*", value):
         return ""
     digits = re.sub(r"\D", "", value)
-    if value.startswith("+44"):
-        valid_length = 12 <= len(digits) <= 13
-    elif value.startswith("0044"):
-        valid_length = 14 <= len(digits) <= 15
-    else:
-        valid_length = 10 <= len(digits) <= 11
-    return value if valid_length else ""
+    if digits.startswith("00440"):
+        digits = digits[4:]
+    elif digits.startswith("0044"):
+        digits = "0" + digits[4:]
+    elif digits.startswith("440"):
+        digits = digits[2:]
+    elif digits.startswith("44"):
+        digits = "0" + digits[2:]
+    if len(digits) not in {10, 11} or not digits.startswith(("01", "02", "03", "07", "08")):
+        return ""
+    return re.sub(r"\s+", " ", value).strip(" .,;:-")
 
 
 def _text_lines(text: str) -> list[str]:
@@ -834,6 +955,22 @@ def _normalise_value(value: str) -> str:
 
 def _postcodes(value: str) -> list[str]:
     return [re.sub(r"\s+", "", match.group(0)).casefold() for match in POSTCODE_RE.finditer(value)]
+
+
+def _meaningful_address_tokens(value: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", value.casefold())
+        if len(token) > 1 and token not in ADDRESS_STOP_TOKENS
+    }
+
+
+def _similar_site_address(candidate: str, excluded: str) -> bool:
+    left = _meaningful_address_tokens(candidate)
+    right = _meaningful_address_tokens(excluded)
+    shared = left & right
+    union = left | right
+    return len(shared) >= 3 and bool(union) and len(shared) / len(union) >= 0.65
 
 
 def _same_value(left: str, right: str) -> bool:
