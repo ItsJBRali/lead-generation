@@ -448,6 +448,28 @@ class DocumentDownloadBatchResult:
     transient_documents: list[PlanningDocument] = field(default_factory=list)
 
 
+class DocumentDiscoveryTransientError(RuntimeError):
+    """A published document source could not be checked reliably."""
+
+    def __init__(self, source_url: str, reason: str) -> None:
+        self.source_url = source_url
+        self.reason = reason
+        super().__init__(f"{source_url}: {reason}")
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentSourceFailure:
+    source_url: str
+    reason: str
+
+
+@dataclass(slots=True)
+class DocumentDiscoveryResult:
+    documents: list[PlanningDocument] = field(default_factory=list)
+    successful_sources: list[str] = field(default_factory=list)
+    failed_sources: list[DocumentSourceFailure] = field(default_factory=list)
+
+
 @dataclass(slots=True)
 class DocumentDownloadJob:
     reference: str
@@ -456,6 +478,10 @@ class DocumentDownloadJob:
     folder: Path
     row: dict[str, str]
     pending_documents: list[PlanningDocument] = field(default_factory=list)
+    processed_document_urls: set[str] = field(default_factory=set)
+    successful_document_sources: set[str] = field(default_factory=set)
+    document_source_failures: list[DocumentSourceFailure] = field(default_factory=list)
+    rediscovery_required: bool = True
     downloaded_count: int = 0
 
 
@@ -929,36 +955,82 @@ def run_lead_search(
         if cancellation_requested():
             return
         try:
-            if not job.pending_documents:
-                job.application = enrich_application_documents(job.application)
-                job.pending_documents = list(job.application.documents)
-            if not job.pending_documents:
-                _log(log, f"{job.reference}: no downloadable documents were listed")
-                mark_document_complete(job, total)
-                return
+            if job.rediscovery_required:
+                discovery = discover_application_documents(job.application)
+                job.successful_document_sources.update(discovery.successful_sources)
+                job.document_source_failures = list(discovery.failed_sources)
+                job.rediscovery_required = bool(job.document_source_failures)
 
-            result = _download_pdf_documents_once(
-                job.pending_documents,
-                job.folder,
-                log=lambda message: _log(log, f"{job.reference}: {message}"),
-                should_cancel=cancellation_requested,
-                defer_transient=not final_attempt,
-            )
-            job.downloaded_count += result.downloaded_count
-            if job.downloaded_count:
-                add_captured_document_application(job.reference)
-            if cancellation_requested():
-                return
-            job.pending_documents = result.transient_documents
-            if job.pending_documents and not final_attempt:
+                pending_urls = {
+                    normalize_url(document.url) for document in job.pending_documents
+                }
+                for document in discovery.documents:
+                    normalized_url = normalize_url(document.url)
+                    if (
+                        normalized_url in job.processed_document_urls
+                        or normalized_url in pending_urls
+                    ):
+                        continue
+                    pending_urls.add(normalized_url)
+                    job.pending_documents.append(document)
+
+            if not job.pending_documents and not job.rediscovery_required:
+                if job.successful_document_sources:
+                    _log(
+                        log,
+                        f"{job.reference}: no documents currently published by the council",
+                    )
+                else:
+                    _log(
+                        log,
+                        f"{job.reference}: no public document source was available",
+                    )
+
+            if job.pending_documents:
+                attempted_documents = list(job.pending_documents)
+                result = _download_pdf_documents_once(
+                    attempted_documents,
+                    job.folder,
+                    log=lambda message: _log(log, f"{job.reference}: {message}"),
+                    should_cancel=cancellation_requested,
+                    defer_transient=not final_attempt,
+                )
+                transient_urls = {
+                    normalize_url(document.url)
+                    for document in result.transient_documents
+                }
+                job.processed_document_urls.update(
+                    normalize_url(document.url)
+                    for document in attempted_documents
+                    if normalize_url(document.url) not in transient_urls
+                )
+                job.pending_documents = list(result.transient_documents)
+                job.downloaded_count += result.downloaded_count
+                if job.downloaded_count:
+                    add_captured_document_application(job.reference)
+                if cancellation_requested():
+                    return
+
+            needs_retry = bool(job.pending_documents) or job.rediscovery_required
+            if needs_retry and not final_attempt:
                 with lock:
                     deferred_document_jobs.append(job)
                 _log(
                     log,
-                    f"{job.reference}: deferred {len(job.pending_documents)} temporary "
-                    "document failure(s) until the end of the download queue",
+                    f"{job.reference}: document discovery deferred for final retry",
                 )
                 return
+            if final_attempt and job.rediscovery_required:
+                for failure in job.document_source_failures:
+                    _log(
+                        log,
+                        f"{job.reference}: unresolved document source {failure.source_url}: "
+                        f"{failure.reason}",
+                    )
+                _log(
+                    log,
+                    f"{job.reference}: partial document capture; one or more sources remain unavailable",
+                )
         except Exception as exc:  # pragma: no cover - live document portals vary
             if not final_attempt and not cancellation_requested():
                 with lock:
@@ -1625,12 +1697,41 @@ def enrich_planit_application(application: PlanningApplication) -> PlanningAppli
     return enrich_application_documents(application)
 
 
-def enrich_application_documents(application: PlanningApplication) -> PlanningApplication:
-    documents: list[PlanningDocument] = list(application.documents)
-    seen: set[str] = {document.url for document in documents}
+def _record_document_source(
+    result: DocumentDiscoveryResult,
+    source_url: str,
+    fetch: Callable[[], list[PlanningDocument]],
+) -> list[PlanningDocument]:
+    try:
+        documents = fetch()
+    except Exception as exc:
+        failed_url = (
+            exc.source_url
+            if isinstance(exc, DocumentDiscoveryTransientError)
+            else source_url
+        )
+        result.failed_sources.append(DocumentSourceFailure(failed_url, str(exc)))
+        return []
+    result.successful_sources.append(source_url)
+    return documents
+
+
+def discover_application_documents(application: PlanningApplication) -> DocumentDiscoveryResult:
+    result = DocumentDiscoveryResult()
+    seen: set[str] = set()
+
+    def merge(documents: Iterable[PlanningDocument]) -> None:
+        for document in documents:
+            normalized_url = normalize_url(document.url)
+            if normalized_url in seen:
+                continue
+            seen.add(normalized_url)
+            result.documents.append(document)
+
+    merge(application.documents)
 
     if (application.raw or {}).get("portal_family") == "agile":
-        try:
+        def fetch_agile_documents() -> list[PlanningDocument]:
             parts = urlsplit(application.url)
             path_parts = [part for part in parts.path.split("/") if part]
             slug = path_parts[0] if path_parts else ""
@@ -1643,50 +1744,61 @@ def enrich_application_documents(application: PlanningApplication) -> PlanningAp
             )
             for document in agile_documents:
                 document.source_url = application.url
-                if document.url not in seen:
-                    seen.add(document.url)
-                    documents.append(document)
-        except Exception:
-            pass
+            return agile_documents
+
+        merge(_record_document_source(result, application.url, fetch_agile_documents))
 
     civica_documents = fetch_civica_documents_from_raw(application.raw or {}, source_url=application.url)
-    for document in civica_documents:
-        if document.url not in seen:
-            seen.add(document.url)
-            documents.append(document)
+    merge(civica_documents)
     for docs_url in application_document_source_urls(application):
-        try:
-            fetched = fetch_planit_documents(docs_url)
-        except Exception:
-            continue
-        expanded: list[PlanningDocument] = []
+        fetched = _record_document_source(
+            result,
+            docs_url,
+            lambda docs_url=docs_url: fetch_planit_documents(
+                docs_url,
+                discovery_result=result,
+            ),
+        )
         for document in fetched:
             if "runthirdpartysearch" in document.url.casefold():
-                try:
-                    nested_documents = fetch_planit_documents(document.url)
-                except Exception:
-                    nested_documents = []
-                expanded.extend(nested_documents or [document])
+                nested_documents = _record_document_source(
+                    result,
+                    document.url,
+                    lambda document_url=document.url: fetch_planit_documents(
+                        document_url,
+                        discovery_result=result,
+                    ),
+                )
+                merge(nested_documents)
             else:
-                expanded.append(document)
-        for document in expanded:
-            if document.url in seen:
-                continue
-            seen.add(document.url)
-            documents.append(document)
+                merge([document])
 
-    usable_documents = [document for document in documents if _looks_like_downloadable_document(document)]
+    usable_documents = [
+        document for document in result.documents if _looks_like_downloadable_document(document)
+    ]
     if not usable_documents and (application.raw or {}).get("portal_family") == "tascomi":
-        try:
-            browser_documents = fetch_browser_document_list(application.url)
-        except Exception:
-            browser_documents = []
-        for document in browser_documents:
-            if document.url not in seen:
-                seen.add(document.url)
-                documents.append(document)
+        browser_documents = _record_document_source(
+            result,
+            application.url,
+            lambda: fetch_browser_document_list(application.url),
+        )
+        merge(browser_documents)
 
-    application.documents = documents
+    return result
+
+
+def enrich_application_documents(application: PlanningApplication) -> PlanningApplication:
+    result = discover_application_documents(application)
+    application.documents = result.documents
+    if result.failed_sources and not result.successful_sources and not result.documents:
+        failures = "; ".join(
+            f"{failure.source_url}: {failure.reason}" for failure in result.failed_sources
+        )
+        raise DocumentDiscoveryTransientError(
+            result.failed_sources[0].source_url,
+            failures,
+        )
+
     return application
 
 
@@ -1777,7 +1889,11 @@ def _looks_like_listing_url(url: str) -> bool:
     return path.endswith("/search") or path.endswith("/search/advanced")
 
 
-def fetch_planit_documents(docs_url: str) -> list[PlanningDocument]:
+def fetch_planit_documents(
+    docs_url: str,
+    *,
+    discovery_result: DocumentDiscoveryResult | None = None,
+) -> list[PlanningDocument]:
     text, page_url, opener = _fetch_html_document_page(docs_url, timeout=45)
     document = html.fromstring(text)
     documents: list[PlanningDocument] = []
@@ -1788,7 +1904,16 @@ def fetch_planit_documents(docs_url: str) -> list[PlanningDocument]:
             continue
         seen.add(absolute_url)
         documents.append(PlanningDocument(title=title, url=normalize_url(absolute_url), source_url=page_url))
-    for publisher_document in fetch_publisher_document_list(text, page_url, opener):
+    try:
+        publisher_documents = fetch_publisher_document_list(text, page_url, opener)
+    except DocumentDiscoveryTransientError as exc:
+        if discovery_result is None:
+            raise
+        discovery_result.failed_sources.append(
+            DocumentSourceFailure(exc.source_url, str(exc))
+        )
+        publisher_documents = []
+    for publisher_document in publisher_documents:
         if publisher_document.url in seen:
             continue
         seen.add(publisher_document.url)
@@ -2491,15 +2616,18 @@ def fetch_publisher_document_list(text: str, page_url: str, opener) -> list[Plan
     try:
         with _open_url_with_retry(request, timeout=45, opener=opener) as response:
             payload = response.read().decode("utf-8", errors="replace")
-    except Exception:
-        return []
-    try:
         data = json.loads(payload)
-    except json.JSONDecodeError:
-        return []
-    rows = data.get("data")
+    except Exception as exc:
+        raise DocumentDiscoveryTransientError(
+            endpoint,
+            f"Publisher document list failed: {exc}",
+        ) from exc
+    rows = data.get("data") if isinstance(data, dict) else None
     if not isinstance(rows, list):
-        return []
+        raise DocumentDiscoveryTransientError(
+            endpoint,
+            "Publisher document list returned invalid data",
+        )
     documents: list[PlanningDocument] = []
     for row in rows:
         if not isinstance(row, list) or len(row) < 2:

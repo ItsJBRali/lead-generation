@@ -21,6 +21,9 @@ from lead_generator.planning.leads import (
     CouncilSearchDegradedError,
     CouncilTarget,
     DocumentDownloadBatchResult,
+    DocumentDiscoveryResult,
+    DocumentDiscoveryTransientError,
+    DocumentSourceFailure,
     DownloadedFile,
     LeadSearchConfig,
     _discover_planit_applications_serial,
@@ -33,6 +36,7 @@ from lead_generator.planning.leads import (
     document_source_url_from_application_url,
     document_filename,
     document_download_candidates,
+    discover_application_documents,
     discover_portal_applications,
     discover_portal_applications_with_deadline,
     download_document_bytes,
@@ -944,14 +948,13 @@ class LeadSearchTest(unittest.TestCase):
                     )
                 ]
 
-            def fake_enrich(application):
-                application.documents = [
+            def fake_document_discovery(application):
+                return DocumentDiscoveryResult(documents=[
                     PlanningDocument(
                         title=f"{application.reference}.pdf",
                         url=f"https://documents.example.gov.uk/{application.uid}.pdf",
                     )
-                ]
-                return application
+                ])
 
             def fake_download(documents, destination, **kwargs):
                 document = list(documents)[0]
@@ -960,7 +963,10 @@ class LeadSearchTest(unittest.TestCase):
 
             with (
                 patch("lead_generator.planning.leads.discover_portal_applications", side_effect=fake_discover),
-                patch("lead_generator.planning.leads.enrich_application_documents", side_effect=fake_enrich),
+                patch(
+                    "lead_generator.planning.leads.discover_application_documents",
+                    side_effect=fake_document_discovery,
+                ),
                 patch("lead_generator.planning.leads._download_pdf_documents_once", side_effect=fake_download),
                 patch("lead_generator.planning.leads.MAX_CONCURRENT_DOCUMENT_BATCHES", 1),
                 patch("lead_generator.planning.leads.enrich_application_folder", return_value=ContactEnrichment()),
@@ -1001,14 +1007,13 @@ class LeadSearchTest(unittest.TestCase):
             ]
             events: list[str] = []
 
-            def fake_enrich(application):
-                application.documents = [
+            def fake_document_discovery(application):
+                return DocumentDiscoveryResult(documents=[
                     PlanningDocument(
                         title=f"{application.reference}.pdf",
                         url=f"https://documents.example.gov.uk/{application.uid}.pdf",
                     )
-                ]
-                return application
+                ])
 
             def fake_download(documents, destination, *, defer_transient=True, **kwargs):
                 document = list(documents)[0]
@@ -1020,7 +1025,10 @@ class LeadSearchTest(unittest.TestCase):
 
             with (
                 patch("lead_generator.planning.leads.discover_portal_applications", return_value=applications),
-                patch("lead_generator.planning.leads.enrich_application_documents", side_effect=fake_enrich),
+                patch(
+                    "lead_generator.planning.leads.discover_application_documents",
+                    side_effect=fake_document_discovery,
+                ),
                 patch("lead_generator.planning.leads._download_pdf_documents_once", side_effect=fake_download),
                 patch("lead_generator.planning.leads._wait_for_document_retry_cooldown", return_value=True),
                 patch("lead_generator.planning.leads.MAX_CONCURRENT_DOCUMENT_BATCHES", 1),
@@ -1030,6 +1038,115 @@ class LeadSearchTest(unittest.TestCase):
 
         self.assertEqual(events, ["first:REF-1", "first:REF-2", "retry:REF-1"])
         self.assertEqual(result.captured_documents, 2)
+
+    def test_run_lead_search_rediscovers_partial_document_jobs_at_queue_end(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_geojson, catalogue = write_search_fixture(root, ["Example Council"])
+            config = LeadSearchConfig(
+                geojson_path=user_geojson,
+                output_root=root,
+                start_date=date(2026, 6, 1),
+                end_date=date(2026, 6, 30),
+                keywords=["gates"],
+                catalogue_path=catalogue,
+                worker_count=1,
+            )
+            application = PlanningApplication(
+                authority="Example Council",
+                uid="APP-1",
+                url="https://planning.example.test/APP-1",
+                reference="REF-1",
+                address="1 Example Street",
+                description="Install driveway gates",
+                date_received="2026-06-10",
+                raw={"location": {"type": "Point", "coordinates": [0.5, 0.5]}},
+            )
+            first = PlanningDocument(title="Proposed plan.pdf", url="https://docs.test/one.pdf")
+            second = PlanningDocument(title="Proposed elevations.pdf", url="https://docs.test/two.pdf")
+            discoveries = [
+                DocumentDiscoveryResult(
+                    documents=[first],
+                    successful_sources=["https://docs.test/a"],
+                    failed_sources=[DocumentSourceFailure("https://docs.test/b", "HTTP 503")],
+                ),
+                DocumentDiscoveryResult(
+                    documents=[first, second],
+                    successful_sources=["https://docs.test/a", "https://docs.test/b"],
+                ),
+            ]
+            download_batches: list[list[str]] = []
+            progress: list[tuple[int, int]] = []
+
+            def fake_download(documents, destination, **kwargs):
+                batch = list(documents)
+                download_batches.append([document.url for document in batch])
+                return DocumentDownloadBatchResult(downloaded_count=len(batch))
+
+            with (
+                patch("lead_generator.planning.leads.discover_portal_applications", return_value=[application]),
+                patch(
+                    "lead_generator.planning.leads.discover_application_documents",
+                    side_effect=discoveries,
+                ) as discover_documents,
+                patch("lead_generator.planning.leads._download_pdf_documents_once", side_effect=fake_download),
+                patch("lead_generator.planning.leads._wait_for_document_retry_cooldown", return_value=True),
+                patch("lead_generator.planning.leads.MAX_CONCURRENT_DOCUMENT_BATCHES", 1),
+                patch("lead_generator.planning.leads.enrich_application_folder", return_value=ContactEnrichment()),
+            ):
+                result = run_lead_search(
+                    config,
+                    document_progress=lambda done, total: progress.append((done, total)),
+                )
+
+        self.assertEqual(download_batches, [[first.url], [second.url]])
+        self.assertEqual(discover_documents.call_count, 2)
+        self.assertEqual(progress, [(0, 1), (1, 1)])
+        self.assertEqual(result.captured_documents, 1)
+
+    def test_run_lead_search_does_not_retry_confirmed_empty_document_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_geojson, catalogue = write_search_fixture(root, ["Example Council"])
+            config = LeadSearchConfig(
+                geojson_path=user_geojson,
+                output_root=root,
+                start_date=date(2026, 6, 1),
+                end_date=date(2026, 6, 30),
+                keywords=["gates"],
+                catalogue_path=catalogue,
+                worker_count=1,
+            )
+            application = PlanningApplication(
+                authority="Example Council",
+                uid="APP-1",
+                url="https://planning.example.test/APP-1",
+                reference="REF-1",
+                address="1 Example Street",
+                description="Install driveway gates",
+                date_received="2026-06-10",
+                raw={"location": {"type": "Point", "coordinates": [0.5, 0.5]}},
+            )
+            confirmed_empty = DocumentDiscoveryResult(
+                successful_sources=["https://planning.example.test/APP-1"]
+            )
+
+            with (
+                patch("lead_generator.planning.leads.discover_portal_applications", return_value=[application]),
+                patch(
+                    "lead_generator.planning.leads.discover_application_documents",
+                    return_value=confirmed_empty,
+                ) as discover_documents,
+                patch("lead_generator.planning.leads._download_pdf_documents_once") as download_documents,
+                patch("lead_generator.planning.leads._wait_for_document_retry_cooldown") as wait_for_retry,
+                patch("lead_generator.planning.leads.enrich_application_folder", return_value=ContactEnrichment()),
+            ):
+                result = run_lead_search(config)
+
+        discover_documents.assert_called_once()
+        download_documents.assert_not_called()
+        wait_for_retry.assert_not_called()
+        self.assertEqual(result.failed_councils, [])
 
     def test_run_lead_search_reports_document_progress(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1058,7 +1175,10 @@ class LeadSearchTest(unittest.TestCase):
 
             with (
                 patch("lead_generator.planning.leads.discover_portal_applications", return_value=[application]),
-                patch("lead_generator.planning.leads.enrich_application_documents", return_value=application),
+                patch(
+                    "lead_generator.planning.leads.discover_application_documents",
+                    return_value=DocumentDiscoveryResult(),
+                ),
                 patch(
                     "lead_generator.planning.leads._download_pdf_documents_once",
                     return_value=DocumentDownloadBatchResult(),
@@ -1095,7 +1215,17 @@ class LeadSearchTest(unittest.TestCase):
 
             with (
                 patch("lead_generator.planning.leads.discover_portal_applications", return_value=[application]),
-                patch("lead_generator.planning.leads.enrich_application_documents", side_effect=RuntimeError("document portal timed out")),
+                patch(
+                    "lead_generator.planning.leads.discover_application_documents",
+                    return_value=DocumentDiscoveryResult(
+                        failed_sources=[
+                            DocumentSourceFailure(
+                                application.url,
+                                "document portal timed out",
+                            )
+                        ]
+                    ),
+                ),
                 patch("lead_generator.planning.leads._wait_for_document_retry_cooldown", return_value=True),
                 patch("lead_generator.planning.leads.enrich_application_folder", return_value=ContactEnrichment()),
             ):
@@ -1160,7 +1290,7 @@ class LeadSearchTest(unittest.TestCase):
 
             with (
                 patch("lead_generator.planning.leads.discover_portal_applications", return_value=[application]),
-                patch("lead_generator.planning.leads.enrich_application_documents", side_effect=AssertionError("Documents should not be enriched")),
+                patch("lead_generator.planning.leads.discover_application_documents", side_effect=AssertionError("Documents should not be discovered")),
                 patch("lead_generator.planning.leads.download_pdf_documents", side_effect=AssertionError("Documents should not be downloaded")),
             ):
                 result = run_lead_search(config)
@@ -1539,19 +1669,21 @@ class LeadSearchTest(unittest.TestCase):
                     ),
                 ]
 
-            def fake_enrich(application):
-                application.documents = [
+            def fake_document_discovery(application):
+                return DocumentDiscoveryResult(documents=[
                     PlanningDocument(
                         title="Proposed plan.pdf",
                         url="https://applications.example.gov.uk/document/proposed.pdf",
                     )
-                ]
-                return application
+                ])
 
             captured_counts: list[int] = []
             with (
                 patch("lead_generator.planning.leads.discover_portal_applications", side_effect=fake_discover),
-                patch("lead_generator.planning.leads.enrich_application_documents", side_effect=fake_enrich),
+                patch(
+                    "lead_generator.planning.leads.discover_application_documents",
+                    side_effect=fake_document_discovery,
+                ),
                 patch(
                     "lead_generator.planning.leads._download_pdf_documents_once",
                     return_value=DocumentDownloadBatchResult(downloaded_count=1),
@@ -2025,7 +2157,11 @@ class LeadSearchTest(unittest.TestCase):
         with patch("lead_generator.planning.leads.fetch_planit_documents", return_value=documents) as fetch_documents:
             enriched = enrich_planit_application(application)
 
-        fetch_documents.assert_called_once_with("https://planning.bcpcouncil.gov.uk/Planning/Display/P/26/02835/HOU")
+        fetch_documents.assert_called_once()
+        self.assertEqual(
+            fetch_documents.call_args.args[0],
+            "https://planning.bcpcouncil.gov.uk/Planning/Display/P/26/02835/HOU",
+        )
         self.assertEqual(enriched.documents, documents)
 
     def test_enrich_application_documents_merges_documents_from_every_source(self) -> None:
@@ -2039,7 +2175,7 @@ class LeadSearchTest(unittest.TestCase):
             },
         )
 
-        def fake_fetch(url: str) -> list[PlanningDocument]:
+        def fake_fetch(url: str, **kwargs) -> list[PlanningDocument]:
             if "SearchResult" in url:
                 return [
                     PlanningDocument(title="Application form.pdf", url="https://documents.example.gov.uk/document/form.pdf"),
@@ -2062,6 +2198,37 @@ class LeadSearchTest(unittest.TestCase):
             [document.title for document in enriched.documents],
             ["Application form.pdf", "Site plan.pdf", "Decision notice.pdf", "Proposed elevations.dwg"],
         )
+
+    def test_discover_application_documents_keeps_partial_results(self) -> None:
+        application = PlanningApplication(
+            authority="Example",
+            uid="ABC123",
+            url="https://example.test/application/ABC123",
+        )
+        source_a = "https://example.test/documents-a"
+        source_b = "https://example.test/documents-b"
+        proposed_plan = PlanningDocument(
+            title="Proposed plan.pdf",
+            url="https://example.test/proposed-plan.pdf",
+        )
+        unavailable = HTTPError(source_b, 503, "Unavailable", {}, None)
+
+        with (
+            patch(
+                "lead_generator.planning.leads.application_document_source_urls",
+                return_value=[source_a, source_b],
+            ),
+            patch(
+                "lead_generator.planning.leads.fetch_planit_documents",
+                side_effect=[[proposed_plan], unavailable],
+            ),
+        ):
+            result = discover_application_documents(application)
+
+        self.assertEqual([document.title for document in result.documents], ["Proposed plan.pdf"])
+        self.assertEqual(result.successful_sources, [source_a])
+        self.assertEqual(result.failed_sources[0].source_url, source_b)
+        self.assertIn("503", result.failed_sources[0].reason)
 
     def test_download_pdf_documents_skips_exe_and_existing_only_files(self) -> None:
         documents = [
@@ -2558,6 +2725,19 @@ class LeadSearchTest(unittest.TestCase):
         self.assertEqual(documents[0].title, "APPLICATION FORM REDACTED")
         self.assertEqual(documents[0].url, "https://app.example.gov.uk/docs/A29775F9/Document-A29775F9.pdf")
         self.assertEqual(documents[0].source_url, "https://app.example.gov.uk/planningdocuments=22%2F001")
+
+    def test_fetch_publisher_document_list_propagates_endpoint_failure(self) -> None:
+        page_url = "https://app.example.test/planningdocuments=26%2F001"
+        endpoint = "https://app.example.test/publisher/mvc/getDocumentList"
+        unavailable = HTTPError(endpoint, 503, "Unavailable", {}, None)
+
+        with patch("lead_generator.planning.leads._open_url_with_retry", side_effect=unavailable):
+            with self.assertRaisesRegex(DocumentDiscoveryTransientError, "getDocumentList"):
+                fetch_publisher_document_list(
+                    '"url": "/publisher/mvc/getDocumentList"',
+                    page_url,
+                    object(),
+                )
 
     def test_fetch_arcus_salesforce_document_list_reads_aura_rows(self) -> None:
         class FakeResponse:
