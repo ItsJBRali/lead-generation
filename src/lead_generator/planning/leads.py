@@ -2044,6 +2044,8 @@ def _associated_document_source_urls(html_text: str, page_url: str) -> list[str]
     document = html.fromstring(html_text)
     urls: list[str] = []
     for anchor in document.xpath("//a[@href]"):
+        if _is_page_chrome_link(anchor):
+            continue
         label = (clean_text(" ".join(anchor.xpath(".//text()"))) or "").casefold()
         if not any(
             marker in label
@@ -2660,21 +2662,28 @@ def source_document_candidates(
                 cache[source_url] = candidates
     wanted = _document_identity(document)
     generic_title = _is_generic_document_title(document.title)
-    matching = [
-        candidate.url
+    identified_candidates = [
+        (candidate.url, identity)
         for candidate in candidates
-        if not wanted
-        or _document_identity(candidate) == wanted
-        or (
-            not generic_title
-            and _document_identity(candidate)
-            and (
-                wanted in _document_identity(candidate)
-                or _document_identity(candidate) in wanted
-            )
-        )
+        if (identity := _document_identity(candidate))
     ]
-    return list(dict.fromkeys(matching))
+    exact_matches = list(
+        dict.fromkeys(
+            url for url, identity in identified_candidates if identity == wanted
+        )
+    )
+    if exact_matches:
+        return exact_matches
+    if not wanted or generic_title:
+        return []
+    fuzzy_matches = list(
+        dict.fromkeys(
+            url
+            for url, identity in identified_candidates
+            if wanted in identity or identity in wanted
+        )
+    )
+    return fuzzy_matches if len(fuzzy_matches) == 1 else []
 
 
 def _is_session_bound_document_url(url: str) -> bool:
@@ -2687,7 +2696,9 @@ def _fetch_isolated_document_fallback(
 ) -> list[PlanningDocument]:
     try:
         return fetch()
-    except Exception:
+    except Exception as exc:
+        if _is_tls_certificate_error(exc) or _is_tls_compatibility_error(exc):
+            raise
         return []
 
 
@@ -2744,6 +2755,8 @@ def iter_document_links(document: html.HtmlElement, page_url: str) -> Iterable[t
         yield href, title
     for attr in ("data-disabled-link", "data-link", "data-url", "data-href"):
         for element in document.xpath(f"//*[@{attr}]"):
+            if _is_page_chrome_link(element):
+                continue
             href = element.get(attr)
             if not _is_document_href(href):
                 continue
@@ -2763,6 +2776,8 @@ def iter_document_links(document: html.HtmlElement, page_url: str) -> Iterable[t
                 continue
             yield href, title
     for element in document.xpath("//*[@onclick]"):
+        if _is_page_chrome_link(element):
+            continue
         onclick = element.get("onclick") or ""
         for href in re.findall(r"['\"]([^'\"]+(?:document|download|attachment|viewDocument|showDocuments|displaymedia|displaysearchdocument|file)[^'\"]*)['\"]", onclick, flags=re.IGNORECASE):
             absolute_url = urljoin(page_url, href)
@@ -2775,6 +2790,8 @@ def iter_document_links(document: html.HtmlElement, page_url: str) -> Iterable[t
                 continue
             yield href, title
     for form in document.xpath("//form[@action]"):
+        if _is_page_chrome_link(form):
+            continue
         action = form.get("action") or ""
         if not _is_document_href(action):
             continue
@@ -2798,6 +2815,8 @@ def iter_document_links(document: html.HtmlElement, page_url: str) -> Iterable[t
             continue
         yield href, title
     for element in document.xpath("//iframe[@src] | //embed[@src] | //object[@data]"):
+        if _is_page_chrome_link(element):
+            continue
         href = element.get("src") or element.get("data")
         if not _is_document_href(href):
             continue
@@ -3930,19 +3949,43 @@ def _path_suffix(url: str | None) -> str:
 
 
 def _is_tls_certificate_error(exc: Exception) -> bool:
-    if isinstance(exc, ssl.SSLCertVerificationError):
-        return True
-    if isinstance(exc, URLError):
-        reason = exc.reason
-        return isinstance(reason, ssl.SSLCertVerificationError) or "certificate" in str(reason).casefold()
-    return "certificate" in str(exc).casefold() and "ssl" in str(exc).casefold()
+    for error in _exception_chain(exc):
+        if isinstance(error, ssl.SSLCertVerificationError):
+            return True
+        if isinstance(error, URLError):
+            reason = error.reason
+            if isinstance(reason, ssl.SSLCertVerificationError) or "certificate" in str(reason).casefold():
+                return True
+        text = str(error).casefold()
+        if "certificate" in text and "ssl" in text:
+            return True
+    return False
 
 
 def _is_tls_compatibility_error(exc: Exception) -> bool:
-    text = str(exc).casefold()
-    if isinstance(exc, URLError):
-        text = f"{exc.reason} {exc}".casefold()
-    return "forcibly closed" in text or "winerror 10054" in text or "sslv3 alert handshake failure" in text
+    for error in _exception_chain(exc):
+        text = str(error).casefold()
+        if isinstance(error, URLError):
+            text = f"{error.reason} {error}".casefold()
+        if any(
+            marker in text
+            for marker in (
+                "forcibly closed",
+                "winerror 10054",
+                "sslv3 alert handshake failure",
+            )
+        ):
+            return True
+    return False
+
+
+def _exception_chain(exc: Exception) -> Iterable[Exception]:
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while isinstance(current, Exception) and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
 
 
 def _comparable_title(value: str | None) -> str:

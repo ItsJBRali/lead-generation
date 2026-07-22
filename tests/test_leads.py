@@ -2274,6 +2274,20 @@ class LeadSearchTest(unittest.TestCase):
             ["https://planning.example.test/documents/related"],
         )
 
+    def test_associated_document_sources_ignore_page_chrome(self) -> None:
+        page_url = "https://planning.example.test/application/ABC123"
+        markup = """
+            <html><body>
+              <nav><a href="/navigation/documents">Plans &amp; Documents</a></nav>
+              <main><a href="/application/documents">Plans &amp; Documents</a></main>
+            </body></html>
+        """
+
+        self.assertEqual(
+            _associated_document_source_urls(markup, page_url),
+            ["https://planning.example.test/application/documents"],
+        )
+
     def test_document_links_exclude_breadcrumb_tab_navigation_and_footer_pdf(self) -> None:
         page_url = (
             "https://planning.example.gov.uk/online-applications/"
@@ -3114,6 +3128,96 @@ class LeadSearchTest(unittest.TestCase):
                 self.assertEqual(discoveries, ["verified", "unverified"])
                 self.assertNotIn(("unverified", verified_url), opened)
 
+    def test_nested_enterprise_tls_failure_restarts_source_discovery_with_replacement_opener(self) -> None:
+        source_url = (
+            "https://planning.example.gov.uk/application/details?applicationNumber=ABC123"
+        )
+        list_path = "/documents/list"
+        stale_url = (
+            "https://planning.example.gov.uk/Document/Download?"
+            "session=stale&fileName=ApplicationForm.pdf"
+        )
+        fresh_url = (
+            "https://planning.example.gov.uk/OnlinePlanning/DisplaySearchDocument?"
+            "session=fresh&fileName=ApplicationForm.pdf"
+        )
+        source_markup = (
+            f'<div id="divDisplayDocumentsUrl" data-url="{list_path}"></div>'
+        ).encode()
+        events: list[tuple[str, str]] = []
+
+        class FakeResponse:
+            def __init__(self, url: str, payload: bytes, content_type: str) -> None:
+                self._url = url
+                self._payload = payload
+                self.headers = {"Content-Type": content_type}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return self._payload
+
+            def geturl(self) -> str:
+                return self._url
+
+        class FakeOpener:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def open(self, request, timeout):
+                url = request.full_url
+                events.append((self.name, url))
+                if url == source_url:
+                    return FakeResponse(url, source_markup, "text/html")
+                if url.startswith("https://planning.example.gov.uk/documents/list?"):
+                    if self.name == "verified":
+                        raise URLError(
+                            ssl.SSLCertVerificationError(
+                                "Missing Authority Key Identifier"
+                            )
+                        )
+                    return FakeResponse(
+                        url,
+                        (
+                            '<a href="/OnlinePlanning/DisplaySearchDocument?session=fresh&amp;'
+                            'fileName=ApplicationForm.pdf">Application Form</a>'
+                        ).encode(),
+                        "text/html",
+                    )
+                if self.name == "replacement" and url == fresh_url:
+                    return FakeResponse(url, b"%PDF-1.4", "application/pdf")
+                raise HTTPError(url, 404, "Expired session", {}, None)
+
+        verified_opener = FakeOpener("verified")
+        replacement_opener = FakeOpener("replacement")
+        document = PlanningDocument(
+            title="Application Form",
+            url=stale_url,
+            source_url=source_url,
+        )
+
+        with patch(
+            "lead_generator.planning.leads._build_document_opener",
+            return_value=replacement_opener,
+        ) as opener_factory:
+            downloaded = download_document_file(document, opener=verified_opener)
+
+        self.assertEqual(downloaded.final_url, fresh_url)
+        self.assertEqual(
+            [name for name, url in events if url == source_url],
+            ["verified", "replacement"],
+        )
+        self.assertEqual(
+            [name for name, url in events if url.startswith("https://planning.example.gov.uk/documents/list?")],
+            ["verified", "replacement"],
+        )
+        self.assertNotIn(("replacement", stale_url), events)
+        opener_factory.assert_called_once_with(verify_tls=False, tls_compat=False)
+
     def test_generic_plan_documents_use_distinct_url_filenames(self) -> None:
         documents = [
             PlanningDocument(
@@ -3194,6 +3298,63 @@ class LeadSearchTest(unittest.TestCase):
             downloaded.final_url,
             "https://planning.example.gov.uk/current?fileName=SitePlan.pdf",
         )
+
+    def test_source_document_candidates_prefer_exact_and_reject_ambiguous_fuzzy_matches(self) -> None:
+        source_url = "https://planning.example.gov.uk/application/ABC123"
+        wanted = PlanningDocument(
+            title="Application Form",
+            url="https://planning.example.gov.uk/files/stale.pdf",
+            source_url=source_url,
+        )
+        exact_url = "https://planning.example.gov.uk/files/application-form.pdf"
+        repeated_fuzzy_url = "https://planning.example.gov.uk/files/redacted-form.pdf"
+
+        cases = (
+            (
+                "later exact match",
+                [
+                    PlanningDocument(
+                        title="Application Form Covering Letter",
+                        url="https://planning.example.gov.uk/files/covering-letter.pdf",
+                    ),
+                    PlanningDocument(title="Application Form", url=exact_url),
+                ],
+                [exact_url],
+            ),
+            (
+                "one repeated fuzzy URL",
+                [
+                    PlanningDocument(title="Application Form Redacted", url=repeated_fuzzy_url),
+                    PlanningDocument(title="Application Form Copy", url=repeated_fuzzy_url),
+                ],
+                [repeated_fuzzy_url],
+            ),
+            (
+                "two fuzzy URLs",
+                [
+                    PlanningDocument(
+                        title="Application Form Redacted",
+                        url="https://planning.example.gov.uk/files/redacted-form.pdf",
+                    ),
+                    PlanningDocument(
+                        title="Application Form Covering Letter",
+                        url="https://planning.example.gov.uk/files/covering-letter.pdf",
+                    ),
+                ],
+                [],
+            ),
+        )
+
+        for label, candidates, expected in cases:
+            with self.subTest(label=label):
+                self.assertEqual(
+                    source_document_candidates(
+                        wanted,
+                        object(),
+                        cache={source_url: candidates},
+                    ),
+                    expected,
+                )
 
     def test_non_generic_fallback_rejects_empty_candidate_identities(self) -> None:
         source_url = "https://planning.example.gov.uk/Planning/Display/2024/00577/4/CD"
@@ -3472,6 +3633,49 @@ class LeadSearchTest(unittest.TestCase):
                     "Download Proposed plan.pdf",
                 )
             ],
+        )
+
+    def test_element_backed_document_links_ignore_page_chrome(self) -> None:
+        page_url = "https://planning.example.gov.uk/application/ABC123"
+        document = html.fromstring(
+            """
+            <html><body>
+              <footer>
+                <button data-url="/files/footer-data.pdf">Footer data</button>
+                <button onclick="window.location='/files/footer-onclick.pdf'">Footer onclick</button>
+                <form method="get" action="/Document/Download">
+                  <input type="hidden" name="id" value="footer-form">
+                  <button>Footer form</button>
+                </form>
+                <iframe src="/files/footer-iframe.pdf"></iframe>
+                <embed src="/files/footer-embed.pdf">
+                <object data="/files/footer-object.pdf"></object>
+              </footer>
+              <main>
+                <button data-url="/files/main-data.pdf">Main data</button>
+                <button onclick="window.location='/files/main-onclick.pdf'">Main onclick</button>
+                <form method="get" action="/Document/Download">
+                  <input type="hidden" name="id" value="main-form">
+                  <button>Main form</button>
+                </form>
+                <iframe src="/files/main-iframe.pdf"></iframe>
+                <embed src="/files/main-embed.pdf">
+                <object data="/files/main-object.pdf"></object>
+              </main>
+            </body></html>
+            """
+        )
+
+        self.assertEqual(
+            {href for href, _title in iter_document_links(document, page_url)},
+            {
+                "/files/main-data.pdf",
+                "/files/main-onclick.pdf",
+                "https://planning.example.gov.uk/Document/Download?id=main-form",
+                "/files/main-iframe.pdf",
+                "/files/main-embed.pdf",
+                "/files/main-object.pdf",
+            },
         )
 
     def test_fetch_publisher_document_list_reads_ajax_rows(self) -> None:
