@@ -2611,8 +2611,12 @@ def iter_document_links(document: html.HtmlElement, page_url: str) -> Iterable[t
     yield from iter_public_access_model_links(document, page_url)
     for anchor in document.xpath("//a[@href]"):
         href = anchor.get("href")
+        if not href:
+            continue
         absolute_url = urljoin(page_url, href)
-        title = clean_text(" ".join(anchor.itertext())) or document_title_from_url(absolute_url)
+        title = _document_link_title(" ".join(anchor.itertext()), absolute_url)
+        if not title:
+            continue
         if _is_generic_site_document(href, title):
             continue
         if not _is_document_href(href) and not _is_document_link_text(title, href):
@@ -2626,16 +2630,25 @@ def iter_document_links(document: html.HtmlElement, page_url: str) -> Iterable[t
             if not _is_document_href(href):
                 continue
             absolute_url = urljoin(page_url, href)
-            title = clean_text(element.get("aria-label") or " ".join(element.itertext())) or document_title_from_url(absolute_url)
+            title = _document_link_title(
+                element.get("aria-label") or " ".join(element.itertext()),
+                absolute_url,
+            )
+            if not title:
+                continue
             title = re.sub(r"^link\s*\(\s*download\s*\)\s*", "", title, flags=re.IGNORECASE).strip()
+            if not title:
+                continue
             if _is_generic_site_document(href, title):
                 continue
-            yield href, title or document_title_from_url(absolute_url)
+            yield href, title
     for element in document.xpath("//*[@onclick]"):
         onclick = element.get("onclick") or ""
         for href in re.findall(r"['\"]([^'\"]+(?:document|download|attachment|viewDocument|showDocuments|displaymedia|displaysearchdocument|file)[^'\"]*)['\"]", onclick, flags=re.IGNORECASE):
             absolute_url = urljoin(page_url, href)
-            title = clean_text(" ".join(element.itertext())) or document_title_from_url(absolute_url)
+            title = _document_link_title(" ".join(element.itertext()), absolute_url)
+            if not title:
+                continue
             if _is_generic_site_document(href, title):
                 continue
             yield href, title
@@ -2654,7 +2667,9 @@ def iter_document_links(document: html.HtmlElement, page_url: str) -> Iterable[t
             query_items.append((input_node.get("name") or "", input_node.get("value") or ""))
         parts = urlsplit(urljoin(page_url, action))
         href = _with_query_items(parts, [*parse_qsl(parts.query, keep_blank_values=True), *query_items])
-        title = clean_text(" ".join(form.itertext())) or document_title_from_url(href)
+        title = _document_link_title(" ".join(form.itertext()), href)
+        if not title:
+            continue
         if _is_generic_site_document(href, title):
             continue
         yield href, title
@@ -2663,7 +2678,9 @@ def iter_document_links(document: html.HtmlElement, page_url: str) -> Iterable[t
         if not _is_document_href(href):
             continue
         absolute_url = urljoin(page_url, href)
-        title = document_title_from_url(absolute_url)
+        title = _document_link_title(None, absolute_url)
+        if not title:
+            continue
         if _is_generic_site_document(href, title):
             continue
         yield href, title
@@ -3304,8 +3321,12 @@ def _is_generic_site_document(href: str | None, title: str | None) -> bool:
     return any(token in text for token in generic_tokens)
 
 
-def _is_document_link_text(title: str, href: str | None) -> bool:
-    normalized_title = title.casefold().strip()
+def _document_link_title(value: str | None, url: str) -> str | None:
+    return clean_text(value) or clean_text(document_title_from_url(url))
+
+
+def _is_document_link_text(title: str | None, href: str | None) -> bool:
+    normalized_title = (title or "").casefold().strip()
     lowered_href = (href or "").casefold()
     if normalized_title not in {"documents", "view associated documents", "associated documents"}:
         return False

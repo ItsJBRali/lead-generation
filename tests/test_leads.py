@@ -28,6 +28,7 @@ from lead_generator.planning.leads import (
     LeadSearchConfig,
     _discover_planit_applications_serial,
     _download_pdf_documents_once,
+    _is_document_link_text,
     _fetch_json_with_retry,
     _associated_document_source_urls,
     application_in_geojson,
@@ -2207,6 +2208,29 @@ class LeadSearchTest(unittest.TestCase):
             "https://planning.bathnes.gov.uk/planningdocuments=26%2F1049%2FFUL",
             planit_document_source_urls(application),
         )
+
+    def test_iter_document_links_skips_missing_derived_title_and_keeps_valid_link(self) -> None:
+        page_url = "https://planning.example.gov.uk/application/ABC123"
+        markup = html.fromstring(
+            """
+            <html><body>
+              <a href="/documents/download?id=missing-title"></a>
+              <a href="/documents/download?id=proposed-plan">Proposed Site Plan</a>
+            </body></html>
+            """
+        )
+
+        with patch(
+            "lead_generator.planning.leads.document_title_from_url",
+            side_effect=[None, "Proposed Site Plan.pdf"],
+        ):
+            documents = list(iter_document_links(markup, page_url))
+
+        self.assertEqual(
+            documents,
+            [("/documents/download?id=proposed-plan", "Proposed Site Plan")],
+        )
+        self.assertFalse(_is_document_link_text(None, "/documents"))
 
     def test_associated_document_source_reads_wandsworth_link_once(self) -> None:
         page_url = "https://planning2.wandsworth.gov.uk/planningcase/CaseDetails.aspx?case=2026/2589"

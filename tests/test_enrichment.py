@@ -7,7 +7,10 @@ from unittest.mock import patch
 import pytest
 
 from lead_generator.planning import enrichment
-from lead_generator.planning.drawing_sources import classify_drawing_source
+from lead_generator.planning.drawing_sources import (
+    classify_drawing_source,
+    preclassify_drawing_source,
+)
 
 
 APPLICATION_FORM_TEXT = """
@@ -155,6 +158,43 @@ def test_enrichment_uses_only_proposed_or_existing_drawings() -> None:
         "APPLICATION_FORM.pdf": "narrative document title",
         "Design and Access Statement.pdf": "narrative document title",
     }
+
+
+def test_management_plan_never_enriches_even_with_drawing_markers() -> None:
+    filename = "SANG_LANDSCAPE_AND_ECOLOGICAL_MANAGEMENT_PLAN.pdf"
+    text = (
+        "PROPOSED EXISTING PLAN\nDRAWING NUMBER M-101\nSCALE 1:100\nREVISION P1\n"
+        "SLR Consulting Limited\n020 7123 4567\ncontact@slrconsulting.example\n"
+        "1 Consultant Way\nLondon\nSW1A 1AA"
+    )
+
+    assert preclassify_drawing_source(filename).eligible is False
+    assert preclassify_drawing_source(filename).needs_text is False
+    assert classify_drawing_source(filename, text).eligible is False
+    assert classify_drawing_source(
+        "Proposed Site Plan.pdf",
+        "\n".join(["PROPOSED SITE PLAN DRAWING NUMBER P-101 SCALE 1:100 REV P1"] * 31)
+        + "\nLandscape Management Plan",
+    ).eligible is False
+
+    with tempfile.TemporaryDirectory() as directory:
+        folder = Path(directory)
+        path = folder / filename
+        path.touch()
+        document = _fake_pdf(path, text, application_form=False)
+
+        with patch.object(enrichment, "extract_pdf_text", return_value=document):
+            result = enrichment.enrich_application_folder(folder)
+
+    assert result.to_csv_row() == {
+        "Architect / Company Name": "Failed",
+        "Phone Number": "Failed",
+        "Email Address": "Failed",
+        "Company Address": "Failed",
+    }
+    assert result.field_sources == {}
+    assert result.eligible_documents == []
+    assert result.rejected_documents == {filename: "narrative document title"}
 
 
 def test_application_form_alone_produces_failed_fields() -> None:

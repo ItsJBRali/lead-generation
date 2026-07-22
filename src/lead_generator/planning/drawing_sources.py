@@ -22,6 +22,7 @@ NARRATIVE_PHRASES = (
     "supporting statement", "report", "assessment", "survey", "letter",
     "notice", "certificate", "schedule", "specification", "consultation",
     "photograph", "photos", "method statement", "heritage statement",
+    "management plan",
 )
 DRAWING_EVIDENCE_RE = re.compile(
     r"(?i)\b(?:drawing\s*(?:no|number)|scale|revision|rev|drawn\s+by|checked\s+by)\b"
@@ -41,6 +42,10 @@ def _tokens(value: str) -> set[str]:
 def _has_narrative_marker(value: str) -> bool:
     normalized = _phrase_text(value)
     return any(phrase in normalized for phrase in NARRATIVE_PHRASES)
+
+
+def _is_management_plan(value: str) -> bool:
+    return "management plan" in _phrase_text(value)
 
 
 def preclassify_drawing_source(filename: str) -> DrawingSourceDecision:
@@ -63,7 +68,11 @@ def classify_drawing_source(filename: str, text: str) -> DrawingSourceDecision:
         (text[:CLASSIFICATION_TEXT_LIMIT], text[-CLASSIFICATION_TEXT_LIMIT:])
     )
     combined = f"{Path(filename).stem}\n{bounded_text}"
-    if _has_narrative_marker(Path(filename).stem) or _has_narrative_marker(title_text):
+    if (
+        _has_narrative_marker(Path(filename).stem)
+        or _has_narrative_marker(title_text)
+        or _is_management_plan(bounded_text)
+    ):
         return DrawingSourceDecision(False, False, "narrative document marker")
     filename_tokens = _tokens(Path(filename).stem)
     tokens = _tokens(combined)
