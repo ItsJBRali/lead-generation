@@ -29,6 +29,7 @@ from lead_generator.planning.leads import (
     _discover_planit_applications_serial,
     _download_pdf_documents_once,
     _is_document_link_text,
+    _looks_like_listing_url,
     _fetch_json_with_retry,
     _associated_document_source_urls,
     application_in_geojson,
@@ -2249,6 +2250,149 @@ class LeadSearchTest(unittest.TestCase):
             _associated_document_source_urls(markup, page_url),
             ["https://planning2.wandsworth.gov.uk/planningcase/comments.aspx?case=2026/2589"],
         )
+
+    def test_associated_document_source_skips_empty_label_and_keeps_later_link(self) -> None:
+        page_url = "https://planning.example.test/application/ABC123"
+        markup = """
+            <html><body>
+              <a href="/documents/empty"></a>
+              <a href="/documents/related">View Related Documents</a>
+            </body></html>
+        """
+
+        self.assertEqual(
+            _associated_document_source_urls(markup, page_url),
+            ["https://planning.example.test/documents/related"],
+        )
+
+    def test_tascomi_search_url_is_treated_as_listing_page(self) -> None:
+        self.assertTrue(
+            _looks_like_listing_url(
+                "https://planning.example.test/planning/index.html?fa=search"
+            )
+        )
+
+    def test_tascomi_browser_documents_reconcile_same_source_http_failure(self) -> None:
+        application = PlanningApplication(
+            authority="Waltham Forest",
+            uid="261479",
+            url="https://planning.example.test/planning/application details?id=261479",
+            raw={"portal_family": "tascomi"},
+        )
+        normalized_source = "https://planning.example.test/planning/application%20details?id=261479"
+        unrelated_source = "https://documents.example.test/secondary"
+        document = PlanningDocument(
+            title="Proposed elevations.pdf",
+            url="https://planning.example.test/documents/proposed-elevations.pdf",
+        )
+
+        with (
+            patch(
+                "lead_generator.planning.leads.application_document_source_urls",
+                return_value=[normalized_source, unrelated_source],
+            ),
+            patch(
+                "lead_generator.planning.leads.fetch_planit_documents",
+                side_effect=[
+                    HTTPError(normalized_source, 503, "Unavailable", {}, None),
+                    HTTPError(unrelated_source, 503, "Unavailable", {}, None),
+                ],
+            ),
+            patch(
+                "lead_generator.planning.leads.fetch_browser_document_list",
+                return_value=[document],
+            ),
+        ):
+            result = discover_application_documents(application)
+
+        self.assertEqual(result.documents, [document])
+        self.assertEqual(
+            [failure.source_url for failure in result.failed_sources],
+            [unrelated_source],
+        )
+        self.assertIn(application.url, result.successful_sources)
+
+    def test_tascomi_confirmed_empty_browser_reconciles_same_source_http_failure(self) -> None:
+        application = PlanningApplication(
+            authority="Rother",
+            uid="RR/2026/0814/FULL",
+            url="https://planning.example.test/planning/index.html?fa=getApplication&id=123",
+            raw={"portal_family": "tascomi"},
+        )
+
+        with (
+            patch(
+                "lead_generator.planning.leads.application_document_source_urls",
+                return_value=[application.url],
+            ),
+            patch(
+                "lead_generator.planning.leads.fetch_planit_documents",
+                side_effect=HTTPError(application.url, 503, "Unavailable", {}, None),
+            ),
+            patch(
+                "lead_generator.planning.leads.fetch_browser_document_list",
+                return_value=[],
+            ),
+        ):
+            result = discover_application_documents(application)
+
+        self.assertEqual(result.documents, [])
+        self.assertEqual(result.failed_sources, [])
+        self.assertIn(application.url, result.successful_sources)
+
+    def test_tascomi_browser_failure_retains_same_source_failure(self) -> None:
+        application = PlanningApplication(
+            authority="Rother",
+            uid="RR/2026/0802/LBC",
+            url="https://planning.example.test/planning/index.html?fa=getApplication&id=456",
+            raw={"portal_family": "tascomi"},
+        )
+
+        with (
+            patch(
+                "lead_generator.planning.leads.application_document_source_urls",
+                return_value=[application.url],
+            ),
+            patch(
+                "lead_generator.planning.leads.fetch_planit_documents",
+                side_effect=HTTPError(application.url, 503, "Unavailable", {}, None),
+            ),
+            patch(
+                "lead_generator.planning.leads.fetch_browser_document_list",
+                side_effect=HTTPError(application.url, 503, "Unavailable", {}, None),
+            ),
+        ):
+            result = discover_application_documents(application)
+
+        self.assertGreaterEqual(len(result.failed_sources), 1)
+        self.assertTrue(
+            all(failure.source_url == application.url for failure in result.failed_sources)
+        )
+        self.assertEqual(result.successful_sources, [])
+
+    def test_tascomi_browser_failure_is_retained_after_successful_http_empty(self) -> None:
+        application = PlanningApplication(
+            authority="Rother",
+            uid="RR/2026/0802/LBC",
+            url="https://planning.example.test/planning/index.html?fa=getApplication&id=456",
+            raw={"portal_family": "tascomi"},
+        )
+
+        with (
+            patch(
+                "lead_generator.planning.leads.application_document_source_urls",
+                return_value=[application.url],
+            ),
+            patch("lead_generator.planning.leads.fetch_planit_documents", return_value=[]),
+            patch(
+                "lead_generator.planning.leads.fetch_browser_document_list",
+                side_effect=HTTPError(application.url, 503, "Unavailable", {}, None),
+            ),
+        ):
+            result = discover_application_documents(application)
+
+        self.assertEqual(len(result.failed_sources), 1)
+        self.assertEqual(result.failed_sources[0].source_url, application.url)
 
     def test_enrich_application_documents_merges_documents_from_every_source(self) -> None:
         application = PlanningApplication(

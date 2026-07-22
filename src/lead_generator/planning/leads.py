@@ -1785,11 +1785,20 @@ def discover_application_documents(application: PlanningApplication) -> Document
         document for document in result.documents if _looks_like_downloadable_document(document)
     ]
     if not usable_documents and (application.raw or {}).get("portal_family") == "tascomi":
+        browser_source = normalize_url(application.url)
+        successful_source_count = len(result.successful_sources)
         browser_documents = _record_document_source(
             result,
             application.url,
             lambda: fetch_browser_document_list(application.url),
         )
+        browser_succeeded = len(result.successful_sources) > successful_source_count
+        if browser_succeeded:
+            result.failed_sources = [
+                failure
+                for failure in result.failed_sources
+                if normalize_url(failure.source_url) != browser_source
+            ]
         merge(browser_documents)
 
     return result
@@ -1887,6 +1896,12 @@ def _looks_like_listing_url(url: str) -> bool:
     path = parts.path.casefold().rstrip("/")
     if "applicationdetails.do" in path:
         return False
+    query_items = {
+        name.casefold(): value.casefold()
+        for name, value in parse_qsl(parts.query, keep_blank_values=True)
+    }
+    if path.endswith("/index.html") and query_items.get("fa") == "search":
+        return True
     if any(
         marker in lowered
         for marker in (
@@ -1999,7 +2014,7 @@ def _associated_document_source_urls(html_text: str, page_url: str) -> list[str]
     document = html.fromstring(html_text)
     urls: list[str] = []
     for anchor in document.xpath("//a[@href]"):
-        label = clean_text(" ".join(anchor.xpath(".//text()"))).casefold()
+        label = (clean_text(" ".join(anchor.xpath(".//text()"))) or "").casefold()
         if not any(
             marker in label
             for marker in (

@@ -31,6 +31,7 @@ from lead_generator.planning.leads import (
     write_csv,
 )
 from lead_generator.planning.models import PlanningApplication, PlanningDocument
+from lead_generator.planning.portals import detect_portal_family
 
 
 RECOVERY_AUDIT_FIELDS = [
@@ -60,6 +61,13 @@ _AUDIT_SOURCE_FIELDS = {
     "Phone Sources": "Phone Number",
     "Email Sources": "Email Address",
     "Address Sources": "Company Address",
+}
+
+_PRESERVED_RECOVERY_PORTAL_FAMILIES = {"bath_planning_api"}
+_RECOVERY_SCRAPER_NAMES = {
+    "agile": "Agile",
+    "idox": "Idox",
+    "tascomi": "Tascomi",
 }
 
 
@@ -149,9 +157,22 @@ def _application_from_row(
         ),
         "",
     )
+    detected_family = detect_portal_family("", application_link)
+    portal_family = target.portal_family
+    scraper_type = target.scraper_type
+    if (
+        detected_family in _RECOVERY_SCRAPER_NAMES
+        and portal_family.casefold() not in _PRESERVED_RECOVERY_PORTAL_FAMILIES
+    ):
+        portal_family = detected_family
+        scraper_type = _RECOVERY_SCRAPER_NAMES[detected_family]
+    if not uid and portal_family.casefold() == "agile":
+        path_parts = [part for part in urlsplit(application_link).path.split("/") if part]
+        if len(path_parts) >= 2 and path_parts[-2].casefold() == "application-details":
+            uid = path_parts[-1]
     raw = {
-        "portal_family": target.portal_family,
-        "scraper_type": target.scraper_type,
+        "portal_family": portal_family,
+        "scraper_type": scraper_type,
         "portal_url": application_link,
         "source_url": target.listing_url or target.base_url,
     }

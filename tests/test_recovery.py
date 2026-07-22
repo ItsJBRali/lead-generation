@@ -133,6 +133,111 @@ def test_application_from_row_uses_catalogue_and_reference_fallback() -> None:
         ).uid == "TI9E6KES0YN00"
 
 
+def test_application_from_row_uses_modern_agile_path_uid() -> None:
+    target = CouncilTarget(
+        authority="Richmond",
+        portal_family="agile",
+        scraper_type="Agile",
+        base_url="https://planning.agileapplications.co.uk/richmond/",
+        listing_url="https://planning.agileapplications.co.uk/richmond/search-applications",
+        geometry={},
+    )
+    row = {
+        **_row("PA26/2493"),
+        "council": "Richmond",
+        "application link": (
+            "https://planning.agileapplications.co.uk/richmond/"
+            "application-details/240740"
+        ),
+    }
+
+    application = _application_from_row(row, {"richmond": target})
+
+    assert application.reference == "PA26/2493"
+    assert application.uid == "240740"
+
+
+def test_application_from_row_prefers_query_uid_over_modern_agile_path_uid() -> None:
+    target = CouncilTarget(
+        authority="Richmond",
+        portal_family="agile",
+        scraper_type="Agile",
+        base_url="https://planning.agileapplications.co.uk/richmond/",
+        listing_url="https://planning.agileapplications.co.uk/richmond/search-applications",
+        geometry={},
+    )
+    row = {
+        **_row("PA26/2493"),
+        "council": "Richmond",
+        "application link": (
+            "https://planning.agileapplications.co.uk/richmond/"
+            "application-details/240740?applicationId=999999"
+        ),
+    }
+
+    application = _application_from_row(row, {"richmond": target})
+
+    assert application.uid == "999999"
+
+
+@pytest.mark.parametrize(
+    ("catalogue_family", "catalogue_scraper", "application_link", "expected_family", "expected_scraper"),
+    [
+        (
+            "tascomi",
+            "Tascomi",
+            "https://planning.gloucestershire.gov.uk/online-applications/"
+            "applicationDetails.do?keyVal=ABC123",
+            "idox",
+            "Idox",
+        ),
+        (
+            "idox",
+            "Idox",
+            "https://planning.agileapplications.co.uk/richmond/application-details/240740",
+            "agile",
+            "Agile",
+        ),
+        (
+            "idox",
+            "Idox",
+            "https://planning.example.test/planning/index.html?fa=getApplication&id=123",
+            "tascomi",
+            "Tascomi",
+        ),
+        (
+            "bath_planning_api",
+            "BathPlanningApi",
+            "https://planning.bathnes.gov.uk/online-applications/"
+            "applicationDetails.do?keyVal=ABC123",
+            "bath_planning_api",
+            "BathPlanningApi",
+        ),
+    ],
+)
+def test_application_from_row_reconciles_stale_catalogue_portal_family(
+    catalogue_family: str,
+    catalogue_scraper: str,
+    application_link: str,
+    expected_family: str,
+    expected_scraper: str,
+) -> None:
+    target = CouncilTarget(
+        authority="Example Council",
+        portal_family=catalogue_family,
+        scraper_type=catalogue_scraper,
+        base_url="https://catalogue.example.test",
+        listing_url="https://catalogue.example.test/search",
+        geometry={},
+    )
+    row = {**_row(), "application link": application_link}
+
+    application = _application_from_row(row, {"example council": target})
+
+    assert application.raw["portal_family"] == expected_family
+    assert application.raw["scraper_type"] == expected_scraper
+
+
 def test_recovery_preserves_original_and_writes_corrected_audit_files(tmp_path: Path) -> None:
     original_csv = tmp_path / "applications.csv"
     row = _row()
