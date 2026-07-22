@@ -431,6 +431,56 @@ def test_recovery_does_not_redownload_an_existing_file(tmp_path: Path) -> None:
     assert [document.title for document in captured] == ["Proposed Floor Plans.pdf"]
 
 
+def test_recovery_generic_existing_file_clears_only_matching_identity(tmp_path: Path) -> None:
+    row = _row()
+    initialise_csv(tmp_path / "applications.csv", APPLICATION_CSV_FIELDS)
+    append_csv_row(tmp_path / "applications.csv", APPLICATION_CSV_FIELDS, row)
+    catalogue = json.loads(_catalogue_json("Example Council"))
+    source_url = "https://planning.example.test/documents/REF-1"
+    site_plan = PlanningDocument(
+        "Plan",
+        "https://docs.test/download?fileName=SitePlan.pdf",
+        source_url=source_url,
+    )
+    floor_plan = PlanningDocument(
+        "Plan",
+        "https://docs.test/download?fileName=FloorPlan.pdf",
+        source_url=source_url,
+    )
+    discovery = DocumentDiscoveryResult(
+        documents=[site_plan, floor_plan],
+        successful_sources=[source_url],
+    )
+    attempts: list[list[PlanningDocument]] = []
+
+    def fake_download(documents, destination, **kwargs):
+        attempted = list(documents)
+        attempts.append(attempted)
+        if len(attempts) == 1:
+            (destination / "SitePlan.pdf").write_bytes(b"%PDF-existing")
+        return DocumentDownloadBatchResult(
+            failures=[
+                SimpleNamespace(document=document, reason="HTTP 404")
+                for document in attempted
+            ]
+        )
+
+    with (
+        patch("lead_generator.planning.recovery.load_authority_catalogue", return_value=catalogue),
+        patch("lead_generator.planning.recovery.discover_application_documents", return_value=discovery),
+        patch("lead_generator.planning.recovery._download_pdf_documents_once", side_effect=fake_download),
+        patch("lead_generator.planning.recovery._wait_for_document_retry_cooldown", side_effect=[True, False]),
+        patch("lead_generator.planning.recovery.enrich_application_folder", return_value=ContactEnrichment()),
+    ):
+        summary = recover_search_output(tmp_path)
+
+    with summary.audit_csv_path.open(encoding="utf-8") as handle:
+        status = next(csv.DictReader(handle))["Document Discovery Status"]
+    assert attempts == [[site_plan, floor_plan], [floor_plan]]
+    assert "fileName=FloorPlan.pdf" in status
+    assert "fileName=SitePlan.pdf" not in status
+
+
 def test_recovery_retries_partial_discovery_after_other_rows(tmp_path: Path) -> None:
     rows = [_row(reference) for reference in ("REF-1", "REF-2")]
     initialise_csv(tmp_path / "applications.csv", APPLICATION_CSV_FIELDS)

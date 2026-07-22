@@ -2462,18 +2462,44 @@ def _download_document_file(
     pending = deque(direct_candidates)
     source_discovery_attempted = False
     seen: set[str] = set()
+
+    def replace_opener_for_tls(exc: Exception) -> bool:
+        nonlocal opener, verify_tls, tls_compat
+        if not tls_compat and _is_tls_compatibility_error(exc):
+            tls_compat = True
+        elif verify_tls and _is_tls_certificate_error(exc):
+            verify_tls = False
+        else:
+            return False
+        opener = _build_document_opener(
+            verify_tls=verify_tls,
+            tls_compat=tls_compat,
+        )
+        if source_cache is not None and document.source_url:
+            source_cache.pop(document.source_url, None)
+        return True
+
     while pending or (document.source_url and not source_discovery_attempted):
         if not pending:
             source_discovery_attempted = True
-            pending.extend(
-                source_document_candidates(
-                    document,
-                    opener,
-                    cache=source_cache,
+            try:
+                pending.extend(
+                    source_document_candidates(
+                        document,
+                        opener,
+                        cache=source_cache,
+                    )
                 )
-            )
+            except Exception as exc:
+                last_error = exc
+                if replace_opener_for_tls(exc):
+                    source_discovery_attempted = False
+                    continue
+                raise
             seen.difference_update(direct_candidates)
             pending.extend(direct_candidates)
+            if not pending:
+                break
         url = pending.popleft()
         if url in seen:
             continue
@@ -2524,17 +2550,13 @@ def _download_document_file(
                 _skip_next_throttle(url)
             except Exception as exc:
                 last_error = exc
-                if not tls_compat and _is_tls_compatibility_error(exc):
-                    tls_compat = True
-                    opener = _build_document_opener(tls_compat=True)
-                    seen.discard(url)
-                    pending.appendleft(url)
-                    break
-                if verify_tls and _is_tls_certificate_error(exc):
-                    verify_tls = False
-                    opener = _build_document_opener(verify_tls=False)
-                    seen.discard(url)
-                    pending.appendleft(url)
+                if replace_opener_for_tls(exc):
+                    if document.source_url and _is_session_bound_document_url(url):
+                        pending.clear()
+                        source_discovery_attempted = False
+                    else:
+                        seen.discard(url)
+                        pending.appendleft(url)
                     break
                 break
     raise last_error or RuntimeError(f"Could not download {document.url}")
@@ -2598,14 +2620,9 @@ def source_document_candidates(
         try:
             text, page_url = _fetch_html_with_portal_session(source_url, opener, timeout=30)
         except Exception as exc:
-            if not _is_tls_certificate_error(exc):
-                return []
-            try:
-                fallback_opener = _build_document_opener(verify_tls=False)
-                text, page_url = _fetch_html_with_portal_session(source_url, fallback_opener, timeout=30)
-                opener = fallback_opener
-            except Exception:
-                return []
+            if _is_tls_certificate_error(exc) or _is_tls_compatibility_error(exc):
+                raise
+            return []
         candidates = []
         try:
             page = html.fromstring(text)
@@ -3301,7 +3318,12 @@ def document_title_from_url(url: str) -> str:
 
 def document_filename(document: PlanningDocument, downloaded_file: DownloadedFile, *, fallback: str) -> str:
     extension = _downloaded_extension(downloaded_file)
-    for value in (downloaded_file.filename, document.title, document_title_from_url(downloaded_file.final_url), fallback):
+    for value in (
+        downloaded_file.filename,
+        _document_identity_title(document),
+        document_title_from_url(downloaded_file.final_url),
+        fallback,
+    ):
         if not value:
             continue
         filename = sanitize_path_part(Path(value.replace("\\", "/")).name)
@@ -3935,11 +3957,14 @@ def _is_generic_document_title(value: str | None) -> bool:
 
 
 def _document_identity(document: PlanningDocument) -> str:
-    title = _comparable_title(document.title)
-    url_title = _comparable_title(document_title_from_url(document.url))
+    return _comparable_title(_document_identity_title(document))
+
+
+def _document_identity_title(document: PlanningDocument) -> str:
+    url_title = document_title_from_url(document.url)
     if _is_generic_document_title(document.title) and url_title:
         return url_title
-    return title or url_title
+    return document.title or url_title
 
 
 def _filename_from_headers(headers: Message) -> str | None:

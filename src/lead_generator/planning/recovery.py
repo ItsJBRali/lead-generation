@@ -21,6 +21,7 @@ from lead_generator.planning.leads import (
     DocumentDiscoveryResult,
     DocumentSourceFailure,
     _document_identity,
+    _document_identity_title,
     _download_pdf_documents_once,
     _looks_like_downloadable_document,
     _wait_for_document_retry_cooldown,
@@ -383,7 +384,7 @@ def _logical_document_key(
 
 def _existing_file_matches_document(path: Path, document: PlanningDocument) -> bool:
     existing_name = sanitize_path_part(path.name).casefold()
-    expected_name = sanitize_path_part(document.title).casefold()
+    expected_name = sanitize_path_part(_document_identity_title(document)).casefold()
     if existing_name == expected_name:
         return True
     if Path(expected_name).suffix:

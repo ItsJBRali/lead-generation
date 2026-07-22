@@ -3007,6 +3007,123 @@ class LeadSearchTest(unittest.TestCase):
             ],
         )
 
+    def test_session_bound_tls_fallback_rediscovers_with_replacement_opener(self) -> None:
+        source_url = "https://planning.example.gov.uk/application/ABC123"
+        session_urls = (
+            (
+                "https://planning.example.gov.uk/publisher/docs/OLD/Document.pdf",
+                "https://planning.example.gov.uk/publisher/docs/VERIFIED/Document.pdf",
+                "https://planning.example.gov.uk/publisher/docs/UNVERIFIED/Document.pdf",
+            ),
+            (
+                "https://planning.example.gov.uk/Document/Download?fileName=SitePlan.pdf&token=old",
+                "https://planning.example.gov.uk/Document/Download?fileName=SitePlan.pdf&token=verified",
+                "https://planning.example.gov.uk/Document/Download?fileName=SitePlan.pdf&token=unverified",
+            ),
+        )
+
+        class FakeResponse:
+            headers = {"Content-Type": "application/pdf"}
+
+            def __init__(self, url: str) -> None:
+                self._url = url
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return b"%PDF-1.4"
+
+            def geturl(self) -> str:
+                return self._url
+
+        for original_url, verified_url, unverified_url in session_urls:
+            with self.subTest(original_url=original_url):
+                opened: list[tuple[str, str]] = []
+                discoveries: list[str] = []
+
+                class VerifiedOpener:
+                    def open(self, request, timeout):
+                        opened.append(("verified", request.full_url))
+                        raise URLError(
+                            ssl.SSLCertVerificationError(
+                                "Missing Authority Key Identifier"
+                            )
+                        )
+
+                class UnverifiedOpener:
+                    def open(self, request, timeout):
+                        opened.append(("unverified", request.full_url))
+                        if request.full_url == unverified_url:
+                            return FakeResponse(unverified_url)
+                        raise HTTPError(request.full_url, 404, "Expired session", {}, None)
+
+                verified_opener = VerifiedOpener()
+                unverified_opener = UnverifiedOpener()
+
+                def fake_source_candidates(document, opener, *, cache=None):
+                    if opener is verified_opener:
+                        discoveries.append("verified")
+                        return [verified_url]
+                    if opener is unverified_opener:
+                        discoveries.append("unverified")
+                        return [unverified_url]
+                    raise AssertionError("unexpected opener")
+
+                document = PlanningDocument(
+                    title="Plan",
+                    url=original_url,
+                    source_url=source_url,
+                )
+                with (
+                    patch(
+                        "lead_generator.planning.leads.source_document_candidates",
+                        side_effect=fake_source_candidates,
+                    ),
+                    patch(
+                        "lead_generator.planning.leads._build_document_opener",
+                        return_value=unverified_opener,
+                    ),
+                ):
+                    downloaded = download_document_file(document, opener=verified_opener)
+
+                self.assertEqual(downloaded.final_url, unverified_url)
+                self.assertEqual(discoveries, ["verified", "unverified"])
+                self.assertNotIn(("unverified", verified_url), opened)
+
+    def test_generic_plan_documents_use_distinct_url_filenames(self) -> None:
+        documents = [
+            PlanningDocument(
+                title="Plan",
+                url=f"https://planning.example.gov.uk/Document/Download?fileName={filename}",
+            )
+            for filename in ("SitePlan.pdf", "FloorPlan.pdf")
+        ]
+
+        def fake_download(document, **kwargs):
+            return DownloadedFile(
+                payload=f"%PDF-{document.url}".encode(),
+                final_url=document.url,
+                content_type="application/pdf",
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory)
+            with patch(
+                "lead_generator.planning.leads.download_document_file",
+                side_effect=fake_download,
+            ):
+                result = _download_pdf_documents_once(documents, destination)
+
+            self.assertEqual(result.downloaded_count, 2)
+            self.assertEqual(
+                sorted(path.name for path in destination.iterdir()),
+                ["FloorPlan.pdf", "SitePlan.pdf"],
+            )
+
     def test_generic_plan_fallback_matches_filename_identity(self) -> None:
         source_url = "https://planning.example.gov.uk/application/ABC123"
         document = PlanningDocument(
