@@ -62,6 +62,7 @@ from lead_generator.planning.leads import (
     run_lead_search,
     sanitize_path_part,
     select_overlapping_authorities,
+    source_document_candidates,
 )
 from lead_generator.planning.models import PlanningApplication, PlanningDocument
 from lead_generator.planning.http import CouncilHttpClient
@@ -3174,6 +3175,55 @@ class LeadSearchTest(unittest.TestCase):
             downloaded.final_url,
             "https://planning.example.gov.uk/current?fileName=SitePlan.pdf",
         )
+
+    def test_non_generic_fallback_rejects_empty_candidate_identities(self) -> None:
+        source_url = "https://planning.example.gov.uk/Planning/Display/2024/00577/4/CD"
+        cases = (
+            (
+                "Forms",
+                "ApplicationFormRedacted.pdf",
+                "Additional Details",
+                "Material%20Schedule%20July%202026.pdf",
+            ),
+            (
+                "Additional Details",
+                "Material%20Schedule%20July%202026.pdf",
+                "Forms",
+                "ApplicationFormRedacted.pdf",
+            ),
+        )
+
+        for wanted_title, wanted_filename, other_title, other_filename in cases:
+            with self.subTest(wanted_title=wanted_title):
+                markup = f"""
+                    <html><body><table>
+                      <tr>
+                        <td><a href="/Document/Download?fileName={other_filename}">-</a></td>
+                        <td><a href="/Document/Download?fileName={other_filename}">{other_title}</a></td>
+                      </tr>
+                      <tr>
+                        <td><a href="/Document/Download?fileName={wanted_filename}">-</a></td>
+                        <td><a href="/Document/Download?fileName={wanted_filename}">{wanted_title}</a></td>
+                      </tr>
+                    </table></body></html>
+                """
+                wanted_url = (
+                    "https://planning.example.gov.uk/Document/Download?fileName="
+                    f"{wanted_filename}"
+                )
+                document = PlanningDocument(
+                    title=wanted_title,
+                    url=wanted_url,
+                    source_url=source_url,
+                )
+
+                with patch(
+                    "lead_generator.planning.leads._fetch_html_with_portal_session",
+                    return_value=(markup, source_url),
+                ):
+                    candidates = source_document_candidates(document, object())
+
+                self.assertEqual(candidates, [wanted_url])
 
     def test_document_download_retries_viewer_url_as_download_url(self) -> None:
         class FakeResponse:

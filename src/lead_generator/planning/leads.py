@@ -2667,6 +2667,7 @@ def source_document_candidates(
         or _document_identity(candidate) == wanted
         or (
             not generic_title
+            and _document_identity(candidate)
             and (
                 wanted in _document_identity(candidate)
                 or _document_identity(candidate) in wanted
