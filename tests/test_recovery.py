@@ -15,13 +15,16 @@ from lead_generator.planning.leads import (
     DocumentDownloadBatchResult,
     DocumentDiscoveryResult,
     DocumentSourceFailure,
+    application_document_source_urls,
     append_csv_row,
     append_csv_rows,
     initialise_csv,
+    load_authority_catalogue,
 )
 from lead_generator.planning.models import PlanningApplication, PlanningDocument
 from lead_generator.planning.recovery import (
     _application_from_row,
+    _catalogue_index,
     _recovery_item,
     recover_search_output,
 )
@@ -65,6 +68,10 @@ def _row(reference: str = "REF-1") -> dict[str, str]:
         }
     )
     return row
+
+
+def _loaded_target(authority: str) -> CouncilTarget:
+    return _catalogue_index(load_authority_catalogue())[authority.casefold()]
 
 
 def test_application_from_row_uses_catalogue_and_reference_fallback() -> None:
@@ -180,52 +187,137 @@ def test_application_from_row_prefers_query_uid_over_modern_agile_path_uid() -> 
     assert application.uid == "999999"
 
 
+def test_application_from_row_rejects_nonnumeric_modern_agile_path_uid() -> None:
+    target = CouncilTarget(
+        authority="Richmond",
+        portal_family="agile",
+        scraper_type="Agile",
+        base_url="https://planning.agileapplications.co.uk/richmond/",
+        listing_url="https://planning.agileapplications.co.uk/richmond/search-applications",
+        geometry={},
+    )
+    row = {
+        **_row("PA26/2493"),
+        "council": "Richmond",
+        "application link": (
+            "https://planning.agileapplications.co.uk/richmond/"
+            "application-details/documents"
+        ),
+    }
+
+    application = _application_from_row(row, {"richmond": target})
+
+    assert application.uid == "PA26/2493"
+
+
+def test_application_from_row_uses_bath_effective_family_from_loaded_catalogue() -> None:
+    target = _loaded_target("Bath")
+    reference = "26/02639/CLPU"
+    application_link = (
+        "https://app.bathnes.gov.uk/webforms/planning/details.html?"
+        "refval=26%2F02639%2FCLPU"
+    )
+    row = {
+        **_row(reference),
+        "council": "Bath",
+        "application link": application_link,
+    }
+
+    assert target.portal_family == "custom"
+
+    application = _application_from_row(row, {"bath": target})
+
+    assert application.raw["portal_family"] == "bath_planning_api"
+    assert application.raw["scraper_type"] == "BathPlanningApi"
+    assert (
+        "https://app.bathnes.gov.uk/planningdocuments=26%2F02639%2FCLPU"
+        in application_document_source_urls(application)
+    )
+
+
+def test_application_from_row_preserves_loaded_bracknell_arcus_family() -> None:
+    target = _loaded_target("Bracknell")
+    application_link = (
+        "https://publicaccess.bracknell-forest.gov.uk/s/detail/"
+        "a0iExamplePlanningApplication"
+    )
+    row = {
+        **_row("PA/2026/0714"),
+        "council": "Bracknell",
+        "application link": application_link,
+    }
+
+    application = _application_from_row(row, {"bracknell": target})
+
+    assert application.raw["portal_family"] == "arcus"
+    assert application.raw["scraper_type"] == "Arcus"
+
+
+def test_application_from_row_preserves_loaded_staffordshire_moorlands_family() -> None:
+    target = _loaded_target("Staffordshire Moorlands")
+    application_link = (
+        "http://publicaccess.staffsmoorlands.gov.uk/portal/servlets/"
+        "ApplicationSearchServlet?PKID=169307"
+    )
+    row = {
+        **_row("SMD/2026/0123"),
+        "council": "Staffordshire Moorlands",
+        "application link": application_link,
+    }
+
+    application = _application_from_row(
+        row,
+        {"staffordshire moorlands": target},
+    )
+
+    assert application.raw["portal_family"] == "appsearchserv"
+    assert application.raw["scraper_type"] == "AppSearchServ"
+
+
+def test_application_from_row_corrects_live_gloucestershire_idox_mismatch() -> None:
+    target = _loaded_target("Gloucestershire")
+    application_link = (
+        "https://planning.gloucestershire.gov.uk/online-applications/"
+        "applicationDetails.do?activeTab=summary&keyVal=ABC123"
+    )
+    row = {
+        **_row("26/00629/TRECON"),
+        "council": "Gloucestershire",
+        "application link": application_link,
+    }
+
+    assert target.portal_family == "tascomi"
+
+    application = _application_from_row(row, {"gloucestershire": target})
+
+    assert application.raw["portal_family"] == "idox"
+    assert application.raw["scraper_type"] == "Idox"
+
+
 @pytest.mark.parametrize(
-    ("catalogue_family", "catalogue_scraper", "application_link", "expected_family", "expected_scraper"),
+    ("application_link", "expected_family", "expected_scraper"),
     [
         (
-            "tascomi",
-            "Tascomi",
-            "https://planning.gloucestershire.gov.uk/online-applications/"
-            "applicationDetails.do?keyVal=ABC123",
-            "idox",
-            "Idox",
-        ),
-        (
-            "idox",
-            "Idox",
             "https://planning.agileapplications.co.uk/richmond/application-details/240740",
             "agile",
             "Agile",
         ),
         (
-            "idox",
-            "Idox",
-            "https://planning.example.test/planning/index.html?fa=getApplication&id=123",
+            "https://planning.example.test/planning/application.html?fa=getApplication&id=123",
             "tascomi",
             "Tascomi",
         ),
-        (
-            "bath_planning_api",
-            "BathPlanningApi",
-            "https://planning.bathnes.gov.uk/online-applications/"
-            "applicationDetails.do?keyVal=ABC123",
-            "bath_planning_api",
-            "BathPlanningApi",
-        ),
     ],
 )
-def test_application_from_row_reconciles_stale_catalogue_portal_family(
-    catalogue_family: str,
-    catalogue_scraper: str,
+def test_application_from_row_reconciles_unambiguous_application_route(
     application_link: str,
     expected_family: str,
     expected_scraper: str,
 ) -> None:
     target = CouncilTarget(
         authority="Example Council",
-        portal_family=catalogue_family,
-        scraper_type=catalogue_scraper,
+        portal_family="idox",
+        scraper_type="Idox",
         base_url="https://catalogue.example.test",
         listing_url="https://catalogue.example.test/search",
         geometry={},

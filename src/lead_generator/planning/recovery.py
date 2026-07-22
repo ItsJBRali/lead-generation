@@ -31,7 +31,6 @@ from lead_generator.planning.leads import (
     write_csv,
 )
 from lead_generator.planning.models import PlanningApplication, PlanningDocument
-from lead_generator.planning.portals import detect_portal_family
 
 
 RECOVERY_AUDIT_FIELDS = [
@@ -63,9 +62,9 @@ _AUDIT_SOURCE_FIELDS = {
     "Address Sources": "Company Address",
 }
 
-_PRESERVED_RECOVERY_PORTAL_FAMILIES = {"bath_planning_api"}
 _RECOVERY_SCRAPER_NAMES = {
     "agile": "Agile",
+    "bath_planning_api": "BathPlanningApi",
     "idox": "Idox",
     "tascomi": "Tascomi",
 }
@@ -157,18 +156,20 @@ def _application_from_row(
         ),
         "",
     )
-    detected_family = detect_portal_family("", application_link)
-    portal_family = target.portal_family
-    scraper_type = target.scraper_type
-    if (
-        detected_family in _RECOVERY_SCRAPER_NAMES
-        and portal_family.casefold() not in _PRESERVED_RECOVERY_PORTAL_FAMILIES
-    ):
-        portal_family = detected_family
-        scraper_type = _RECOVERY_SCRAPER_NAMES[detected_family]
+    route_family = _application_route_family(council, application_link)
+    portal_family = route_family or target.portal_family
+    scraper_type = (
+        _RECOVERY_SCRAPER_NAMES[route_family]
+        if route_family
+        else target.scraper_type
+    )
     if not uid and portal_family.casefold() == "agile":
         path_parts = [part for part in urlsplit(application_link).path.split("/") if part]
-        if len(path_parts) >= 2 and path_parts[-2].casefold() == "application-details":
+        if (
+            len(path_parts) >= 2
+            and path_parts[-2].casefold() == "application-details"
+            and path_parts[-1].isdigit()
+        ):
             uid = path_parts[-1]
     raw = {
         "portal_family": portal_family,
@@ -187,6 +188,39 @@ def _application_from_row(
         source_url=target.listing_url,
         raw=raw,
     )
+
+
+def _application_route_family(council: str, application_link: str) -> str | None:
+    parts = urlsplit(application_link)
+    host = (parts.hostname or "").casefold()
+    path = parts.path.casefold().rstrip("/")
+    query = {
+        key.casefold(): value.casefold()
+        for key, value in parse_qsl(parts.query, keep_blank_values=True)
+    }
+
+    if (
+        council.casefold() in {"bath", "bath and north east somerset"}
+        and host == "app.bathnes.gov.uk"
+        and path.endswith("/webforms/planning/details.html")
+    ):
+        return "bath_planning_api"
+    if (
+        path.endswith("/applicationdetails.do")
+        and "/online-applications/" in path
+    ):
+        return "idox"
+    path_parts = [part for part in path.split("/") if part]
+    if (
+        host == "planning.agileapplications.co.uk"
+        and len(path_parts) >= 2
+        and path_parts[-2] == "application-details"
+        and path_parts[-1].isdigit()
+    ):
+        return "agile"
+    if query.get("fa") == "getapplication":
+        return "tascomi"
+    return None
 
 
 def _recovery_item(
