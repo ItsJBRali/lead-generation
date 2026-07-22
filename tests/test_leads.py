@@ -16,6 +16,7 @@ from lxml import html
 
 from lead_generator.planning.adapters.generic import GenericLabelledPlanningScraper
 from lead_generator.planning.enrichment import ContactEnrichment
+from lead_generator.planning.drawing_sources import is_existing_only_drawing_metadata
 from lead_generator.planning.leads import (
     CouncilSearchDegradedError,
     CouncilTarget,
@@ -106,6 +107,11 @@ def write_search_fixture(root: Path, authorities: list[str]) -> tuple[Path, Path
 
 
 class LeadSearchTest(unittest.TestCase):
+    def test_existing_only_drawing_metadata(self) -> None:
+        assert is_existing_only_drawing_metadata("Existing elevations.pdf")
+        assert not is_existing_only_drawing_metadata("Existing survey report.pdf")
+        assert not is_existing_only_drawing_metadata("Existing planning statement.pdf")
+
     def test_parse_keywords_deduplicates_and_strips_quotes(self) -> None:
         self.assertEqual(
             parse_keywords(' "gates" \n"electric gates"\ngates\n'),

@@ -4,7 +4,10 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from lead_generator.planning import enrichment
+from lead_generator.planning.drawing_sources import classify_drawing_source
 
 
 APPLICATION_FORM_TEXT = """
@@ -183,3 +186,24 @@ def test_ocr_company_spelling_variants_are_deduplicated() -> None:
     accumulator.add_name("Bucks Plo.nt Co.re Ltd")
 
     assert accumulator.result.architect_company_names == ["Bucks Plant Care Ltd"]
+
+
+@pytest.mark.parametrize(
+    ("filename", "text", "eligible"),
+    [
+        ("Proposed Elevations.pdf", "", True),
+        ("Existing Site Plan.pdf", "", True),
+        ("Existing and Proposed Plans.pdf", "", True),
+        ("PROPOSED_CAR_PARK.pdf", "DRAWING NUMBER 2411039 SCALE 1:500 REV G", True),
+        ("PROPOSED_CAR_PARK.pdf", "Car park design summary", False),
+        ("2 Drawings.pdf", "PROPOSED GATE DRAWING NUMBER 102 SCALE 1:50", True),
+        ("2 Drawings.pdf", "Two drawings are enclosed", False),
+        ("Drawings.pdf", "Proposed design discussed below", False),
+        ("Existing Planning Statement.pdf", "DRAWING NUMBER 1 SCALE 1:100", False),
+        ("Design and Access Statement.pdf", "Proposed plans are described below", False),
+        ("Application Form.pdf", "Proposed elevation", False),
+        ("Site Location Plan.pdf", "LOCATION PLAN SCALE 1:1250", False),
+    ],
+)
+def test_drawing_source_boundary(filename: str, text: str, eligible: bool) -> None:
+    assert classify_drawing_source(filename, text).eligible is eligible
