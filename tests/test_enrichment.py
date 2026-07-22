@@ -232,6 +232,17 @@ def test_client_company_and_coordinates_are_rejected_from_drawing() -> None:
     assert row["Phone Number"] == "Failed"
 
 
+def test_design_label_starts_a_professional_block_after_client_context() -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+    enrichment.extract_professional_details(
+        "CLIENT\nCroudace Homes Ltd\nDESIGN\nPenchard Architects Ltd",
+        "Proposed Site Plan.pdf",
+        accumulator,
+    )
+
+    assert accumulator.result.architect_company_names == ["Penchard Architects Ltd"]
+
+
 def test_site_address_similarity_rejects_reformatted_site_address() -> None:
     exclusions = enrichment._Exclusions()
     exclusions.add_address("Umbrook Farm, Ashill, Cullompton EX15 3LZ")

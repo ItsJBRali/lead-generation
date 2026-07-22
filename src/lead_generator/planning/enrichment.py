@@ -96,6 +96,7 @@ AUTHOR_ROLE_MARKERS = (
     "drawn by",
     "designed by",
     "designer",
+    "design",
 )
 NAME_NOISE_MARKERS = (
     "copyright",
