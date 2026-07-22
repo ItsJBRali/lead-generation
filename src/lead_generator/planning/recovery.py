@@ -20,6 +20,7 @@ from lead_generator.planning.leads import (
     DocumentDownloadFailure,
     DocumentDiscoveryResult,
     DocumentSourceFailure,
+    _document_identity,
     _download_pdf_documents_once,
     _looks_like_downloadable_document,
     _wait_for_document_retry_cooldown,
@@ -27,6 +28,7 @@ from lead_generator.planning.leads import (
     discover_application_documents,
     initialise_csv,
     load_authority_catalogue,
+    normalize_url,
     sanitize_path_part,
     write_csv,
 )
@@ -311,7 +313,7 @@ def _recover_documents(
             continue
         if any(_existing_file_matches_document(path, document) for path in existing_paths):
             item.processed_document_urls.add(document.url)
-            item.download_failures.pop(document.url, None)
+            _clear_matching_download_failures(item, document)
             continue
         pending_by_url[document.url] = document
 
@@ -346,12 +348,37 @@ def _recover_documents(
         for document in attempted
         if document.url not in transient_urls and document.url not in failed_urls
     }
-    for url in successful_urls:
-        item.download_failures.pop(url, None)
+    for document in attempted:
+        if document.url in successful_urls:
+            _clear_matching_download_failures(item, document)
     item.processed_document_urls.update(
         successful_urls
     )
     item.pending_documents = list(batch.transient_documents)
+
+
+def _clear_matching_download_failures(
+    item: _RecoveryItem,
+    successful_document: PlanningDocument,
+) -> None:
+    successful_key = _logical_document_key(successful_document)
+    for url, failure in list(item.download_failures.items()):
+        if url == successful_document.url or (
+            successful_key is not None
+            and _logical_document_key(failure.document) == successful_key
+        ):
+            item.download_failures.pop(url, None)
+
+
+def _logical_document_key(
+    document: PlanningDocument,
+) -> tuple[str, str] | None:
+    if not document.source_url:
+        return None
+    identity = _document_identity(document)
+    if not identity:
+        return None
+    return normalize_url(document.source_url), identity
 
 
 def _existing_file_matches_document(path: Path, document: PlanningDocument) -> bool:
@@ -404,6 +431,20 @@ def recover_search_output(
         deferred_count=len(deferred_items),
     ):
         for item in deferred_items:
+            _recover_documents(item, final_attempt=True, log=log)
+
+    late_items = [
+        item
+        for item in deferred_items
+        if item.pending_documents or item.discovery_failures or item.download_failures
+    ]
+    if late_items and _wait_for_document_retry_cooldown(
+        DOCUMENT_DOWNLOAD_RETRY_DELAY_SECONDS,
+        None,
+        log=log,
+        deferred_count=len(late_items),
+    ):
+        for item in late_items:
             _recover_documents(item, final_attempt=True, log=log)
 
     for item in items:

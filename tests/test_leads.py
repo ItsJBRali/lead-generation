@@ -984,7 +984,7 @@ class LeadSearchTest(unittest.TestCase):
             ["search:Council A", "search:Council B", "download:REF-A", "download:REF-B"],
         )
 
-    def test_run_lead_search_retries_document_jobs_after_first_download_pass(self) -> None:
+    def test_run_lead_search_retries_temporary_404_at_final_queue_pass(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             user_geojson, catalogue = write_search_fixture(root, ["Example Council"])
@@ -1020,13 +1020,21 @@ class LeadSearchTest(unittest.TestCase):
                     )
                 ])
 
-            def fake_download(documents, destination, *, defer_transient=True, **kwargs):
-                document = list(documents)[0]
+            attempts: dict[str, int] = {}
+
+            def fake_download(document, **kwargs):
                 reference = Path(document.title).stem
-                events.append(f"{'first' if defer_transient else 'retry'}:{reference}")
-                if defer_transient and reference == "REF-1":
-                    return DocumentDownloadBatchResult(transient_documents=[document])
-                return DocumentDownloadBatchResult(downloaded_count=1)
+                attempts[reference] = attempts.get(reference, 0) + 1
+                events.append(
+                    f"{'first' if attempts[reference] == 1 else 'retry'}:{reference}"
+                )
+                if reference == "REF-1" and attempts[reference] == 1:
+                    raise HTTPError(document.url, 404, "Not Found", {}, None)
+                return DownloadedFile(
+                    payload=b"%PDF-1.4",
+                    final_url=document.url,
+                    content_type="application/pdf",
+                )
 
             with (
                 patch("lead_generator.planning.leads.discover_portal_applications", return_value=applications),
@@ -1034,7 +1042,7 @@ class LeadSearchTest(unittest.TestCase):
                     "lead_generator.planning.leads.discover_application_documents",
                     side_effect=fake_document_discovery,
                 ),
-                patch("lead_generator.planning.leads._download_pdf_documents_once", side_effect=fake_download),
+                patch("lead_generator.planning.leads.download_document_file", side_effect=fake_download),
                 patch("lead_generator.planning.leads._wait_for_document_retry_cooldown", return_value=True),
                 patch("lead_generator.planning.leads.MAX_CONCURRENT_DOCUMENT_BATCHES", 1),
                 patch("lead_generator.planning.leads.enrich_application_folder", return_value=ContactEnrichment()),
@@ -2265,6 +2273,73 @@ class LeadSearchTest(unittest.TestCase):
             ["https://planning.example.test/documents/related"],
         )
 
+    def test_document_links_exclude_breadcrumb_tab_navigation_and_footer_pdf(self) -> None:
+        page_url = (
+            "https://planning.example.gov.uk/online-applications/"
+            "applicationDetails.do?keyVal=ABC123"
+        )
+        markup = html.fromstring(
+            """
+            <html><body>
+              <div class="breadcrumb">
+                <a href="/related-documents/Related%20Documents">Related Documents</a>
+              </div>
+              <nav>
+                <a href="applicationDetails.do?activeTab=externalDocuments&amp;keyVal=ABC123">
+                  Plans &amp; Documents
+                </a>
+              </nav>
+              <main>
+                <a href="/files/proposed-elevations.pdf">Proposed elevations</a>
+              </main>
+              <footer>
+                <a href="https://www.westminster.gov.uk/pay-gap.pdf">Pay Gap PDF</a>
+              </footer>
+            </body></html>
+            """
+        )
+
+        self.assertEqual(
+            list(iter_document_links(markup, page_url)),
+            [("/files/proposed-elevations.pdf", "Proposed elevations")],
+        )
+
+    def test_associated_document_chain_is_bounded_and_does_not_loop(self) -> None:
+        root_url = "https://planning.example.gov.uk/summary/ABC123"
+        plans_url = (
+            "https://planning.example.gov.uk/online-applications/"
+            "applicationDetails.do?activeTab=externalDocuments&keyVal=ABC123"
+        )
+        associated_url = "https://planning.example.gov.uk/associated/ABC123"
+        pages = {
+            root_url: (
+                '<a href="/online-applications/applicationDetails.do?'
+                'activeTab=externalDocuments&amp;keyVal=ABC123">Plans &amp; Documents</a>'
+            ),
+            plans_url: '<a href="/associated/ABC123">view associated documents</a>',
+            associated_url: (
+                '<a href="/files/proposed-plan.pdf">Proposed plan</a>'
+                '<a href="/summary/ABC123">Plans &amp; Documents</a>'
+            ),
+        }
+        visits: list[str] = []
+
+        def fake_fetch(url: str, *, timeout: float):
+            visits.append(url)
+            return pages[url], url, object()
+
+        with patch(
+            "lead_generator.planning.leads._fetch_html_document_page",
+            side_effect=fake_fetch,
+        ):
+            documents = fetch_planit_documents(root_url)
+
+        self.assertEqual(
+            [(document.title, document.url) for document in documents],
+            [("Proposed plan", "https://planning.example.gov.uk/files/proposed-plan.pdf")],
+        )
+        self.assertEqual(visits, [root_url, plans_url, associated_url])
+
     def test_tascomi_search_url_is_treated_as_listing_page(self) -> None:
         self.assertTrue(
             _looks_like_listing_url(
@@ -2489,7 +2564,7 @@ class LeadSearchTest(unittest.TestCase):
             self.assertFalse((destination / "Existing survey report.pdf").exists())
             self.assertFalse((destination / "Viewer.exe").exists())
 
-    def test_download_pdf_documents_does_not_retry_permanent_404(self) -> None:
+    def test_download_pdf_documents_retries_temporary_404_once(self) -> None:
         document = PlanningDocument(
             title="Removed plan.pdf",
             url="https://planning.example.gov.uk/docs/removed-plan.pdf",
@@ -2504,9 +2579,43 @@ class LeadSearchTest(unittest.TestCase):
                 downloaded = download_pdf_documents([document], Path(directory))
 
         self.assertEqual(downloaded, 0)
-        download_file.assert_called_once()
-        self.assertIs(download_file.call_args.args[0], document)
-        wait.assert_not_called()
+        self.assertEqual(download_file.call_count, 2)
+        self.assertTrue(all(call.args[0] is document for call in download_file.call_args_list))
+        wait.assert_called_once()
+
+    def test_document_batch_defers_first_pass_404_without_blocking_same_host(self) -> None:
+        missing = PlanningDocument(
+            title="Temporarily missing plan.pdf",
+            url="https://planning.example.gov.uk/docs/missing-plan.pdf",
+        )
+        sibling = PlanningDocument(
+            title="Available elevations.pdf",
+            url="https://planning.example.gov.uk/docs/available-elevations.pdf",
+        )
+
+        def fake_download(document, **kwargs):
+            if document is missing:
+                raise HTTPError(document.url, 404, "Not Found", {}, None)
+            return DownloadedFile(
+                payload=b"%PDF-1.4",
+                final_url=document.url,
+                content_type="application/pdf",
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch(
+                "lead_generator.planning.leads.download_document_file",
+                side_effect=fake_download,
+            ) as download_file:
+                result = _download_pdf_documents_once(
+                    [missing, sibling],
+                    Path(directory),
+                )
+
+        self.assertEqual(download_file.call_count, 2)
+        self.assertEqual(result.downloaded_count, 1)
+        self.assertEqual(result.transient_documents, [missing])
+        self.assertEqual(result.failures, [])
 
     def test_download_pdf_documents_skip_source_page_when_direct_urls_work(self) -> None:
         source_url = (
@@ -2814,6 +2923,139 @@ class LeadSearchTest(unittest.TestCase):
         self.assertEqual(
             documents[0].url,
             "https://planning.example.gov.uk/publisher/docs/SESSION1/Document-SESSION1.pdf",
+        )
+
+    def test_session_bound_publisher_candidates_refresh_for_each_opener_session(self) -> None:
+        source_url = "https://planning.example.gov.uk/publisher/mvc/listDocuments"
+        documents = [
+            PlanningDocument(
+                title=f"Proposed drawing {index}",
+                url=f"https://planning.example.gov.uk/publisher/docs/OLD/Document-{index}.pdf",
+                source_url=source_url,
+            )
+            for index in (1, 2)
+        ]
+        source_cache: dict[str, list[PlanningDocument]] = {}
+
+        class FakeResponse:
+            def __init__(self, url: str, payload: bytes, content_type: str) -> None:
+                self._url = url
+                self._payload = payload
+                self.headers = {"Content-Type": content_type}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return self._payload
+
+            def geturl(self) -> str:
+                return self._url
+
+        class FakeOpener:
+            def __init__(self, session: str) -> None:
+                self.session = session
+                self.urls: list[str] = []
+
+            def open(self, request, timeout):
+                url = request.full_url
+                self.urls.append(url)
+                if url == source_url:
+                    return FakeResponse(
+                        url,
+                        b'<script>var ctx = "/publisher"; var table = '
+                        b'{"url": "/publisher/mvc/getDocumentList"};</script>',
+                        "text/html",
+                    )
+                if "getDocumentList" in url:
+                    rows = [
+                        [
+                            "21/07/2026",
+                            "Drawing",
+                            f"Proposed drawing {index}",
+                            f"/docs/{self.session}/Document-{index}.pdf",
+                            "",
+                        ]
+                        for index in (1, 2)
+                    ]
+                    return FakeResponse(
+                        url,
+                        json.dumps({"data": rows}).encode(),
+                        "application/json",
+                    )
+                if f"/publisher/docs/{self.session}/" in url:
+                    return FakeResponse(url, b"%PDF-1.4", "application/pdf")
+                raise HTTPError(url, 404, "Expired session", {}, None)
+
+        downloaded = [
+            download_document_file(
+                document,
+                opener=FakeOpener(f"SESSION-{index}"),
+                source_cache=source_cache,
+            )
+            for index, document in enumerate(documents, start=1)
+        ]
+
+        self.assertEqual(
+            [result.final_url for result in downloaded],
+            [
+                "https://planning.example.gov.uk/publisher/docs/SESSION-1/Document-1.pdf",
+                "https://planning.example.gov.uk/publisher/docs/SESSION-2/Document-2.pdf",
+            ],
+        )
+
+    def test_generic_plan_fallback_matches_filename_identity(self) -> None:
+        source_url = "https://planning.example.gov.uk/application/ABC123"
+        document = PlanningDocument(
+            title="Plan",
+            url="https://planning.example.gov.uk/stale?fileName=SitePlan.pdf",
+            source_url=source_url,
+        )
+
+        class FakeResponse:
+            def __init__(self, url: str, payload: bytes, content_type: str) -> None:
+                self._url = url
+                self._payload = payload
+                self.headers = {"Content-Type": content_type}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return self._payload
+
+            def geturl(self) -> str:
+                return self._url
+
+        class FakeOpener:
+            def open(self, request, timeout):
+                url = request.full_url
+                if url == source_url:
+                    return FakeResponse(
+                        url,
+                        b"""
+                        <html><body>
+                          <a href="/current?fileName=OtherPlan.pdf">Plan</a>
+                          <a href="/current?fileName=SitePlan.pdf">Plan</a>
+                        </body></html>
+                        """,
+                        "text/html",
+                    )
+                if "/stale?" in url:
+                    raise HTTPError(url, 404, "Expired", {}, None)
+                return FakeResponse(url, b"%PDF-1.4", "application/pdf")
+
+        downloaded = download_document_file(document, opener=FakeOpener())
+
+        self.assertEqual(
+            downloaded.final_url,
+            "https://planning.example.gov.uk/current?fileName=SitePlan.pdf",
         )
 
     def test_document_download_retries_viewer_url_as_download_url(self) -> None:

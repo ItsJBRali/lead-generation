@@ -605,6 +605,118 @@ def test_recovery_clears_a_download_failure_after_successful_final_retry(tmp_pat
     assert summary.discovery_failures == 0
 
 
+def test_recovery_clears_only_matching_rotated_url_failure(tmp_path: Path) -> None:
+    row = _row()
+    initialise_csv(tmp_path / "applications.csv", APPLICATION_CSV_FIELDS)
+    append_csv_row(tmp_path / "applications.csv", APPLICATION_CSV_FIELDS, row)
+    catalogue = json.loads(_catalogue_json("Example Council"))
+    source_url = "https://planning.example.test/documents/REF-1"
+    stale = PlanningDocument(
+        "Plan",
+        "https://docs.test/download?fileName=SitePlan.pdf&token=old",
+        source_url=source_url,
+    )
+    replacement = PlanningDocument(
+        "Plan",
+        "https://docs.test/download?fileName=SitePlan.pdf&token=new",
+        source_url=source_url,
+    )
+    unrelated = PlanningDocument(
+        "Plan",
+        "https://docs.test/download?fileName=FloorPlan.pdf&token=old",
+        source_url=source_url,
+    )
+    discovery_calls = 0
+
+    def fake_discovery(application: PlanningApplication) -> DocumentDiscoveryResult:
+        nonlocal discovery_calls
+        discovery_calls += 1
+        return DocumentDiscoveryResult(
+            documents=[stale, unrelated] if discovery_calls == 1 else [replacement, unrelated],
+            successful_sources=[source_url],
+        )
+
+    def fake_download(documents, destination, **kwargs):
+        attempted = list(documents)
+        if discovery_calls == 1:
+            return DocumentDownloadBatchResult(
+                failures=[
+                    SimpleNamespace(document=document, reason="HTTP 404")
+                    for document in attempted
+                ]
+            )
+        return DocumentDownloadBatchResult(
+            downloaded_count=1,
+            failures=[SimpleNamespace(document=unrelated, reason="HTTP 404")],
+        )
+
+    with (
+        patch("lead_generator.planning.recovery.load_authority_catalogue", return_value=catalogue),
+        patch("lead_generator.planning.recovery.discover_application_documents", side_effect=fake_discovery),
+        patch("lead_generator.planning.recovery._download_pdf_documents_once", side_effect=fake_download),
+        patch("lead_generator.planning.recovery._wait_for_document_retry_cooldown", side_effect=[True, False]),
+        patch("lead_generator.planning.recovery.enrich_application_folder", return_value=ContactEnrichment()),
+    ):
+        summary = recover_search_output(tmp_path)
+
+    with summary.audit_csv_path.open(encoding="utf-8") as handle:
+        status = next(csv.DictReader(handle))["Document Discovery Status"]
+    assert "fileName=FloorPlan.pdf" in status
+    assert "fileName=SitePlan.pdf" not in status
+    assert summary.discovery_failures == 1
+
+
+def test_recovery_runs_one_bounded_late_pass_and_preserves_existing_files(tmp_path: Path) -> None:
+    row = _row()
+    initialise_csv(tmp_path / "applications.csv", APPLICATION_CSV_FIELDS)
+    append_csv_row(tmp_path / "applications.csv", APPLICATION_CSV_FIELDS, row)
+    catalogue = json.loads(_catalogue_json("Example Council"))
+    folder = tmp_path / "Example Council" / "REF-1"
+    folder.mkdir(parents=True)
+    existing_path = folder / "Existing elevations.pdf"
+    existing_path.write_bytes(b"%PDF-existing")
+    existing = PlanningDocument(
+        "Existing elevations.pdf",
+        "https://docs.test/existing.pdf",
+        source_url=row["application link"],
+    )
+    missing = PlanningDocument(
+        "Proposed elevations.pdf",
+        "https://docs.test/proposed.pdf",
+        source_url=row["application link"],
+    )
+    attempts: list[list[PlanningDocument]] = []
+
+    def fake_download(documents, destination, **kwargs):
+        attempted = list(documents)
+        attempts.append(attempted)
+        if len(attempts) < 3:
+            return DocumentDownloadBatchResult(
+                failures=[SimpleNamespace(document=missing, reason="HTTP 404")]
+            )
+        (destination / missing.title).write_bytes(b"%PDF-recovered")
+        return DocumentDownloadBatchResult(downloaded_count=1)
+
+    discovery = DocumentDiscoveryResult(
+        documents=[existing, missing],
+        successful_sources=[row["application link"]],
+    )
+    with (
+        patch("lead_generator.planning.recovery.load_authority_catalogue", return_value=catalogue),
+        patch("lead_generator.planning.recovery.discover_application_documents", return_value=discovery),
+        patch("lead_generator.planning.recovery._download_pdf_documents_once", side_effect=fake_download),
+        patch("lead_generator.planning.recovery._wait_for_document_retry_cooldown", return_value=True) as wait,
+        patch("lead_generator.planning.recovery.enrich_application_folder", return_value=ContactEnrichment()),
+    ):
+        summary = recover_search_output(tmp_path)
+
+    assert attempts == [[missing], [missing], [missing]]
+    assert wait.call_count == 2
+    assert existing_path.read_bytes() == b"%PDF-existing"
+    assert (folder / missing.title).read_bytes() == b"%PDF-recovered"
+    assert summary.discovery_failures == 0
+
+
 def test_recovery_isolates_application_folder_construction_per_row(tmp_path: Path) -> None:
     rows = [_row(reference) for reference in ("REF-1", "REF-2")]
     initialise_csv(tmp_path / "applications.csv", APPLICATION_CSV_FIELDS)

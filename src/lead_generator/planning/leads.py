@@ -196,6 +196,7 @@ DOCUMENT_DOWNLOAD_DELAY_SECONDS = 0.0
 DOCUMENT_DOWNLOAD_RETRY_DELAY_SECONDS = 10.0
 DOCUMENT_DOWNLOAD_ATTEMPTS = 2
 DOCUMENT_DOWNLOAD_MAX_RETRY_DELAY_SECONDS = 15.0
+MAX_ASSOCIATED_DOCUMENT_SOURCE_DEPTH = 2
 MAX_CONCURRENT_DOCUMENT_BATCHES = 2
 RATE_LIMIT_HTTP_CODES = {429, 503}
 MAX_RETRY_AFTER_SECONDS = 60.0
@@ -1924,8 +1925,16 @@ def fetch_planit_documents(
     *,
     follow_associated: bool = True,
     discovery_result: DocumentDiscoveryResult | None = None,
+    _associated_depth: int = 0,
+    _visited_sources: set[str] | None = None,
 ) -> list[PlanningDocument]:
+    visited_sources = _visited_sources if _visited_sources is not None else set()
+    normalized_docs_url = normalize_url(docs_url)
+    if normalized_docs_url in visited_sources:
+        return []
+    visited_sources.add(normalized_docs_url)
     text, page_url, opener = _fetch_html_document_page(docs_url, timeout=45)
+    visited_sources.add(normalize_url(page_url))
     document = html.fromstring(text)
     documents: list[PlanningDocument] = []
     seen: set[str] = set()
@@ -1968,13 +1977,17 @@ def fetch_planit_documents(
                 continue
             seen.add(arcus_document.url)
             documents.append(arcus_document)
-    if follow_associated:
+    if follow_associated and _associated_depth < MAX_ASSOCIATED_DOCUMENT_SOURCE_DEPTH:
         for associated_url in _associated_document_source_urls(text, page_url):
+            if normalize_url(associated_url) in visited_sources:
+                continue
             try:
                 associated_documents = fetch_planit_documents(
                     associated_url,
-                    follow_associated=False,
+                    follow_associated=True,
                     discovery_result=discovery_result,
+                    _associated_depth=_associated_depth + 1,
+                    _visited_sources=visited_sources,
                 )
             except Exception as exc:
                 if discovery_result is None:
@@ -2036,8 +2049,11 @@ def _associated_document_source_urls(html_text: str, page_url: str) -> list[str]
             marker in label
             for marker in (
                 "associated application documents",
+                "view associated documents",
                 "view related documents",
                 "documents for this application",
+                "plans & documents",
+                "plans and documents",
             )
         ):
             continue
@@ -2277,7 +2293,10 @@ def _download_pdf_documents_once(
                     if _is_transient_document_error(exc):
                         error_url = str(getattr(exc, "url", "") or "")
                         error_host = urlsplit(error_url).netloc.casefold()
-                        blocked_hosts.update(host for host in (document_host, error_host) if host)
+                        if not (isinstance(exc, HTTPError) and exc.code == 404):
+                            blocked_hosts.update(
+                                host for host in (document_host, error_host) if host
+                            )
                         if defer_transient:
                             result.transient_documents.append(document)
                             continue
@@ -2299,7 +2318,7 @@ def _download_pdf_documents_once(
 
 def _is_transient_document_error(exc: Exception) -> bool:
     if isinstance(exc, HTTPError):
-        return exc.code in {403, 408, 425, 429, 500, 502, 503, 504}
+        return exc.code in {403, 404, 408, 425, 429, 500, 502, 503, 504}
     if isinstance(exc, ValueError):
         return False
     return True
@@ -2435,7 +2454,11 @@ def _download_document_file(
     opener = opener or _build_document_opener()
     verify_tls = True
     tls_compat = False
-    direct_candidates = document_download_candidates(document.url)
+    direct_candidates = (
+        []
+        if document.source_url and _is_session_bound_document_url(document.url)
+        else document_download_candidates(document.url)
+    )
     pending = deque(direct_candidates)
     source_discovery_attempted = False
     seen: set[str] = set()
@@ -2565,8 +2588,12 @@ def source_document_candidates(
         return []
     source_url = document.source_url
     candidates: list[PlanningDocument]
-    if cache is not None and source_url in cache:
-        candidates = cache[source_url]
+    cached_candidates = cache.get(source_url) if cache is not None else None
+    if cached_candidates is not None and not any(
+        _is_session_bound_document_url(candidate.url)
+        for candidate in cached_candidates
+    ):
+        candidates = cached_candidates
     else:
         try:
             text, page_url = _fetch_html_with_portal_session(source_url, opener, timeout=30)
@@ -2607,17 +2634,34 @@ def source_document_candidates(
                 )
             )
         if cache is not None:
-            cache[source_url] = candidates
-    wanted = _comparable_title(document.title)
+            if any(
+                _is_session_bound_document_url(candidate.url)
+                for candidate in candidates
+            ):
+                cache.pop(source_url, None)
+            else:
+                cache[source_url] = candidates
+    wanted = _document_identity(document)
+    generic_title = _is_generic_document_title(document.title)
     matching = [
         candidate.url
         for candidate in candidates
         if not wanted
-        or _comparable_title(candidate.title) == wanted
-        or wanted in _comparable_title(candidate.title)
-        or _comparable_title(candidate.title) in wanted
+        or _document_identity(candidate) == wanted
+        or (
+            not generic_title
+            and (
+                wanted in _document_identity(candidate)
+                or _document_identity(candidate) in wanted
+            )
+        )
     ]
     return list(dict.fromkeys(matching))
+
+
+def _is_session_bound_document_url(url: str) -> bool:
+    path = urlsplit(url).path.casefold()
+    return "/publisher/docs/" in path or "/document/download" in path
 
 
 def _fetch_isolated_document_fallback(
@@ -2664,6 +2708,8 @@ def document_download_candidates(url: str) -> list[str]:
 def iter_document_links(document: html.HtmlElement, page_url: str) -> Iterable[tuple[str, str]]:
     yield from iter_public_access_model_links(document, page_url)
     for anchor in document.xpath("//a[@href]"):
+        if _is_page_chrome_link(anchor):
+            continue
         href = anchor.get("href")
         if not href:
             continue
@@ -3342,7 +3388,7 @@ def _is_document_href(href: str | None) -> bool:
 
 
 def _is_generic_site_document(href: str | None, title: str | None) -> bool:
-    text = " ".join(value for value in (href, title) if value).casefold()
+    text = unquote(" ".join(value for value in (href, title) if value)).casefold()
     if not text:
         return False
     if "design and access" in text or "access statement" in text:
@@ -3371,8 +3417,25 @@ def _is_generic_site_document(href: str | None, title: str | None) -> bool:
         "/onlineplanning/getonlinedocuments",
         "/onlineplanning/getcommentattachments",
         "/onlinedisplaydocument/opencommentattachment",
+        "/related-documents/related documents",
     )
     return any(token in text for token in generic_tokens)
+
+
+def _is_page_chrome_link(element: html.HtmlElement) -> bool:
+    if element.xpath("ancestor::header | ancestor::nav | ancestor::footer"):
+        return True
+    chrome_markers = {"banner", "breadcrumb", "contentinfo", "footer", "navigation"}
+    for ancestor in element.xpath("ancestor-or-self::*"):
+        role = (ancestor.get("role") or "").casefold()
+        identifiers = " ".join(
+            value for value in (ancestor.get("id"), ancestor.get("class")) if value
+        ).casefold()
+        if role in chrome_markers or any(
+            marker in identifiers for marker in chrome_markers
+        ):
+            return True
+    return False
 
 
 def _document_link_title(value: str | None, url: str) -> str | None:
@@ -3392,8 +3455,13 @@ def _is_application_tab_href(href: str | None) -> bool:
         return False
     lowered = href.strip().lower()
     parts = urlsplit(lowered)
+    query_names = {
+        name.casefold()
+        for name, _value in parse_qsl(parts.query, keep_blank_values=True)
+    }
     return (
-        "applicationdetails.do" in lowered and "activetab=documents" in lowered
+        "applicationdetails.do" in parts.path.casefold()
+        and "activetab" in query_names
     ) or parts.fragment in {"tabdocuments", "documents"}
 
 
@@ -3854,6 +3922,24 @@ def _comparable_title(value: str | None) -> str:
     text = re.sub(r"\.[a-z0-9]{2,5}$", "", text, flags=re.IGNORECASE)
     text = re.sub(r"[^a-z0-9]+", " ", text.casefold())
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _is_generic_document_title(value: str | None) -> bool:
+    return _comparable_title(value) in {
+        "document",
+        "documents",
+        "plan",
+        "plans",
+        "plans documents",
+    }
+
+
+def _document_identity(document: PlanningDocument) -> str:
+    title = _comparable_title(document.title)
+    url_title = _comparable_title(document_title_from_url(document.url))
+    if _is_generic_document_title(document.title) and url_title:
+        return url_title
+    return title or url_title
 
 
 def _filename_from_headers(headers: Message) -> str | None:
