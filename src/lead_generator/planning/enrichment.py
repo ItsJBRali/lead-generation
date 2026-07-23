@@ -58,26 +58,13 @@ APPLICATION_FORM_TEXT_MARKERS = (
 PROFESSIONAL_ROLE_MARKERS = (
     "architect",
     "architecture",
-    "planning agent",
-    "planning consultant",
-    "agent details",
-    "prepared by",
-    "report prepared by",
-    "drawn by",
-    "designed by",
-    "design consultant",
+    "architectural",
     "project architect",
     "landscape architect",
-    "chartered surveyor",
-    "structural engineer",
-    "civil engineer",
-    "transport consultant",
-    "consulting engineer",
     " arb ",
+    "chartered practice",
+    "ciat",
     "mciat",
-    "mciob",
-    "mrtpi",
-    "mrics",
     " riba ",
 )
 CLIENT_ROLE_MARKERS = (
@@ -140,7 +127,7 @@ PROFESSIONAL_LABEL_RE = re.compile(
     r"drawn\s+by|consultant|author)\s*[:\-]\s*(.+?)\s*$"
 )
 PROFESSIONAL_CREDENTIAL_RE = re.compile(
-    r"(?i)\b(?:ARB|ASI|MASI|CIAT|MCIAT|MCIOB|MRTPI|MRICS|RIBA|CMLI|MEng|BArch|DipArch)\b"
+    r"(?i)\b(?:ARB|CIAT|MCIAT|RIBA|BArch|DipArch)\b"
 )
 ADDRESS_WORD_RE = re.compile(
     r"(?i)\b(?:street|road|lane|avenue|court|house|building|park|way|square|drive|"
@@ -153,6 +140,9 @@ BLOCKED_EMAIL_DOMAINS = (
     "planningportal.gov.uk",
     "pins.gsi.gov.uk",
     "greatercambridgeplanning.org",
+)
+OCR_PREFIX_DEDUPE_LOCAL_PARTS = frozenset(
+    {"admin", "contact", "hello", "home", "info", "mail", "office", "studio"}
 )
 FREE_EMAIL_DOMAINS = {
     "aol.com",
@@ -173,6 +163,10 @@ FREE_EMAIL_DOMAINS = {
 
 GENERIC_COMPANY_HEADINGS = {
     "application for planning permission",
+    "architect",
+    "architects",
+    "architecture",
+    "architectural",
     "design and access statement",
     "planning application",
     "planning statement",
@@ -383,6 +377,22 @@ class _Accumulator:
         self.result.company_addresses.append(value)
         self._record_source("Company Address")
 
+    def discard_excluded_values(self) -> None:
+        self.result.architect_company_names = [
+            value
+            for value in self.result.architect_company_names
+            if not self.exclusions.matches_party(value)
+        ]
+        self.result.company_addresses = [
+            value
+            for value in self.result.company_addresses
+            if not self.exclusions.matches_address(value)
+        ]
+        if not self.result.architect_company_names:
+            self.result.field_sources.pop("Architect / Company Name", None)
+        if not self.result.company_addresses:
+            self.result.field_sources.pop("Company Address", None)
+
 
 def empty_enrichment_row(*, requested: bool) -> dict[str, str]:
     value = FAILED_ENRICHMENT_VALUE if requested else ""
@@ -406,11 +416,16 @@ def enrich_application_folder(
         (path for path in folder.iterdir() if path.is_file() and _is_pdf(path)),
         key=lambda path: path.name.casefold(),
     ) if folder.exists() else []
-    _add_application_form_applicant_exclusions(pdf_paths, exclusions, log)
+    accumulator = _Accumulator(exclusions)
+    _add_application_form_applicant_exclusions(
+        pdf_paths,
+        exclusions,
+        accumulator,
+        log,
+    )
 
     if not pdf_paths and log:
         log("No downloaded PDFs were available to enrich")
-    accumulator = _Accumulator(exclusions)
     for path in pdf_paths:
         preliminary = preclassify_drawing_source(path.name)
         if not preliminary.eligible and not preliminary.needs_text:
@@ -422,6 +437,12 @@ def enrich_application_folder(
                 log(f"Checking the first page of {path.name}")
             first_page = extract_pdf_first_page_text(path)
             if first_page.application_form:
+                _add_application_form_path_exclusions(
+                    path,
+                    exclusions,
+                    accumulator,
+                    log,
+                )
                 accumulator.result.rejected_documents[path.name] = "application form"
                 continue
 
@@ -470,12 +491,8 @@ def enrich_application_folder(
             finally:
                 accumulator.source_document = None
             if all(
-                (
-                    accumulator.result.architect_company_names,
-                    accumulator.result.phone_numbers,
-                    accumulator.result.email_addresses,
-                    accumulator.result.company_addresses,
-                )
+                path.name in accumulator.result.field_sources.get(field_name, ())
+                for field_name in ENRICHMENT_CSV_FIELDS
             ):
                 break
         except Exception as exc:  # pragma: no cover - malformed live documents vary widely
@@ -500,11 +517,20 @@ def extract_pdf_first_page_text(path: Path) -> _PdfText:
 
 def extract_pdf_application_form_text(path: Path) -> _PdfText:
     cache = _open_pdf_cache(path)
-    page_indexes = range(
-        min(cache.page_count, APPLICATION_FORM_EXCLUSION_PAGE_LIMIT)
+    page_indexes = list(
+        range(min(cache.page_count, APPLICATION_FORM_EXCLUSION_PAGE_LIMIT))
     )
     try:
         _read_selectable_pages(cache, page_indexes)
+        _ocr_cached_pages(
+            path,
+            cache,
+            [
+                page_index
+                for page_index in page_indexes
+                if _needs_ocr(cache.page_text.get(page_index, ""))
+            ],
+        )
         return _pdf_text_from_cache(path, cache, page_indexes)
     except Exception:
         _close_pdf_read_cache(cache)
@@ -635,11 +661,15 @@ def _close_pdf_cache(document: _PdfText | None) -> None:
 def _close_pdf_read_cache(cache: _PdfReadCache) -> None:
     if cache.reader is None:
         return
-    stream = getattr(cache.reader, "stream", None)
+    reader = cache.reader
+    cache.reader = None
+    stream = getattr(reader, "stream", None)
     close = getattr(stream, "close", None)
     if callable(close):
-        close()
-    cache.reader = None
+        try:
+            close()
+        except Exception:
+            pass
 
 
 def is_application_form(path: Path, text: str) -> bool:
@@ -686,19 +716,30 @@ def extract_professional_details(text: str, filename: str, accumulator: _Accumul
 
     for index, line in enumerate(lines):
         has_contact_evidence = _title_block_contact_evidence(lines, index)
+        architect_context = _architect_context(lines, index)
         excluded_context = _client_context(lines, index) or _authority_context(lines, index)
         if PROFESSIONAL_CREDENTIAL_RE.search(line):
             credentialled_name = _name_before_credentials(lines, index)
             if credentialled_name and not excluded_context:
                 accumulator.add_name(credentialled_name)
         labelled = PROFESSIONAL_LABEL_RE.match(line)
-        if labelled and _valid_labelled_name(labelled.group(1)) and not excluded_context:
+        if (
+            labelled
+            and architect_context
+            and _valid_labelled_name(labelled.group(1))
+            and not excluded_context
+        ):
             accumulator.add_name(labelled.group(1))
-        if _looks_like_company(line) and has_contact_evidence and not excluded_context:
+        if (
+            _looks_like_company(line)
+            and has_contact_evidence
+            and architect_context
+            and not excluded_context
+        ):
             accumulator.add_name(line)
 
         for email in EMAIL_RE.findall(line):
-            if has_contact_evidence and not excluded_context:
+            if has_contact_evidence and architect_context and not excluded_context:
                 accumulator.add_email(email)
                 company = _nearest_company(lines, index)
                 if company:
@@ -707,8 +748,13 @@ def extract_professional_details(text: str, filename: str, accumulator: _Accumul
         for phone_match in PHONE_RE.finditer(line):
             if (
                 has_contact_evidence
+                and architect_context
                 and not excluded_context
-                and not _fax_context(line, phone_match.start())
+                and not _noncontact_number_context(
+                    lines,
+                    index,
+                    phone_match.start(),
+                )
             ):
                 accumulator.add_phone(phone_match.group(0))
                 company = _nearest_company(lines, index)
@@ -720,6 +766,7 @@ def extract_professional_details(text: str, filename: str, accumulator: _Accumul
             if (
                 address
                 and has_contact_evidence
+                and architect_context
                 and not excluded_context
             ):
                 accumulator.add_address(address)
@@ -728,25 +775,41 @@ def extract_professional_details(text: str, filename: str, accumulator: _Accumul
 def _add_application_form_applicant_exclusions(
     pdf_paths: Iterable[Path],
     exclusions: _Exclusions,
+    accumulator: _Accumulator,
     log: Callable[[str], None] | None,
 ) -> None:
     for path in pdf_paths:
         if not is_application_form(path, ""):
             continue
-        document: _PdfText | None = None
-        try:
-            document = extract_pdf_application_form_text(path)
-            applicant, _agent = extract_application_form_parties(document.text)
-            if not applicant:
-                continue
-            exclusions.add_party(applicant.person_name)
-            exclusions.add_party(applicant.company_name)
-            exclusions.add_address(applicant.address)
-        except Exception as exc:
-            if log:
-                log(f"Could not read {path.name} for applicant exclusions: {exc}")
-        finally:
-            _close_pdf_cache(document)
+        _add_application_form_path_exclusions(
+            path,
+            exclusions,
+            accumulator,
+            log,
+        )
+
+
+def _add_application_form_path_exclusions(
+    path: Path,
+    exclusions: _Exclusions,
+    accumulator: _Accumulator,
+    log: Callable[[str], None] | None,
+) -> None:
+    document: _PdfText | None = None
+    try:
+        document = extract_pdf_application_form_text(path)
+        applicant, _agent = extract_application_form_parties(document.text)
+        if not applicant:
+            return
+        exclusions.add_party(applicant.person_name)
+        exclusions.add_party(applicant.company_name)
+        exclusions.add_address(applicant.address)
+        accumulator.discard_excluded_values()
+    except Exception as exc:
+        if log:
+            log(f"Could not read {path.name} for applicant exclusions: {exc}")
+    finally:
+        _close_pdf_cache(document)
 
 
 def _fax_context(line: str, phone_start: int) -> bool:
@@ -754,7 +817,30 @@ def _fax_context(line: str, phone_start: int) -> bool:
     if re.search(r"(?i)\b(?:tel|t)\s*/\s*(?:fax|f)\s*[:.]?\s*$", prefix):
         return False
     return bool(
-        re.search(r"(?i)(?:\bfax|\bf)\s*[:.]?\s*$", prefix)
+        re.search(
+            r"(?i)(?:\bfax(?:\s+(?:no|number))?|\bf|\bfacsimile)\s*[:.]?\s*$",
+            prefix,
+        )
+    )
+
+
+def _noncontact_number_context(
+    lines: list[str],
+    index: int,
+    phone_start: int,
+) -> bool:
+    if _fax_context(lines[index], phone_start):
+        return True
+    labels = [lines[index][:phone_start]]
+    if index:
+        labels.append(lines[index - 1])
+    return any(
+        re.fullmatch(
+            r"(?i)\s*(?:f|fax(?:\s+(?:no|number))?|facsimile|"
+            r"(?:drawing|job|project)\s+(?:no|number))\s*:?\s*",
+            label,
+        )
+        for label in labels
     )
 
 
@@ -852,6 +938,12 @@ def _has_professional_contact_evidence(lines: list[str], index: int) -> bool:
     return has_role or (has_company and has_contact)
 
 
+def _architect_context(lines: list[str], index: int) -> bool:
+    window = lines[max(0, index - 6):min(len(lines), index + 7)]
+    text = f" {' '.join(window).casefold()} "
+    return any(marker in text for marker in PROFESSIONAL_ROLE_MARKERS)
+
+
 def _title_block_contact_evidence(lines: list[str], index: int) -> bool:
     if _has_professional_contact_evidence(lines, index):
         return True
@@ -890,6 +982,7 @@ def _nearest_company(lines: list[str], index: int) -> str:
         if (
             _looks_like_company(candidate)
             and _has_professional_contact_evidence(lines, candidate_index)
+            and _architect_context(lines, candidate_index)
             and not _client_context(lines, candidate_index)
             and not _authority_context(lines, candidate_index)
         ):
@@ -1201,6 +1294,8 @@ def _clean_professional_address(value: str | None) -> str:
         return ""
     if re.match(r"^(?:architects?|architecture|interiors?)\s*[+,;:]", folded):
         return ""
+    if re.search(r"\blandscape\s+plan\b", folded):
+        return ""
     if any(
         marker in folded
         for marker in (
@@ -1213,7 +1308,6 @@ def _clean_professional_address(value: str | None) -> str:
             "issued on",
             "http://",
             "https://",
-            "landscape plan",
         )
     ):
         return ""
@@ -1237,7 +1331,11 @@ def _similar_ocr_email(left: str, right: str) -> bool:
         return False
     if abs(len(left_local) - len(right_local)) == 1:
         longer, shorter = sorted((left_local, right_local), key=len, reverse=True)
-        return longer[0] in {"e", "i", "l", "o", "0"} and longer[1:] == shorter
+        return (
+            shorter in OCR_PREFIX_DEDUPE_LOCAL_PARTS
+            and longer[0] in {"e", "i", "l", "o", "0"}
+            and longer[1:] == shorter
+        )
     if len(left_local) != len(right_local):
         return False
     differences = [
@@ -1262,6 +1360,7 @@ def _prefer_shorter_ocr_email(candidate: str, existing: str) -> bool:
     return (
         candidate_domain == existing_domain
         and len(candidate_local) + 1 == len(existing_local)
+        and candidate_local in OCR_PREFIX_DEDUPE_LOCAL_PARTS
         and existing_local[0] in {"e", "i", "l", "o", "0"}
         and existing_local[1:] == candidate_local
     )
@@ -1304,7 +1403,11 @@ def _similar_site_address(candidate: str, excluded: str) -> bool:
     right = _meaningful_address_tokens(excluded)
     shared = left & right
     union = left | right
-    return len(shared) >= 3 and bool(union) and len(shared) / len(union) >= 0.65
+    return len(shared) >= 4 or (
+        len(shared) >= 3
+        and bool(union)
+        and len(shared) / len(union) >= 0.65
+    )
 
 
 def _same_value(left: str, right: str) -> bool:

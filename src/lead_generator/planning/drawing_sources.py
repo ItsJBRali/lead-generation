@@ -62,9 +62,13 @@ DRAWING_CODE_RE = re.compile(
     r"(?=.*[-_.][a-z0-9]*\d[a-z0-9]*$)"
     r"(?!.*(?:^|[-_.])(?:document|report|statement)(?:[-_.]|$))"
     r"(?:"
-    r"(?:[a-z]{1,3}|[0-9]{1,8})(?:[-_.][a-z0-9]{1,8}){1,3}"
+    r"(?:[a-z]{1,3}|[0-9]{1,8}|"
+    r"(?=[a-z0-9]{2,8}[-_.])(?=[a-z0-9]*[a-z])(?=[a-z0-9]*\d)"
+    r"[a-z0-9]{2,8})(?:[-_.][a-z0-9]{1,8}){1,3}"
     r"|"
-    r"(?:[a-z]{1,3}|[0-9]{1,8})(?:[-_.][a-z0-9]{1,8}){3,9}"
+    r"(?:[a-z]{1,3}|[0-9]{1,8}|"
+    r"(?=[a-z0-9]{2,8}[-_.])(?=[a-z0-9]*[a-z])(?=[a-z0-9]*\d)"
+    r"[a-z0-9]{2,8})(?:[-_.][a-z0-9]{1,8}){3,9}"
     r"[-_.](?=[a-z0-9]*[a-z])(?=[a-z0-9]*\d)[a-z0-9]{2,8}"
     r")$"
 )
@@ -126,9 +130,9 @@ def _has_title_narrative_marker(text: str) -> bool:
             is_short_title = len(line_words) <= len(phrase_words) + 4
             if normalized_line == normalized_phrase:
                 return True
-            if is_short_title and (
-                normalized_line.startswith(f"{normalized_phrase} ")
-                or normalized_line.endswith(f" {normalized_phrase}")
+            if (
+                is_short_title
+                and f" {normalized_phrase} " in f" {normalized_line} "
             ):
                 return True
             if (
