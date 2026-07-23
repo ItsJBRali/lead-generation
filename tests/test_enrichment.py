@@ -133,7 +133,7 @@ def test_enrichment_uses_only_proposed_or_existing_drawings() -> None:
         ), patch.object(
             enrichment,
             "extract_pdf_text",
-            side_effect=lambda path: documents[path.name],
+            side_effect=lambda path, **_kwargs: documents[path.name],
         ):
             result = enrichment.enrich_application_folder(
                 folder,
@@ -307,7 +307,7 @@ def test_sparse_first_page_cannot_be_rescued_by_second_page_drawing_text() -> No
     extract_pdf_text.assert_not_called()
     assert result.eligible_documents == []
     assert result.rejected_documents == {
-        "Document 123.pdf": "drawing status/type evidence incomplete"
+        "Document 123.pdf": "not a proposed or existing drawing"
     }
 
 
@@ -367,7 +367,7 @@ def test_rejected_ambiguous_pdf_never_invokes_full_document_extraction() -> None
     assert result.eligible_documents == []
 
 
-def test_first_page_reader_does_not_extract_or_ocr_later_pages() -> None:
+def test_selectable_first_page_reader_does_not_extract_ocr_or_read_later_pages() -> None:
     path = Path("Document 789.pdf")
     first_page = Mock()
     first_page.extract_text.return_value = ""
@@ -375,26 +375,17 @@ def test_first_page_reader_does_not_extract_or_ocr_later_pages() -> None:
     reader = Mock()
     reader.is_encrypted = False
     reader.pages = [first_page, second_page]
-    ocr_text = (
-        "PROPOSED SITE PLAN\nDRAWING NUMBER A-101\nSCALE 1:100\n"
-        "PROJECT TITLE RESIDENTIAL REDEVELOPMENT"
-    )
-
     with (
         patch.object(enrichment, "PdfReader", return_value=reader),
-        patch.object(
-            enrichment,
-            "_ocr_pdf_pages",
-            return_value={0: ocr_text},
-        ) as ocr_pdf_pages,
+        patch.object(enrichment, "_ocr_pdf_pages") as ocr_pdf_pages,
     ):
         document = enrichment.extract_pdf_first_page_text(path)
 
     first_page.extract_text.assert_called_once_with()
     second_page.extract_text.assert_not_called()
-    ocr_pdf_pages.assert_called_once_with(path, [0])
-    assert document.text == ocr_text
-    assert document.ocr_pages == 1
+    ocr_pdf_pages.assert_not_called()
+    assert document.text == ""
+    assert document.ocr_pages == 0
 
 
 def test_ambiguous_drawing_evidence_must_be_close_together_on_title_page() -> None:
@@ -519,7 +510,7 @@ def test_enrichment_stops_reading_pdfs_once_all_fields_are_complete() -> None:
             result = enrichment.enrich_application_folder(folder)
 
     first_page_reader.assert_called_once_with(first_path)
-    full_document_reader.assert_called_once_with(first_path)
+    full_document_reader.assert_called_once_with(first_path, first_page=first_page)
     assert result.eligible_documents == ["A Proposed Plan.pdf"]
     assert result.field_sources == {
         "Architect / Company Name": ["A Proposed Plan.pdf"],
@@ -570,7 +561,7 @@ def test_enrichment_continues_reading_pdfs_while_fields_are_missing() -> None:
             patch.object(
                 enrichment,
                 "extract_pdf_text",
-                side_effect=lambda path: full_documents[path.name],
+                side_effect=lambda path, **_kwargs: full_documents[path.name],
             ) as full_document_reader,
         ):
             result = enrichment.enrich_application_folder(folder)
@@ -909,3 +900,273 @@ def test_ambiguous_car_park_accepts_late_first_page_title_block_evidence() -> No
 )
 def test_drawing_source_boundary(filename: str, text: str, eligible: bool) -> None:
     assert classify_drawing_source(filename, text).eligible is eligible
+
+
+LIVE_NARRATIVE_FILENAMES = [
+    "PL_26_05353_FA-ES_VOL._1_CHAPTER_13_-_HISTORIC_ENVIRONMENT-26015267.pdf",
+    "PL_26_05353_FA-ES_VOL._2_CHAPTER_6_-_AIR_QUALITY-26015268.pdf",
+    "PL_26_05353_FA-ES_VOL._3_FIGURE_13.1-26015269.pdf",
+    "PL_26_05353_FA-ES_FIGURES_7.1_TO_7.4-26015270.pdf",
+    "PL_26_05353_FA-ES_VOL._1-26015273.pdf",
+    "PL_26_05353_FA-NON_TECHNICAL_SUMMARY-26015271.pdf",
+    "PL_26_05353_FA-PLANNING_SUMMARY-26015272.pdf",
+    "PHASE_1_GEO-ENVIRONMENTAL_DESK_STUDY.pdf",
+    "SANG_JUSTIFICATION_DRAWING.pdf",
+    "ENVIRONMENTAL_STATEMENT_COVER.pdf",
+    "ENVIRONMENTAL_STATEMENT_CONTENTS.pdf",
+]
+
+
+@pytest.mark.parametrize("filename", LIVE_NARRATIVE_FILENAMES)
+def test_live_narrative_filename_families_are_rejected_before_reading(
+    filename: str,
+) -> None:
+    preliminary = preclassify_drawing_source(filename)
+
+    assert preliminary.eligible is False
+    assert preliminary.needs_text is False
+
+    with tempfile.TemporaryDirectory() as directory:
+        folder = Path(directory)
+        (folder / filename).touch()
+        with (
+            patch.object(
+                enrichment,
+                "extract_pdf_first_page_text",
+            ) as first_page_reader,
+            patch.object(enrichment, "_ocr_pdf_pages") as ocr_pdf_pages,
+        ):
+            result = enrichment.enrich_application_folder(folder)
+
+    first_page_reader.assert_not_called()
+    ocr_pdf_pages.assert_not_called()
+    assert result.rejected_documents == {filename: "narrative document title"}
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "Document 123.pdf",
+        "PL_26_05353_FA-123.pdf",
+        "PL_26_05353_FA_REPORT_123.pdf",
+        "Housing Report 2026.pdf",
+    ],
+)
+def test_arbitrary_numbered_documents_are_not_drawing_code_candidates(
+    filename: str,
+) -> None:
+    decision = preclassify_drawing_source(filename)
+
+    assert decision.eligible is False
+    assert decision.needs_text is False
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "A-101.pdf",
+        "P_01_100.pdf",
+        "ABC.123.P1.pdf",
+        "1234-A-101.pdf",
+    ],
+)
+def test_structured_drawing_codes_remain_title_block_candidates(
+    filename: str,
+) -> None:
+    decision = preclassify_drawing_source(filename)
+
+    assert decision.eligible is False
+    assert decision.needs_text is True
+
+
+def test_selectable_narrative_first_page_is_rejected_without_ocr() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        folder = Path(directory)
+        path = folder / "Proposed Site Plan.pdf"
+        path.touch()
+        page = Mock()
+        page.extract_text.return_value = (
+            "ENVIRONMENTAL STATEMENT\nCHAPTER 1\n"
+            "This report explains the proposed development and its effects."
+        )
+        reader = Mock()
+        reader.is_encrypted = False
+        reader.pages = [page]
+
+        with (
+            patch.object(enrichment, "PdfReader", return_value=reader),
+            patch.object(enrichment, "_ocr_pdf_pages") as ocr_pdf_pages,
+        ):
+            result = enrichment.enrich_application_folder(folder)
+
+    ocr_pdf_pages.assert_not_called()
+    assert result.eligible_documents == []
+    assert result.rejected_documents == {
+        "Proposed Site Plan.pdf": "narrative document marker"
+    }
+
+
+def test_ambiguous_filename_with_selectable_narrative_title_is_not_ocr_processed() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        folder = Path(directory)
+        path = folder / "A-101.pdf"
+        path.touch()
+        page = Mock()
+        page.extract_text.return_value = (
+            "ENVIRONMENTAL STATEMENT\nCHAPTER 1\n"
+            "This report explains the proposed development and its effects."
+        )
+        reader = Mock()
+        reader.is_encrypted = False
+        reader.pages = [page]
+
+        with (
+            patch.object(enrichment, "PdfReader", return_value=reader),
+            patch.object(enrichment, "_ocr_pdf_pages") as ocr_pdf_pages,
+        ):
+            result = enrichment.enrich_application_folder(folder)
+
+    ocr_pdf_pages.assert_not_called()
+    assert result.rejected_documents == {"A-101.pdf": "narrative document marker"}
+
+
+def test_scanned_clear_drawing_filename_is_rejected_when_ocr_reveals_narrative() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        folder = Path(directory)
+        path = folder / "Proposed Elevations.pdf"
+        path.touch()
+        page = Mock()
+        page.extract_text.return_value = ""
+        reader = Mock()
+        reader.is_encrypted = False
+        reader.pages = [page]
+        ocr_text = (
+            "ENVIRONMENTAL STATEMENT\nCHAPTER 2\n"
+            "Architect: Report Writer Ltd\n"
+            "020 7123 4567\nreports@example.co.uk\n"
+            "12 Report Road, London, SW1A 1AA"
+        )
+
+        with (
+            patch.object(enrichment, "PdfReader", return_value=reader),
+            patch.object(
+                enrichment,
+                "_ocr_pdf_pages",
+                return_value={0: ocr_text},
+            ) as ocr_pdf_pages,
+        ):
+            result = enrichment.enrich_application_folder(folder)
+
+    ocr_pdf_pages.assert_called_once_with(path, [0])
+    assert result.eligible_documents == []
+    assert result.field_sources == {}
+    assert result.rejected_documents == {
+        "Proposed Elevations.pdf": "narrative document marker"
+    }
+
+
+@pytest.mark.parametrize(
+    ("selectable_text", "ocr_text", "expected_ocr_calls"),
+    [
+        (
+            "PROPOSED ELEVATIONS\nDRAWING NUMBER A-101\nSCALE 1:100\n"
+            "Architect: Studio Arc Architects Ltd\n"
+            "020 7123 4567\nstudio@studioarc.co.uk\n"
+            "12 Design Road, London, SW1A 1AA\n"
+            + ("General drawing note. " * 20),
+            "",
+            0,
+        ),
+        (
+            "",
+            "PROPOSED ELEVATIONS\nDRAWING NUMBER A-101\nSCALE 1:100\n"
+            "Architect: Studio Arc Architects Ltd\n"
+            "020 7123 4567\nstudio@studioarc.co.uk\n"
+            "12 Design Road, London, SW1A 1AA",
+            1,
+        ),
+    ],
+)
+def test_one_page_eligible_drawing_reuses_parse_and_ocr_work(
+    selectable_text: str,
+    ocr_text: str,
+    expected_ocr_calls: int,
+) -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        folder = Path(directory)
+        path = folder / "Proposed Elevations.pdf"
+        path.touch()
+        page = Mock()
+        page.extract_text.return_value = selectable_text
+        reader = Mock()
+        reader.is_encrypted = False
+        reader.pages = [page]
+        ocr_result = {0: ocr_text} if ocr_text else {}
+
+        with (
+            patch.object(enrichment, "PdfReader", return_value=reader) as pdf_reader,
+            patch.object(
+                enrichment,
+                "_ocr_pdf_pages",
+                return_value=ocr_result,
+            ) as ocr_pdf_pages,
+        ):
+            result = enrichment.enrich_application_folder(folder)
+
+    pdf_reader.assert_called_once_with(path, strict=False)
+    page.extract_text.assert_called_once_with()
+    assert ocr_pdf_pages.call_count == expected_ocr_calls
+    assert result.eligible_documents == ["Proposed Elevations.pdf"]
+    assert result.to_csv_row() == {
+        "Architect / Company Name": "Studio Arc Architects Ltd",
+        "Phone Number": "020 7123 4567",
+        "Email Address": "studio@studioarc.co.uk",
+        "Company Address": "12 Design Road, London, SW1A 1AA",
+    }
+
+
+def test_multi_page_extraction_reuses_cached_page_zero() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        folder = Path(directory)
+        path = folder / "Proposed Plan.pdf"
+        path.touch()
+        first_page = Mock()
+        first_page.extract_text.return_value = (
+            "PROPOSED PLAN\nDRAWING NUMBER P-101\nSCALE 1:100\n"
+            "Architect: Studio Arc Architects Ltd\n"
+            + ("General drawing note. " * 20)
+        )
+        second_page = Mock()
+        second_page.extract_text.return_value = (
+            "020 7123 4567\nstudio@studioarc.co.uk\n"
+            "12 Design Road, London, SW1A 1AA\n"
+            + ("Construction note. " * 20)
+        )
+        reader = Mock()
+        reader.is_encrypted = False
+        reader.pages = [first_page, second_page]
+
+        with (
+            patch.object(enrichment, "PdfReader", return_value=reader) as pdf_reader,
+            patch.object(enrichment, "_ocr_pdf_pages") as ocr_pdf_pages,
+        ):
+            result = enrichment.enrich_application_folder(folder)
+
+    pdf_reader.assert_called_once_with(path, strict=False)
+    first_page.extract_text.assert_called_once_with()
+    second_page.extract_text.assert_called_once_with()
+    ocr_pdf_pages.assert_not_called()
+    assert result.eligible_documents == ["Proposed Plan.pdf"]
+
+
+def test_field_source_audit_uses_exact_normalized_filename_deduplication() -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+
+    accumulator.source_document = "Proposed Plan.pdf"
+    accumulator.add_phone("020 7123 4567")
+    accumulator.source_document = "123 Proposed Plan.pdf"
+    accumulator.add_phone("020 7987 6543")
+
+    assert accumulator.result.field_sources == {
+        "Phone Number": ["Proposed Plan.pdf", "123 Proposed Plan.pdf"]
+    }

@@ -271,6 +271,17 @@ class _PdfText:
     text: str
     application_form: bool
     ocr_pages: int = 0
+    first_page_text: str = ""
+    cache: _PdfReadCache | None = field(default=None, repr=False)
+
+
+@dataclass(slots=True)
+class _PdfReadCache:
+    reader: object | None
+    page_count: int
+    page_text: dict[int, str] = field(default_factory=dict)
+    ocr_attempted: set[int] = field(default_factory=set)
+    reader_error: Exception | None = None
 
 
 @dataclass(slots=True)
@@ -311,7 +322,9 @@ class _Accumulator:
         if not self.source_document:
             return
         sources = self.result.field_sources.setdefault(field_name, [])
-        _append_unique(sources, self.source_document)
+        source_key = _normalise_value(self.source_document)
+        if not any(_normalise_value(existing) == source_key for existing in sources):
+            sources.append(self.source_document)
 
     def add_name(self, value: str | None) -> None:
         value = _clean_candidate(value)
@@ -398,118 +411,198 @@ def enrich_application_folder(
         if not preliminary.eligible and not preliminary.needs_text:
             accumulator.result.rejected_documents[path.name] = preliminary.reason
             continue
+        first_page: _PdfText | None = None
         try:
             if log:
                 log(f"Checking the first page of {path.name}")
             first_page = extract_pdf_first_page_text(path)
-            if first_page.ocr_pages and log:
-                log(f"OCR read the first page of {path.name}")
-        except Exception as exc:  # pragma: no cover - malformed live documents vary widely
-            accumulator.result.rejected_documents[path.name] = f"read failed: {exc}"
-            if log:
-                log(f"Could not read {path.name} for enrichment: {exc}")
-            continue
-        if first_page.application_form:
-            accumulator.result.rejected_documents[path.name] = "application form"
-            continue
-        decision = classify_drawing_source(path.name, first_page.text)
-        if not decision.eligible:
-            accumulator.result.rejected_documents[path.name] = decision.reason
-            continue
-        try:
+            if first_page.application_form:
+                accumulator.result.rejected_documents[path.name] = "application form"
+                continue
+
+            decision = classify_drawing_source(path.name, first_page.text)
+            if (
+                not decision.eligible
+                and decision.needs_text
+                and preliminary.needs_text
+                and _needs_ocr(first_page.text)
+            ):
+                first_page = extract_pdf_first_page_with_ocr(path, first_page)
+                if first_page.ocr_pages and log:
+                    log(f"OCR read the first page of {path.name}")
+                if first_page.application_form:
+                    accumulator.result.rejected_documents[path.name] = "application form"
+                    continue
+                decision = classify_drawing_source(path.name, first_page.text)
+            if not decision.eligible:
+                accumulator.result.rejected_documents[path.name] = decision.reason
+                continue
+
             if log:
                 log(f"Reading {path.name} for professional contact details")
-            document = extract_pdf_text(path)
+            document = extract_pdf_text(path, first_page=first_page)
             if document.ocr_pages and log:
                 log(f"OCR read {document.ocr_pages} page(s) from {path.name}")
+            if document.application_form:
+                accumulator.result.rejected_documents[path.name] = "application form"
+                continue
+
+            final_decision = classify_drawing_source(
+                path.name,
+                document.first_page_text or first_page.text,
+            )
+            if not final_decision.eligible:
+                accumulator.result.rejected_documents[path.name] = final_decision.reason
+                continue
+
+            accumulator.result.eligible_documents.append(path.name)
+            if not _meaningful_text(document.text):
+                accumulator.result.unreadable_documents.append(path.name)
+                continue
+            accumulator.source_document = path.name
+            try:
+                extract_professional_details(document.text, path.name, accumulator)
+            finally:
+                accumulator.source_document = None
+            if all(
+                (
+                    accumulator.result.architect_company_names,
+                    accumulator.result.phone_numbers,
+                    accumulator.result.email_addresses,
+                    accumulator.result.company_addresses,
+                )
+            ):
+                break
         except Exception as exc:  # pragma: no cover - malformed live documents vary widely
             accumulator.result.rejected_documents[path.name] = f"read failed: {exc}"
             if log:
                 log(f"Could not read {path.name} for enrichment: {exc}")
-            continue
-        if document.application_form:
-            accumulator.result.rejected_documents[path.name] = "application form"
-            continue
-        accumulator.result.eligible_documents.append(path.name)
-        if not _meaningful_text(document.text):
-            accumulator.result.unreadable_documents.append(path.name)
-            continue
-        accumulator.source_document = path.name
-        try:
-            extract_professional_details(document.text, path.name, accumulator)
         finally:
-            accumulator.source_document = None
-        if all(
-            (
-                accumulator.result.architect_company_names,
-                accumulator.result.phone_numbers,
-                accumulator.result.email_addresses,
-                accumulator.result.company_addresses,
-            )
-        ):
-            break
+            _close_pdf_cache(first_page)
 
     return accumulator.result
 
 
 def extract_pdf_first_page_text(path: Path) -> _PdfText:
-    return _extract_pdf_text(path, first_page_only=True)
+    cache = _open_pdf_cache(path)
+    _read_selectable_pages(cache, [0])
+    return _pdf_text_from_cache(path, cache, [0])
 
 
-def extract_pdf_text(path: Path) -> _PdfText:
-    return _extract_pdf_text(path, first_page_only=False)
+def extract_pdf_first_page_with_ocr(path: Path, first_page: _PdfText) -> _PdfText:
+    cache = first_page.cache or _open_pdf_cache(path)
+    _read_selectable_pages(cache, [0])
+    _ocr_cached_pages(path, cache, [0])
+    return _pdf_text_from_cache(path, cache, [0])
 
 
-def _extract_pdf_text(path: Path, *, first_page_only: bool) -> _PdfText:
-    page_text: dict[int, str] = {}
+def extract_pdf_text(
+    path: Path,
+    *,
+    first_page: _PdfText | None = None,
+) -> _PdfText:
+    cache = first_page.cache if first_page and first_page.cache else _open_pdf_cache(path)
+    page_indexes = _preferred_ocr_pages(cache.page_count)
+    _read_selectable_pages(cache, page_indexes)
+    _ocr_cached_pages(
+        path,
+        cache,
+        [
+            page_index
+            for page_index in page_indexes
+            if _needs_ocr(cache.page_text.get(page_index, ""))
+        ],
+    )
+    return _pdf_text_from_cache(path, cache, page_indexes)
+
+
+def _open_pdf_cache(path: Path) -> _PdfReadCache:
+    reader: object | None = None
     page_count = 0
     reader_error: Exception | None = None
-    page_indexes: list[int] = []
     try:
         reader = PdfReader(path, strict=False)
         if reader.is_encrypted:
             reader.decrypt("")
         page_count = len(reader.pages)
-        page_indexes = (
-            [0]
-            if first_page_only and page_count
-            else _preferred_ocr_pages(page_count)
-        )
-        for page_index in page_indexes:
-            try:
-                page_text[page_index] = reader.pages[page_index].extract_text() or ""
-            except Exception:
-                page_text[page_index] = ""
     except Exception as exc:
         reader_error = exc
 
     if not page_count:
         page_count = _pdfium_page_count(path)
-        page_indexes = (
-            [0]
-            if first_page_only and page_count
-            else _preferred_ocr_pages(page_count)
-        )
-    ocr_candidates = [
-        index
-        for index in page_indexes
-        if _needs_ocr(page_text.get(index, ""))
+    return _PdfReadCache(
+        reader=reader,
+        page_count=page_count,
+        reader_error=reader_error,
+    )
+
+
+def _read_selectable_pages(cache: _PdfReadCache, page_indexes: Iterable[int]) -> None:
+    if cache.reader is None:
+        return
+    for page_index in page_indexes:
+        if page_index in cache.page_text:
+            continue
+        try:
+            cache.page_text[page_index] = (
+                cache.reader.pages[page_index].extract_text() or ""
+            )
+        except Exception:
+            cache.page_text[page_index] = ""
+
+
+def _ocr_cached_pages(
+    path: Path,
+    cache: _PdfReadCache,
+    page_indexes: Iterable[int],
+) -> None:
+    candidates = [
+        page_index
+        for page_index in page_indexes
+        if page_index not in cache.ocr_attempted
     ]
-    ocr_text = _ocr_pdf_pages(path, ocr_candidates) if ocr_candidates else {}
+    if not candidates:
+        return
+    cache.ocr_attempted.update(candidates)
+    ocr_text = _ocr_pdf_pages(path, candidates)
     for index, text in ocr_text.items():
         if _meaningful_text(text):
-            page_text[index] = "\n".join(
-                value for value in (page_text.get(index, ""), text) if value
+            cache.page_text[index] = "\n".join(
+                value for value in (cache.page_text.get(index, ""), text) if value
             )
-    combined = "\n\n".join(page_text.get(index, "") for index in page_indexes).strip()
-    if not combined and reader_error:
-        raise reader_error
+
+
+def _pdf_text_from_cache(
+    path: Path,
+    cache: _PdfReadCache,
+    page_indexes: Iterable[int],
+) -> _PdfText:
+    indexes = list(page_indexes)
+    combined = "\n\n".join(
+        cache.page_text.get(index, "") for index in indexes
+    ).strip()
+    if not combined and cache.reader_error and not cache.page_count:
+        raise cache.reader_error
+    first_page_text = cache.page_text.get(0, "")
     return _PdfText(
         path=path,
         text=combined,
         application_form=is_application_form(path, combined),
-        ocr_pages=len(ocr_text),
+        ocr_pages=len(cache.ocr_attempted),
+        first_page_text=first_page_text,
+        cache=cache,
     )
+
+
+def _close_pdf_cache(document: _PdfText | None) -> None:
+    cache = document.cache if document else None
+    if not cache or cache.reader is None:
+        return
+    stream = getattr(cache.reader, "stream", None)
+    close = getattr(stream, "close", None)
+    if callable(close):
+        close()
+    cache.reader = None
 
 
 def is_application_form(path: Path, text: str) -> bool:

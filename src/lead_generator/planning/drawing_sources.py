@@ -32,7 +32,10 @@ NARRATIVE_PHRASES = (
     "consultations",
     "photograph", "photographs", "photos", "heritage statement",
     "management plan", "design access statement", "planning application appendix",
-    "das",
+    "environmental statement volume", "es vol", "es volume",
+    "non technical summary", "desk study",
+    "chapter", "figure", "figures", "summary", "study", "studies",
+    "justification", "cover", "contents", "das",
 )
 DRAWING_EVIDENCE_PATTERNS = (
     re.compile(r"(?i)\bdrawing\s*(?:no|number)\b"),
@@ -41,7 +44,15 @@ DRAWING_EVIDENCE_PATTERNS = (
     re.compile(r"(?i)\bdrawn\s+by\b"),
     re.compile(r"(?i)\bchecked\s+by\b"),
 )
-DRAWING_CODE_RE = re.compile(r"(?i)^(?=.*\d)[a-z0-9][a-z0-9._ -]{2,}$")
+DRAWING_CODE_RE = re.compile(
+    r"(?ix)"
+    r"^(?=.{3,48}$)"
+    r"(?=.*[a-z])"
+    r"(?=.*\d)"
+    r"(?=.*[-_.][a-z0-9]*\d[a-z0-9]*$)"
+    r"(?!.*(?:^|[-_.])(?:document|report|statement)(?:[-_.]|$))"
+    r"[a-z0-9]{1,8}(?:[-_.][a-z0-9]{1,8}){1,3}$"
+)
 TITLE_PAGE_LINE_LIMIT = 30
 TITLE_PAGE_TEXT_LIMIT = 3_000
 TITLE_BLOCK_WINDOW_LINES = 10
@@ -132,7 +143,7 @@ def classify_drawing_source(filename: str, text: str) -> DrawingSourceDecision:
         filename, title_lines
     )
     reason = "eligible drawing" if eligible else "drawing status/type evidence incomplete"
-    return DrawingSourceDecision(eligible, False, reason)
+    return DrawingSourceDecision(eligible, not eligible, reason)
 
 
 def is_existing_only_drawing_metadata(value: str) -> bool:
