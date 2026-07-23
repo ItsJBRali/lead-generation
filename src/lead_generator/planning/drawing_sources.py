@@ -24,13 +24,15 @@ NARRATIVE_PHRASES = (
     "strategies", "travel plan", "environmental statement",
     "landscape visual impact", "appendix", "appendices", "review", "reviews",
     "presentation", "presentations",
-    "external materials", "material schedule", "materials schedule",
+    "external material", "external materials", "material schedule",
+    "materials schedule",
     "drawing register", "cemp", "wms", "method statement", "letter",
     "notice", "notices", "certificate", "certificates", "schedule",
     "schedules", "specification", "specifications", "consultation",
     "consultations",
     "photograph", "photographs", "photos", "heritage statement",
-    "management plan", "design access statement", "das",
+    "management plan", "design access statement", "planning application appendix",
+    "das",
 )
 DRAWING_EVIDENCE_PATTERNS = (
     re.compile(r"(?i)\bdrawing\s*(?:no|number)\b"),
@@ -54,8 +56,19 @@ def _tokens(value: str) -> set[str]:
 
 
 def _has_narrative_marker(value: str) -> bool:
-    normalized = f" {_phrase_text(value)} "
-    return any(f" {_phrase_text(phrase)} " in normalized for phrase in NARRATIVE_PHRASES)
+    phrase_text = _phrase_text(value)
+    normalized = f" {phrase_text} "
+    compact = phrase_text.replace(" ", "")
+    for phrase in NARRATIVE_PHRASES:
+        normalized_phrase = _phrase_text(phrase)
+        if f" {normalized_phrase} " in normalized:
+            return True
+        if (
+            " " in normalized_phrase
+            and normalized_phrase.replace(" ", "") in compact
+        ):
+            return True
+    return False
 
 
 def _title_page_lines(text: str) -> list[str]:
@@ -68,18 +81,23 @@ def _title_page_lines(text: str) -> list[str]:
 
 
 def _has_ambiguous_drawing_evidence(filename: str, title_lines: list[str]) -> bool:
-    lines = [Path(filename).stem, *title_lines]
-    for start in range(len(lines)):
-        window = "\n".join(lines[start:start + TITLE_BLOCK_WINDOW_LINES])
+    filename_tokens = _tokens(Path(filename).stem)
+    filename_has_status = bool(filename_tokens & STATUS_TOKENS)
+    filename_has_drawing_type = bool(filename_tokens & DRAWING_TOKENS)
+    for start in range(len(title_lines)):
+        window = "\n".join(title_lines[start:start + TITLE_BLOCK_WINDOW_LINES])
         tokens = _tokens(window)
         evidence_count = sum(
             bool(pattern.search(window)) for pattern in DRAWING_EVIDENCE_PATTERNS
         )
-        has_drawing_type = bool(tokens & DRAWING_TOKENS) or bool(
-            DRAWING_EVIDENCE_PATTERNS[0].search(window)
+        has_status = filename_has_status or bool(tokens & STATUS_TOKENS)
+        has_drawing_type = (
+            filename_has_drawing_type
+            or bool(tokens & DRAWING_TOKENS)
+            or bool(DRAWING_EVIDENCE_PATTERNS[0].search(window))
         )
         if (
-            bool(tokens & STATUS_TOKENS)
+            has_status
             and has_drawing_type
             and evidence_count >= 2
         ):

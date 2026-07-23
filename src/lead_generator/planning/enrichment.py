@@ -400,6 +400,24 @@ def enrich_application_folder(
             continue
         try:
             if log:
+                log(f"Checking the first page of {path.name}")
+            first_page = extract_pdf_first_page_text(path)
+            if first_page.ocr_pages and log:
+                log(f"OCR read the first page of {path.name}")
+        except Exception as exc:  # pragma: no cover - malformed live documents vary widely
+            accumulator.result.rejected_documents[path.name] = f"read failed: {exc}"
+            if log:
+                log(f"Could not read {path.name} for enrichment: {exc}")
+            continue
+        if first_page.application_form:
+            accumulator.result.rejected_documents[path.name] = "application form"
+            continue
+        decision = classify_drawing_source(path.name, first_page.text)
+        if not decision.eligible:
+            accumulator.result.rejected_documents[path.name] = decision.reason
+            continue
+        try:
+            if log:
                 log(f"Reading {path.name} for professional contact details")
             document = extract_pdf_text(path)
             if document.ocr_pages and log:
@@ -412,10 +430,6 @@ def enrich_application_folder(
         if document.application_form:
             accumulator.result.rejected_documents[path.name] = "application form"
             continue
-        decision = classify_drawing_source(path.name, document.text)
-        if not decision.eligible:
-            accumulator.result.rejected_documents[path.name] = decision.reason
-            continue
         accumulator.result.eligible_documents.append(path.name)
         if not _meaningful_text(document.text):
             accumulator.result.unreadable_documents.append(path.name)
@@ -425,22 +439,45 @@ def enrich_application_folder(
             extract_professional_details(document.text, path.name, accumulator)
         finally:
             accumulator.source_document = None
+        if all(
+            (
+                accumulator.result.architect_company_names,
+                accumulator.result.phone_numbers,
+                accumulator.result.email_addresses,
+                accumulator.result.company_addresses,
+            )
+        ):
+            break
 
     return accumulator.result
 
 
+def extract_pdf_first_page_text(path: Path) -> _PdfText:
+    return _extract_pdf_text(path, first_page_only=True)
+
+
 def extract_pdf_text(path: Path) -> _PdfText:
+    return _extract_pdf_text(path, first_page_only=False)
+
+
+def _extract_pdf_text(path: Path, *, first_page_only: bool) -> _PdfText:
     page_text: dict[int, str] = {}
     page_count = 0
     reader_error: Exception | None = None
+    page_indexes: list[int] = []
     try:
         reader = PdfReader(path, strict=False)
         if reader.is_encrypted:
             reader.decrypt("")
         page_count = len(reader.pages)
-        for page_index, page in enumerate(reader.pages):
+        page_indexes = (
+            [0]
+            if first_page_only and page_count
+            else _preferred_ocr_pages(page_count)
+        )
+        for page_index in page_indexes:
             try:
-                page_text[page_index] = page.extract_text() or ""
+                page_text[page_index] = reader.pages[page_index].extract_text() or ""
             except Exception:
                 page_text[page_index] = ""
     except Exception as exc:
@@ -448,9 +485,14 @@ def extract_pdf_text(path: Path) -> _PdfText:
 
     if not page_count:
         page_count = _pdfium_page_count(path)
+        page_indexes = (
+            [0]
+            if first_page_only and page_count
+            else _preferred_ocr_pages(page_count)
+        )
     ocr_candidates = [
         index
-        for index in _preferred_ocr_pages(page_count)
+        for index in page_indexes
         if _needs_ocr(page_text.get(index, ""))
     ]
     ocr_text = _ocr_pdf_pages(path, ocr_candidates) if ocr_candidates else {}
@@ -459,7 +501,7 @@ def extract_pdf_text(path: Path) -> _PdfText:
             page_text[index] = "\n".join(
                 value for value in (page_text.get(index, ""), text) if value
             )
-    combined = "\n\n".join(page_text.get(index, "") for index in range(page_count)).strip()
+    combined = "\n\n".join(page_text.get(index, "") for index in page_indexes).strip()
     if not combined and reader_error:
         raise reader_error
     return _PdfText(
@@ -946,7 +988,15 @@ def _blocked_email(value: str) -> bool:
 
 
 def _normalise_phone(value: str) -> str:
-    if value.count("(") != value.count(")"):
+    parenthesis_depth = 0
+    for character in value:
+        if character == "(":
+            parenthesis_depth += 1
+        elif character == ")":
+            if parenthesis_depth == 0:
+                return ""
+            parenthesis_depth -= 1
+    if parenthesis_depth:
         return ""
     if re.search(r"\b\d{4,6}\.\d{3,}\b", value):
         return ""
@@ -987,13 +1037,14 @@ def _clean_professional_address(value: str | None) -> str:
             "not copied",
             "construction",
             "issued on",
-            "www.",
             "http://",
             "https://",
         )
     ):
         return ""
-    if re.search(r"(?i)\b(?:tel(?:ephone)?|phone|email|web)\s*:", address):
+    if re.search(r"(?i)\b(?:www|tel(?:ephone)?)\b", address):
+        return ""
+    if re.search(r"(?i)\b(?:phone|email|web)\s*:", address):
         return ""
     if EMAIL_RE.search(address) or PHONE_RE.search(address):
         return ""
@@ -1003,17 +1054,26 @@ def _clean_professional_address(value: str | None) -> str:
 
 
 def _similar_ocr_email(left: str, right: str) -> bool:
+    if left == right:
+        return True
     left_local, left_domain = left.rsplit("@", 1)
     right_local, right_domain = right.rsplit("@", 1)
-    if left_domain != right_domain or abs(len(left_local) - len(right_local)) > 1:
+    if left_domain != right_domain or len(left_local) != len(right_local):
         return False
-    if len(left_local) == len(right_local):
-        return sum(a != b for a, b in zip(left_local, right_local)) <= 1
-    shorter, longer = sorted((left_local, right_local), key=len)
-    for index in range(len(longer)):
-        if shorter == longer[:index] + longer[index + 1:]:
-            return True
-    return False
+    differences = [
+        index
+        for index, (left_character, right_character) in enumerate(
+            zip(left_local, right_local)
+        )
+        if left_character != right_character
+    ]
+    if differences != [0]:
+        return False
+    return frozenset((left_local[0], right_local[0])) in {
+        frozenset(("m", "n")),
+        frozenset(("i", "l")),
+        frozenset(("o", "0")),
+    }
 
 
 def _text_lines(text: str) -> list[str]:

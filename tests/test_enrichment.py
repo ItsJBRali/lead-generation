@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -128,6 +128,10 @@ def test_enrichment_uses_only_proposed_or_existing_drawings() -> None:
 
         with patch.object(
             enrichment,
+            "extract_pdf_first_page_text",
+            side_effect=lambda path: documents[path.name],
+        ), patch.object(
+            enrichment,
             "extract_pdf_text",
             side_effect=lambda path: documents[path.name],
         ):
@@ -187,7 +191,11 @@ def test_management_plan_never_enriches_even_with_drawing_markers() -> None:
         path.touch()
         document = _fake_pdf(path, text, application_form=False)
 
-        with patch.object(enrichment, "extract_pdf_text", return_value=document):
+        with patch.object(
+            enrichment,
+            "extract_pdf_first_page_text",
+            return_value=document,
+        ):
             result = enrichment.enrich_application_folder(folder)
 
     assert result.to_csv_row() == {
@@ -265,6 +273,130 @@ def test_later_report_body_drawing_references_cannot_make_document_eligible() ->
     assert classify_drawing_source("Document 123.pdf", text).eligible is False
 
 
+def test_sparse_first_page_cannot_be_rescued_by_second_page_drawing_text() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        folder = Path(directory)
+        path = folder / "Document 123.pdf"
+        path.touch()
+        first_page = _fake_pdf(
+            path,
+            "GENERAL DEVELOPMENT NOTES",
+            application_form=False,
+        )
+        full_document = _fake_pdf(
+            path,
+            "GENERAL DEVELOPMENT NOTES\n\n"
+            "PROPOSED SITE PLAN\nDRAWING NUMBER A-101\nSCALE 1:100",
+            application_form=False,
+        )
+
+        with (
+            patch.object(
+                enrichment,
+                "extract_pdf_first_page_text",
+                return_value=first_page,
+            ),
+            patch.object(
+                enrichment,
+                "extract_pdf_text",
+                return_value=full_document,
+            ) as extract_pdf_text,
+        ):
+            result = enrichment.enrich_application_folder(folder)
+
+    extract_pdf_text.assert_not_called()
+    assert result.eligible_documents == []
+    assert result.rejected_documents == {
+        "Document 123.pdf": "drawing status/type evidence incomplete"
+    }
+
+
+def test_clear_drawing_classification_ignores_second_page_narrative_marker() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        folder = Path(directory)
+        path = folder / "Proposed Elevations.pdf"
+        path.touch()
+        first_page = _fake_pdf(
+            path,
+            "PROPOSED ELEVATIONS\nDRAWING NUMBER A-201\nSCALE 1:100",
+            application_form=False,
+        )
+        full_document = _fake_pdf(
+            path,
+            "PROPOSED ELEVATIONS\nDRAWING NUMBER A-201\nSCALE 1:100\n\n"
+            "PLANNING STATEMENT\nStudio Arc Architects Ltd",
+            application_form=False,
+        )
+
+        with (
+            patch.object(
+                enrichment,
+                "extract_pdf_first_page_text",
+                return_value=first_page,
+            ),
+            patch.object(
+                enrichment,
+                "extract_pdf_text",
+                return_value=full_document,
+            ),
+        ):
+            result = enrichment.enrich_application_folder(folder)
+
+    assert result.eligible_documents == ["Proposed Elevations.pdf"]
+    assert result.rejected_documents == {}
+
+
+def test_rejected_ambiguous_pdf_never_invokes_full_document_extraction() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        folder = Path(directory)
+        path = folder / "Document 456.pdf"
+        path.touch()
+        first_page = _fake_pdf(path, "GENERAL NOTES", application_form=False)
+
+        with (
+            patch.object(
+                enrichment,
+                "extract_pdf_first_page_text",
+                return_value=first_page,
+            ),
+            patch.object(enrichment, "extract_pdf_text") as extract_pdf_text,
+        ):
+            result = enrichment.enrich_application_folder(folder)
+
+    extract_pdf_text.assert_not_called()
+    assert result.eligible_documents == []
+
+
+def test_first_page_reader_does_not_extract_or_ocr_later_pages() -> None:
+    path = Path("Document 789.pdf")
+    first_page = Mock()
+    first_page.extract_text.return_value = ""
+    second_page = Mock()
+    reader = Mock()
+    reader.is_encrypted = False
+    reader.pages = [first_page, second_page]
+    ocr_text = (
+        "PROPOSED SITE PLAN\nDRAWING NUMBER A-101\nSCALE 1:100\n"
+        "PROJECT TITLE RESIDENTIAL REDEVELOPMENT"
+    )
+
+    with (
+        patch.object(enrichment, "PdfReader", return_value=reader),
+        patch.object(
+            enrichment,
+            "_ocr_pdf_pages",
+            return_value={0: ocr_text},
+        ) as ocr_pdf_pages,
+    ):
+        document = enrichment.extract_pdf_first_page_text(path)
+
+    first_page.extract_text.assert_called_once_with()
+    second_page.extract_text.assert_not_called()
+    ocr_pdf_pages.assert_called_once_with(path, [0])
+    assert document.text == ocr_text
+    assert document.ocr_pages == 1
+
+
 def test_ambiguous_drawing_evidence_must_be_close_together_on_title_page() -> None:
     text = "\n".join(
         [
@@ -305,7 +437,11 @@ def test_misnamed_application_form_cannot_contribute_contact_details() -> None:
         form_path.touch()
         document = _fake_pdf(form_path, APPLICATION_FORM_TEXT, application_form=True)
 
-        with patch.object(enrichment, "extract_pdf_text", return_value=document):
+        with patch.object(
+            enrichment,
+            "extract_pdf_first_page_text",
+            return_value=document,
+        ):
             result = enrichment.enrich_application_folder(folder)
 
     assert result.to_csv_row() == {
@@ -329,7 +465,14 @@ def test_partial_drawing_contact_keeps_only_available_fields() -> None:
             "Architect: Example Studio Ltd\nstudio@example.co.uk",
             application_form=False,
         )
-        with patch.object(enrichment, "extract_pdf_text", return_value=document):
+        with (
+            patch.object(
+                enrichment,
+                "extract_pdf_first_page_text",
+                return_value=document,
+            ),
+            patch.object(enrichment, "extract_pdf_text", return_value=document),
+        ):
             row = enrichment.enrich_application_folder(folder).to_csv_row()
 
     assert row == {
@@ -337,6 +480,120 @@ def test_partial_drawing_contact_keeps_only_available_fields() -> None:
         "Phone Number": "Failed",
         "Email Address": "studio@example.co.uk",
         "Company Address": "Failed",
+    }
+
+
+def test_enrichment_stops_reading_pdfs_once_all_fields_are_complete() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        folder = Path(directory)
+        first_path = folder / "A Proposed Plan.pdf"
+        later_path = folder / "B Proposed Plan.pdf"
+        first_path.touch()
+        later_path.touch()
+        first_page = _fake_pdf(
+            first_path,
+            "PROPOSED PLAN\nDRAWING NUMBER P01\nSCALE 1:100",
+            application_form=False,
+        )
+        complete_document = _fake_pdf(
+            first_path,
+            "PROPOSED PLAN\nDRAWING NUMBER P01\nSCALE 1:100\n"
+            "Architect: Studio Arc Architects Ltd\n"
+            "020 7123 4567\nstudio@studioarc.co.uk\n"
+            "12 Design Road\nLondon\nSW1A 1AA",
+            application_form=False,
+        )
+
+        with (
+            patch.object(
+                enrichment,
+                "extract_pdf_first_page_text",
+                return_value=first_page,
+            ) as first_page_reader,
+            patch.object(
+                enrichment,
+                "extract_pdf_text",
+                return_value=complete_document,
+            ) as full_document_reader,
+        ):
+            result = enrichment.enrich_application_folder(folder)
+
+    first_page_reader.assert_called_once_with(first_path)
+    full_document_reader.assert_called_once_with(first_path)
+    assert result.eligible_documents == ["A Proposed Plan.pdf"]
+    assert result.field_sources == {
+        "Architect / Company Name": ["A Proposed Plan.pdf"],
+        "Phone Number": ["A Proposed Plan.pdf"],
+        "Email Address": ["A Proposed Plan.pdf"],
+        "Company Address": ["A Proposed Plan.pdf"],
+    }
+
+
+def test_enrichment_continues_reading_pdfs_while_fields_are_missing() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        folder = Path(directory)
+        first_path = folder / "A Proposed Plan.pdf"
+        second_path = folder / "B Proposed Plan.pdf"
+        first_path.touch()
+        second_path.touch()
+        first_pages = {
+            path.name: _fake_pdf(
+                path,
+                "PROPOSED PLAN\nDRAWING NUMBER P01\nSCALE 1:100",
+                application_form=False,
+            )
+            for path in (first_path, second_path)
+        }
+        full_documents = {
+            first_path.name: _fake_pdf(
+                first_path,
+                "PROPOSED PLAN\nDRAWING NUMBER P01\nSCALE 1:100\n"
+                "Architect: Studio Arc Architects Ltd\n"
+                "020 7123 4567\nstudio@studioarc.co.uk",
+                application_form=False,
+            ),
+            second_path.name: _fake_pdf(
+                second_path,
+                "PROPOSED PLAN\nDRAWING NUMBER P02\nSCALE 1:100\n"
+                "Architect: Studio Arc Architects Ltd\n"
+                "12 Design Road\nLondon\nSW1A 1AA",
+                application_form=False,
+            ),
+        }
+
+        with (
+            patch.object(
+                enrichment,
+                "extract_pdf_first_page_text",
+                side_effect=lambda path: first_pages[path.name],
+            ) as first_page_reader,
+            patch.object(
+                enrichment,
+                "extract_pdf_text",
+                side_effect=lambda path: full_documents[path.name],
+            ) as full_document_reader,
+        ):
+            result = enrichment.enrich_application_folder(folder)
+
+    assert [call.args[0] for call in first_page_reader.call_args_list] == [
+        first_path,
+        second_path,
+    ]
+    assert [call.args[0] for call in full_document_reader.call_args_list] == [
+        first_path,
+        second_path,
+    ]
+    assert result.to_csv_row() == {
+        "Architect / Company Name": "Studio Arc Architects Ltd",
+        "Phone Number": "020 7123 4567",
+        "Email Address": "studio@studioarc.co.uk",
+        "Company Address": "12 Design Road, London, SW1A 1AA",
+    }
+    assert result.field_sources == {
+        "Architect / Company Name": ["A Proposed Plan.pdf"],
+        "Phone Number": ["A Proposed Plan.pdf"],
+        "Email Address": ["A Proposed Plan.pdf"],
+        "Company Address": ["B Proposed Plan.pdf"],
     }
 
 
@@ -362,6 +619,10 @@ def test_malformed_date_like_and_invalid_area_phone_numbers_are_rejected(
     value: str,
 ) -> None:
     assert enrichment._normalise_phone(value) == ""
+
+
+def test_phone_parentheses_must_be_balanced_in_order() -> None:
+    assert enrichment._normalise_phone("0)1494 (123456") == ""
 
 
 @pytest.mark.parametrize(
@@ -440,7 +701,9 @@ def test_company_address_is_safely_trimmed_after_first_postcode() -> None:
         "London, SW1A 1AA",
         "construction. This drawing, 2 Design Road, London, SW1A 1AA",
         "Studio Arc Ltd, www.studioarc.co.uk, 3 Design Road, London, SW1A 1AA",
+        "Studio Arc Ltd, www studioarc co uk, 3 Design Road, London, SW1A 1AA",
         "Studio Arc Ltd, Tel: 020 7123 4567, 4 Design Road, London, SW1A 1AA",
+        "Studio Arc Ltd, Tel, 4 Design Road, London, SW1A 1AA",
         "Copyright notice SW1A 1AA Telephone 020 7123 4567",
     ],
 )
@@ -480,6 +743,18 @@ def test_one_character_ocr_email_variants_are_deduplicated_per_domain() -> None:
     accumulator.add_email("nichael@neoarchitects.co.uk")
 
     assert accumulator.result.email_addresses == ["michael@neoarchitects.co.uk"]
+
+
+def test_legitimate_close_same_domain_emails_remain_distinct() -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+
+    accumulator.add_email("john@example.com")
+    accumulator.add_email("joan@example.com")
+
+    assert accumulator.result.email_addresses == [
+        "john@example.com",
+        "joan@example.com",
+    ]
 
 
 def test_client_company_and_coordinates_are_rejected_from_drawing() -> None:
@@ -573,6 +848,46 @@ def test_ocr_company_spelling_variants_are_deduplicated() -> None:
     accumulator.add_name("Bucks Plo.nt Co.re Ltd")
 
     assert accumulator.result.architect_company_names == ["Bucks Plant Care Ltd"]
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "Proposed Travel Plans.pdf",
+        "Existing Travel Plans.pdf",
+        "Proposed Drawing Registers.pdf",
+        "Existing Drawing Registers.pdf",
+        "Proposed External Material Finishes Plan.pdf",
+        "Existing External Material Finishes Plan.pdf",
+        "Proposed ApplicationForm Drawing.pdf",
+        "Existing ApplicationForm Drawing.pdf",
+        "Proposed PlanningApplicationAppendix Drawings.pdf",
+        "Existing PlanningApplicationAppendix Drawings.pdf",
+    ],
+)
+def test_compact_and_plural_narrative_filenames_are_rejected(
+    filename: str,
+) -> None:
+    decision = preclassify_drawing_source(filename)
+
+    assert decision.eligible is False
+    assert decision.needs_text is False
+    assert classify_drawing_source(
+        filename,
+        "PROPOSED DRAWING\nDRAWING NUMBER A-101\nSCALE 1:100",
+    ).eligible is False
+
+
+def test_ambiguous_car_park_accepts_late_first_page_title_block_evidence() -> None:
+    text = "\n".join(
+        [
+            *(f"Project header {index}" for index in range(12)),
+            "DRAWING NUMBER 2411039",
+            "SCALE 1:500",
+        ]
+    )
+
+    assert classify_drawing_source("PROPOSED_CAR_PARK.pdf", text).eligible is True
 
 
 @pytest.mark.parametrize(
