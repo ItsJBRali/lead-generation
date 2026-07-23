@@ -15,10 +15,12 @@ from unittest.mock import patch
 
 from lxml import html
 
+import lead_generator.planning.leads as leads_module
 from lead_generator.planning.adapters.generic import GenericLabelledPlanningScraper
 from lead_generator.planning.enrichment import ContactEnrichment
 from lead_generator.planning.drawing_sources import is_existing_only_drawing_metadata
 from lead_generator.planning.leads import (
+    CouncilSearchCancelledError,
     CouncilSearchDegradedError,
     CouncilTarget,
     DocumentDownloadBatchResult,
@@ -29,6 +31,7 @@ from lead_generator.planning.leads import (
     DownloadedFile,
     LeadSearchConfig,
     _discover_planit_applications_serial,
+    _download_document_file,
     _download_pdf_documents_once,
     _open_url_with_retry,
     _throttle_request,
@@ -69,7 +72,7 @@ from lead_generator.planning.leads import (
     source_document_candidates,
 )
 from lead_generator.planning.models import PlanningApplication, PlanningDocument
-from lead_generator.planning.http import CouncilHttpClient
+from lead_generator.planning.http import CouncilFetchError, CouncilHttpClient
 
 
 def polygon_feature(name: str, xmin: float, ymin: float, xmax: float, ymax: float) -> dict[str, object]:
@@ -121,6 +124,11 @@ def write_search_fixture(root: Path, authorities: list[str]) -> tuple[Path, Path
 
 
 class LeadSearchTest(unittest.TestCase):
+    def setUp(self) -> None:
+        with leads_module._REQUEST_THROTTLE_LOCK:
+            leads_module._LAST_REQUEST_AT.clear()
+            leads_module._REQUEST_COOLDOWN_UNTIL.clear()
+
     def test_existing_only_drawing_metadata(self) -> None:
         assert is_existing_only_drawing_metadata("Existing elevations.pdf")
         assert not is_existing_only_drawing_metadata("Existing survey report.pdf")
@@ -942,7 +950,7 @@ class LeadSearchTest(unittest.TestCase):
             )
             events: list[str] = []
 
-            def fake_discover(target, start_date, end_date):
+            def fake_discover(target, start_date, end_date, *, should_cancel=None):
                 events.append(f"search:{target.authority}")
                 suffix = target.authority[-1]
                 return [
@@ -958,7 +966,7 @@ class LeadSearchTest(unittest.TestCase):
                     )
                 ]
 
-            def fake_document_discovery(application):
+            def fake_document_discovery(application, *, should_cancel=None):
                 return DocumentDiscoveryResult(documents=[
                     PlanningDocument(
                         title=f"{application.reference}.pdf",
@@ -1017,7 +1025,7 @@ class LeadSearchTest(unittest.TestCase):
             ]
             events: list[str] = []
 
-            def fake_document_discovery(application):
+            def fake_document_discovery(application, *, should_cancel=None):
                 return DocumentDiscoveryResult(documents=[
                     PlanningDocument(
                         title=f"{application.reference}.pdf",
@@ -1523,7 +1531,7 @@ class LeadSearchTest(unittest.TestCase):
 
             broken_attempts = 0
 
-            def fake_discover(target, start_date, end_date):
+            def fake_discover(target, start_date, end_date, *, should_cancel=None):
                 nonlocal broken_attempts
                 if target.authority == "Broken Council":
                     broken_attempts += 1
@@ -1663,7 +1671,7 @@ class LeadSearchTest(unittest.TestCase):
                 worker_count=1,
             )
 
-            def fake_discover(target, start_date, end_date):
+            def fake_discover(target, start_date, end_date, *, should_cancel=None):
                 if target.authority == "Broken Council":
                     raise RuntimeError("portal exploded")
                 if target.authority == "Empty Council":
@@ -1687,7 +1695,7 @@ class LeadSearchTest(unittest.TestCase):
                     ),
                 ]
 
-            def fake_document_discovery(application):
+            def fake_document_discovery(application, *, should_cancel=None):
                 return DocumentDiscoveryResult(documents=[
                     PlanningDocument(
                         title="Proposed plan.pdf",
@@ -1803,7 +1811,7 @@ class LeadSearchTest(unittest.TestCase):
             )
             started: list[str] = []
 
-            def fake_discover(target, start_date, end_date):
+            def fake_discover(target, start_date, end_date, *, should_cancel=None):
                 started.append(target.authority)
                 return []
 
@@ -1865,7 +1873,7 @@ class LeadSearchTest(unittest.TestCase):
             calls: list[str] = []
             rate_limited_attempts = 0
 
-            def fake_discover(target, start_date, end_date):
+            def fake_discover(target, start_date, end_date, *, should_cancel=None):
                 nonlocal rate_limited_attempts
                 calls.append(target.authority)
                 if target.authority == "Rate Limited":
@@ -1944,7 +1952,7 @@ class LeadSearchTest(unittest.TestCase):
             calls: list[str] = []
             logs: list[str] = []
 
-            def fake_discover(target, start_date, end_date):
+            def fake_discover(target, start_date, end_date, *, should_cancel=None):
                 calls.append(target.authority)
                 if target.authority == "Stuck Council":
                     release_stuck_searches.wait(timeout=2)
@@ -2040,6 +2048,35 @@ class LeadSearchTest(unittest.TestCase):
 
         self.assertEqual(applications, [])
 
+    def test_council_deadline_propagates_attempt_cancellation_to_discovery(self) -> None:
+        target = CouncilTarget(
+            authority="Cancelable Council",
+            portal_family="custom",
+            scraper_type="Custom",
+            base_url="https://planning.example.gov.uk",
+            listing_url="https://planning.example.gov.uk/search",
+            geometry={},
+        )
+        received_callbacks = []
+
+        def discover(*args, should_cancel=None, **kwargs):
+            received_callbacks.append(should_cancel)
+            return []
+
+        with patch(
+            "lead_generator.planning.leads.discover_portal_applications",
+            side_effect=discover,
+        ):
+            applications = discover_portal_applications_with_deadline(
+                target,
+                date(2026, 7, 6),
+                date(2026, 7, 12),
+            )
+
+        self.assertEqual(applications, [])
+        self.assertEqual(len(received_callbacks), 1)
+        self.assertTrue(callable(received_callbacks[0]))
+
     def test_run_lead_search_caps_configured_worker_count_at_eight(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2092,7 +2129,7 @@ class LeadSearchTest(unittest.TestCase):
             first_batch_ready = threading.Event()
             release_workers = threading.Event()
 
-            def fake_discover(target, start_date, end_date):
+            def fake_discover(target, start_date, end_date, *, should_cancel=None):
                 nonlocal active, max_active
                 with lock:
                     started.append(target.authority)
@@ -2304,6 +2341,29 @@ class LeadSearchTest(unittest.TestCase):
                     list(iter_document_links(html.fromstring(markup), page_url)),
                     [("/files/proposed-elevations.pdf", "Proposed elevations")],
                 )
+
+    def test_suffixed_associated_document_label_is_source_only(self) -> None:
+        page_url = "https://planning.example.test/application/ABC123"
+        markup = """
+            <html><body>
+              <a href="/planning/planning-documents?reference=ABC123">
+                Click to view associated documents (opens in new window)
+              </a>
+              <a href="/files/proposed-elevations.pdf">Proposed elevations</a>
+            </body></html>
+        """
+
+        self.assertEqual(
+            _associated_document_source_urls(markup, page_url),
+            [
+                "https://planning.example.test/planning/"
+                "planning-documents?reference=ABC123"
+            ],
+        )
+        self.assertEqual(
+            list(iter_document_links(html.fromstring(markup), page_url)),
+            [("/files/proposed-elevations.pdf", "Proposed elevations")],
+        )
 
     def test_associated_document_sources_ignore_page_chrome(self) -> None:
         page_url = "https://planning.example.test/application/ABC123"
@@ -2806,6 +2866,132 @@ class LeadSearchTest(unittest.TestCase):
         self.assertEqual(result.transient_documents, rate_limited)
         self.assertEqual(result.downloaded_count, 1)
 
+    def test_real_first_pass_429_releases_slot_for_unrelated_host(self) -> None:
+        limited_first = PlanningDocument(
+            title="First limited plan.pdf",
+            url="https://limited.example.gov.uk/docs/first.pdf",
+        )
+        limited_second = PlanningDocument(
+            title="Second limited plan.pdf",
+            url="https://limited.example.gov.uk/docs/second.pdf",
+        )
+        available = PlanningDocument(
+            title="Available plan.pdf",
+            url="https://available.example.gov.uk/docs/available.pdf",
+        )
+        cooldown_recorded = threading.Event()
+        second_waiting = threading.Event()
+        release_waits = threading.Event()
+        available_started = threading.Event()
+        results: dict[str, DocumentDownloadBatchResult] = {}
+
+        class FakeResponse:
+            headers = {"Content-Type": "application/pdf"}
+
+            def __init__(self, url: str) -> None:
+                self.url = url
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return b"%PDF-available"
+
+            def geturl(self) -> str:
+                return self.url
+
+        class HostAwareOpener:
+            def open(self, request, timeout):
+                if "limited.example.gov.uk" in request.full_url:
+                    raise HTTPError(
+                        request.full_url,
+                        429,
+                        "Too Many Requests",
+                        {},
+                        None,
+                    )
+                available_started.set()
+                return FakeResponse(request.full_url)
+
+        original_set_cooldown = leads_module._set_request_cooldown
+
+        def record_cooldown(url: str, seconds: float) -> None:
+            original_set_cooldown(url, seconds)
+            cooldown_recorded.set()
+
+        def controlled_wait(seconds: float, should_cancel) -> bool:
+            if threading.current_thread().name == "limited-second":
+                second_waiting.set()
+            return release_waits.wait(timeout=2.0)
+
+        def run_batch(name: str, document: PlanningDocument, destination: Path) -> None:
+            results[name] = _download_pdf_documents_once(
+                [document],
+                destination,
+                defer_transient=True,
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            destinations = {
+                name: root / name
+                for name in ("limited-first", "limited-second", "available")
+            }
+            for destination in destinations.values():
+                destination.mkdir()
+            with (
+                patch(
+                    "lead_generator.planning.leads._build_document_opener",
+                    return_value=HostAwareOpener(),
+                ),
+                patch(
+                    "lead_generator.planning.leads._REQUEST_COOLDOWN_UNTIL",
+                    {},
+                ),
+                patch("lead_generator.planning.leads._LAST_REQUEST_AT", {}),
+                patch(
+                    "lead_generator.planning.leads._set_request_cooldown",
+                    side_effect=record_cooldown,
+                ),
+                patch(
+                    "lead_generator.planning.leads._wait_for_cancelable_delay",
+                    side_effect=controlled_wait,
+                ),
+            ):
+                first = threading.Thread(
+                    target=run_batch,
+                    args=("limited-first", limited_first, destinations["limited-first"]),
+                    name="limited-first",
+                )
+                second = threading.Thread(
+                    target=run_batch,
+                    args=("limited-second", limited_second, destinations["limited-second"]),
+                    name="limited-second",
+                )
+                third = threading.Thread(
+                    target=run_batch,
+                    args=("available", available, destinations["available"]),
+                    name="available",
+                )
+                first.start()
+                self.assertTrue(cooldown_recorded.wait(timeout=1.0))
+                second.start()
+                self.assertTrue(second_waiting.wait(timeout=1.0))
+                third.start()
+                try:
+                    self.assertTrue(available_started.wait(timeout=0.5))
+                finally:
+                    release_waits.set()
+                    for worker in (first, second, third):
+                        worker.join(timeout=2.0)
+
+        self.assertEqual(results["limited-first"].transient_documents, [limited_first])
+        self.assertEqual(results["limited-second"].transient_documents, [limited_second])
+        self.assertEqual(results["available"].downloaded_count, 1)
+
     def test_document_batch_reuses_identical_payload_in_same_folder(self) -> None:
         documents = [
             PlanningDocument(
@@ -3067,7 +3253,6 @@ class LeadSearchTest(unittest.TestCase):
                 return_value=True,
             ) as wait,
             patch("lead_generator.planning.leads._set_request_cooldown") as set_cooldown,
-            patch("lead_generator.planning.leads._clear_request_cooldown") as clear_cooldown,
         ):
             with self.assertRaises(HTTPError):
                 download_document_file(document, opener=opener)
@@ -3078,7 +3263,6 @@ class LeadSearchTest(unittest.TestCase):
             [(document.url, 60.0), (document.url, 60.0)],
         )
         wait.assert_called_once_with(60.0, None)
-        clear_cooldown.assert_called_once_with(document.url)
 
     def test_source_page_429_uses_rate_limit_policy_and_keeps_final_cooldown(self) -> None:
         url = "https://planning.example.gov.uk/documents/ABC123"
@@ -3101,7 +3285,6 @@ class LeadSearchTest(unittest.TestCase):
                 return_value=True,
             ) as wait,
             patch("lead_generator.planning.leads._set_request_cooldown") as set_cooldown,
-            patch("lead_generator.planning.leads._clear_request_cooldown") as clear_cooldown,
         ):
             with self.assertRaises(HTTPError):
                 _open_url_with_retry(request, timeout=30, opener=opener)
@@ -3115,7 +3298,53 @@ class LeadSearchTest(unittest.TestCase):
             [entry.args for entry in wait.call_args_list],
             [(60.0, None)] * 3,
         )
-        self.assertEqual(clear_cooldown.call_count, 3)
+
+    def test_document_discovery_rate_limit_wait_propagates_cancellation(self) -> None:
+        source_url = "https://planning.example.gov.uk/documents/ABC123"
+        application = PlanningApplication(
+            authority="Example",
+            uid="ABC123",
+            url=source_url,
+            reference="ABC123",
+            raw={"docs_url": source_url},
+        )
+        cancel_checks = 0
+
+        def should_cancel() -> bool:
+            nonlocal cancel_checks
+            cancel_checks += 1
+            return cancel_checks >= 2
+
+        class RateLimitedOpener:
+            def open(self, request, timeout):
+                raise HTTPError(
+                    request.full_url,
+                    429,
+                    "Too Many Requests",
+                    {"Retry-After": "120"},
+                    None,
+                )
+
+        with (
+            patch(
+                "lead_generator.planning.leads._build_document_opener",
+                return_value=RateLimitedOpener(),
+            ),
+            patch("lead_generator.planning.leads._REQUEST_COOLDOWN_UNTIL", {}),
+            patch("lead_generator.planning.leads._LAST_REQUEST_AT", {}),
+            patch("lead_generator.planning.leads._throttle_request"),
+            patch(
+                "lead_generator.planning.leads._wait_for_cancelable_delay",
+                wraps=leads_module._wait_for_cancelable_delay,
+            ) as wait,
+        ):
+            with self.assertRaises(DocumentDownloadCancelledError):
+                discover_application_documents(
+                    application,
+                    should_cancel=should_cancel,
+                )
+
+        wait.assert_called_once_with(120.0, should_cancel)
 
     def test_document_429_retry_after_is_bounded_at_120_seconds(self) -> None:
         document = PlanningDocument(
@@ -3156,12 +3385,215 @@ class LeadSearchTest(unittest.TestCase):
                 return_value=True,
             ) as wait,
             patch("lead_generator.planning.leads._set_request_cooldown"),
-            patch("lead_generator.planning.leads._clear_request_cooldown"),
         ):
             payload = download_document_file(document, opener=opener).payload
 
         self.assertEqual(payload, b"%PDF-1.4")
         wait.assert_called_once_with(120.0, None)
+
+    def test_final_pass_retained_cooldown_wait_is_bounded_and_cancelable(self) -> None:
+        document = PlanningDocument(
+            title="Proposed plan.pdf",
+            url="https://planning.example.gov.uk/docs/proposed-plan.pdf",
+        )
+
+        class RateLimitedOpener:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def open(self, request, timeout):
+                self.calls += 1
+                raise HTTPError(
+                    request.full_url,
+                    429,
+                    "Too Many Requests",
+                    {"Retry-After": "999"},
+                    None,
+                )
+
+        opener = RateLimitedOpener()
+        cancel_checks = 0
+
+        def should_cancel() -> bool:
+            nonlocal cancel_checks
+            cancel_checks += 1
+            return cancel_checks >= 3
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch(
+                "lead_generator.planning.leads._build_document_opener",
+                return_value=opener,
+            ),
+            patch("lead_generator.planning.leads._REQUEST_COOLDOWN_UNTIL", {}),
+            patch("lead_generator.planning.leads._LAST_REQUEST_AT", {}),
+            patch(
+                "lead_generator.planning.leads._wait_for_cancelable_delay",
+                wraps=leads_module._wait_for_cancelable_delay,
+            ) as wait,
+        ):
+            first_pass = _download_pdf_documents_once(
+                [document],
+                Path(directory),
+                defer_transient=True,
+            )
+            final_pass = _download_pdf_documents_once(
+                first_pass.transient_documents,
+                Path(directory),
+                should_cancel=should_cancel,
+                defer_transient=False,
+            )
+
+        self.assertEqual(opener.calls, 1)
+        self.assertEqual(first_pass.transient_documents, [document])
+        self.assertEqual(final_pass.downloaded_count, 0)
+        self.assertEqual(wait.call_count, 1)
+        waited_seconds, waited_callback = wait.call_args.args
+        self.assertLessEqual(waited_seconds, 120.0)
+        self.assertIs(waited_callback, should_cancel)
+
+    def test_overlapping_retry_cannot_remove_newer_host_cooldown(self) -> None:
+        document = PlanningDocument(
+            title="Proposed plan.pdf",
+            url="https://planning.example.gov.uk/docs/proposed-plan.pdf",
+        )
+        older_waiting = threading.Event()
+        release_older = threading.Event()
+        older_result: list[DownloadedFile] = []
+        older_errors: list[Exception] = []
+
+        class FakeResponse:
+            headers = {"Content-Type": "application/pdf"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return b"%PDF-1.4"
+
+        class OlderOpener:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def open(self, request, timeout):
+                self.calls += 1
+                if self.calls == 1:
+                    raise HTTPError(
+                        request.full_url,
+                        429,
+                        "Too Many Requests",
+                        {"Retry-After": "60"},
+                        None,
+                    )
+                return FakeResponse()
+
+        class NewerOpener:
+            def open(self, request, timeout):
+                raise HTTPError(
+                    request.full_url,
+                    429,
+                    "Too Many Requests",
+                    {"Retry-After": "120"},
+                    None,
+                )
+
+        def hold_older_wait(seconds: float, should_cancel) -> bool:
+            older_waiting.set()
+            return release_older.wait(timeout=2.0)
+
+        def run_older() -> None:
+            try:
+                older_result.append(
+                    _download_document_file(
+                        document,
+                        opener=OlderOpener(),
+                        defer_rate_limit=False,
+                    )
+                )
+            except Exception as exc:
+                older_errors.append(exc)
+
+        cooldowns: dict[str, float] = {}
+        with (
+            patch("lead_generator.planning.leads._REQUEST_COOLDOWN_UNTIL", cooldowns),
+            patch("lead_generator.planning.leads._LAST_REQUEST_AT", {}),
+            patch("lead_generator.planning.leads._throttle_request"),
+            patch(
+                "lead_generator.planning.leads._wait_for_cancelable_delay",
+                side_effect=hold_older_wait,
+            ),
+            patch(
+                "lead_generator.planning.leads.monotonic",
+                side_effect=[100.0, 101.0, 102.0],
+            ),
+        ):
+            older = threading.Thread(target=run_older)
+            older.start()
+            self.assertTrue(older_waiting.wait(timeout=1.0))
+            with self.assertRaises(HTTPError):
+                _download_document_file(
+                    document,
+                    opener=NewerOpener(),
+                    defer_rate_limit=True,
+                )
+            release_older.set()
+            older.join(timeout=2.0)
+
+        self.assertEqual(older_errors, [])
+        self.assertEqual(len(older_result), 1)
+        self.assertEqual(cooldowns["planning.example.gov.uk"], 221.0)
+
+    def test_browser_rate_limits_defer_host_without_first_pass_wait(self) -> None:
+        documents = [
+            PlanningDocument(
+                title=f"Browser plan {index}.pdf",
+                url=f"https://planning.example.gov.uk/index.html?fa=downloaddocument&id={index}",
+                source_url="https://planning.example.gov.uk/index.html?fa=getApplication&id=1",
+            )
+            for index in range(1, 3)
+        ]
+
+        for status in (429, 503):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                class RateLimitedBrowser:
+                    def __init__(self, timeout_seconds):
+                        pass
+
+                    def get(self, url):
+                        return object()
+
+                    def get_bytes(self, url):
+                        raise CouncilFetchError(f"HTTP {status} while fetching {url}")
+
+                    def close(self):
+                        pass
+
+                with (
+                    patch(
+                        "lead_generator.planning.leads.CouncilBrowserClient",
+                        RateLimitedBrowser,
+                    ),
+                    patch(
+                        "lead_generator.planning.leads._set_request_cooldown",
+                    ) as set_cooldown,
+                    patch(
+                        "lead_generator.planning.leads._wait_for_cancelable_delay",
+                    ) as wait,
+                ):
+                    result = _download_pdf_documents_once(
+                        documents,
+                        Path(directory),
+                        defer_transient=True,
+                    )
+
+                self.assertEqual(result.transient_documents, documents)
+                wait.assert_not_called()
+                if status == 429:
+                    set_cooldown.assert_called_once_with(documents[0].url, 60.0)
+                else:
+                    set_cooldown.assert_not_called()
 
     def test_host_cooldown_wait_is_cancelable(self) -> None:
         url = "https://planning.example.gov.uk/docs/proposed-plan.pdf"
@@ -3417,6 +3849,48 @@ class LeadSearchTest(unittest.TestCase):
                 self.assertEqual(downloaded.final_url, unverified_url)
                 self.assertEqual(discoveries, ["verified", "unverified"])
                 self.assertNotIn(("unverified", verified_url), opened)
+
+    def test_source_document_candidate_wait_propagates_cancellation(self) -> None:
+        source_url = "https://planning.example.gov.uk/application/ABC123"
+        document = PlanningDocument(
+            title="Proposed plan.pdf",
+            url="https://planning.example.gov.uk/docs/proposed-plan.pdf",
+            source_url=source_url,
+        )
+        cancel_checks = 0
+
+        def should_cancel() -> bool:
+            nonlocal cancel_checks
+            cancel_checks += 1
+            return cancel_checks >= 2
+
+        class RateLimitedOpener:
+            def open(self, request, timeout):
+                raise HTTPError(
+                    request.full_url,
+                    429,
+                    "Too Many Requests",
+                    {"Retry-After": "120"},
+                    None,
+                )
+
+        with (
+            patch("lead_generator.planning.leads._REQUEST_COOLDOWN_UNTIL", {}),
+            patch("lead_generator.planning.leads._LAST_REQUEST_AT", {}),
+            patch("lead_generator.planning.leads._throttle_request"),
+            patch(
+                "lead_generator.planning.leads._wait_for_cancelable_delay",
+                wraps=leads_module._wait_for_cancelable_delay,
+            ) as wait,
+        ):
+            with self.assertRaises(DocumentDownloadCancelledError):
+                source_document_candidates(
+                    document,
+                    RateLimitedOpener(),
+                    should_cancel=should_cancel,
+                )
+
+        wait.assert_called_once_with(120.0, should_cancel)
 
     def test_nested_enterprise_tls_failure_restarts_source_discovery_with_replacement_opener(self) -> None:
         source_url = (
@@ -4784,6 +5258,39 @@ class LeadSearchTest(unittest.TestCase):
 
         self.assertEqual(payload, {"records": []})
         sleep_mock.assert_called_once_with(3.0)
+
+    def test_fetch_json_rate_limit_wait_propagates_search_cancellation(self) -> None:
+        url = "https://www.planit.org.uk/api/applics/json"
+        cancel_checks = 0
+
+        def should_cancel() -> bool:
+            nonlocal cancel_checks
+            cancel_checks += 1
+            return cancel_checks >= 2
+
+        with (
+            patch(
+                "lead_generator.planning.leads.urlopen",
+                side_effect=HTTPError(
+                    url,
+                    429,
+                    "Too Many Requests",
+                    {"Retry-After": "120"},
+                    None,
+                ),
+            ),
+            patch("lead_generator.planning.leads._REQUEST_COOLDOWN_UNTIL", {}),
+            patch("lead_generator.planning.leads._LAST_REQUEST_AT", {}),
+            patch("lead_generator.planning.leads._throttle_request"),
+            patch(
+                "lead_generator.planning.leads._wait_for_cancelable_delay",
+                wraps=leads_module._wait_for_cancelable_delay,
+            ) as wait,
+        ):
+            with self.assertRaises(CouncilSearchCancelledError):
+                _fetch_json_with_retry(url, should_cancel=should_cancel)
+
+        wait.assert_called_once_with(120.0, should_cancel)
 
     def test_fetch_json_retries_planit_tls_verification_failure_with_compat_opener(self) -> None:
         class FakeResponse:

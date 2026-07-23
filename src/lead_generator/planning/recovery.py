@@ -403,8 +403,28 @@ def _existing_file_matches_document(path: Path, document: PlanningDocument) -> b
         return False
     if existing_base == expected_base:
         return True
-    collision_match = re.fullmatch(r"(.+)-([2-9]\d*)", existing_base)
-    return bool(collision_match and collision_match.group(1) == expected_base)
+    generated_identity = _generated_collision_saved_file_identity(path.name)
+    return bool(
+        generated_identity
+        and generated_identity[0] == expected_base
+        and _compatible_saved_extensions(
+            generated_identity[1],
+            expected_extensions,
+        )
+    )
+
+
+def _generated_collision_saved_file_identity(
+    value: str,
+) -> tuple[str, tuple[str, ...]] | None:
+    name = sanitize_path_part(Path(value.replace("\\", "/")).name).casefold()
+    match = re.fullmatch(
+        r"(.+(\.[a-z0-9]+))-([2-9]\d*)(\.[a-z0-9]+)",
+        name,
+    )
+    if not match or match.group(2) != match.group(4):
+        return None
+    return _saved_file_identity(f"{match.group(1)}{match.group(4)}")
 
 
 def _saved_file_identity(value: str) -> tuple[str, tuple[str, ...]]:

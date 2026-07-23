@@ -895,7 +895,7 @@ def test_extensionless_title_only_matches_existing_pdf(
     "existing_name",
     [
         "plan.pdf.PDF",
-        "plan-2.PDF",
+        "plan.pdf-2.PDF",
     ],
 )
 def test_recovery_matches_repeated_extension_and_generated_collision_name(
@@ -910,6 +910,19 @@ def test_recovery_matches_repeated_extension_and_generated_collision_name(
     )
 
     assert _existing_file_matches_document(existing, document)
+
+
+def test_recovery_does_not_treat_legitimate_numbered_file_as_collision(
+    tmp_path: Path,
+) -> None:
+    existing = tmp_path / "plan-2.pdf"
+    existing.write_bytes(b"%PDF-existing")
+    document = PlanningDocument(
+        "plan.pdf",
+        "https://docs.test/plan.pdf",
+    )
+
+    assert not _existing_file_matches_document(existing, document)
 
 
 def test_recovery_does_not_strip_collision_suffix_from_document_identity(
