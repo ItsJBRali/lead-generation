@@ -62,9 +62,9 @@ DRAWING_CODE_RE = re.compile(
     r"(?=.*[-_.][a-z0-9]*\d[a-z0-9]*$)"
     r"(?!.*(?:^|[-_.])(?:document|report|statement)(?:[-_.]|$))"
     r"(?:"
-    r"[a-z0-9]{1,8}(?:[-_.][a-z0-9]{1,8}){1,3}"
+    r"(?:[a-z]{1,3}|[0-9]{1,8})(?:[-_.][a-z0-9]{1,8}){1,3}"
     r"|"
-    r"[a-z0-9]{1,8}(?:[-_.][a-z0-9]{1,8}){3,9}"
+    r"(?:[a-z]{1,3}|[0-9]{1,8})(?:[-_.][a-z0-9]{1,8}){3,9}"
     r"[-_.](?=[a-z0-9]*[a-z])(?=[a-z0-9]*\d)[a-z0-9]{2,8}"
     r")$"
 )
@@ -113,6 +113,31 @@ def _title_page_lines(text: str) -> list[str]:
         *lines[:TITLE_PAGE_START_LINE_LIMIT],
         *lines[-TITLE_PAGE_END_LINE_LIMIT:],
     ]
+
+
+def _has_title_narrative_marker(text: str) -> bool:
+    for line in text.splitlines():
+        normalized_line = _phrase_text(line)
+        line_words = normalized_line.split()
+        compact_line = normalized_line.replace(" ", "")
+        for phrase in TITLE_NARRATIVE_PHRASES:
+            normalized_phrase = _phrase_text(phrase)
+            phrase_words = normalized_phrase.split()
+            is_short_title = len(line_words) <= len(phrase_words) + 4
+            if normalized_line == normalized_phrase:
+                return True
+            if is_short_title and (
+                normalized_line.startswith(f"{normalized_phrase} ")
+                or normalized_line.endswith(f" {normalized_phrase}")
+            ):
+                return True
+            if (
+                is_short_title
+                and len(phrase_words) > 1
+                and normalized_phrase.replace(" ", "") in compact_line
+            ):
+                return True
+    return False
 
 
 def _has_ambiguous_drawing_evidence(filename: str, title_lines: list[str]) -> bool:
@@ -170,9 +195,8 @@ def classify_drawing_source(filename: str, text: str) -> DrawingSourceDecision:
         for line in text.splitlines()[:TITLE_HEADING_LINE_LIMIT]
         if line.strip()
     )
-    if _has_narrative_marker(Path(filename).stem) or _has_narrative_marker(
-        heading_text,
-        TITLE_NARRATIVE_PHRASES,
+    if _has_narrative_marker(Path(filename).stem) or _has_title_narrative_marker(
+        heading_text
     ):
         return DrawingSourceDecision(False, False, "narrative document marker")
     filename_tokens = _tokens(Path(filename).stem)

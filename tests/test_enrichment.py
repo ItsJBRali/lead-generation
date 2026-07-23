@@ -672,6 +672,22 @@ def test_valid_company_name_remains_accepted_after_noise_filtering() -> None:
     assert accumulator.result.architect_company_names == ["NEO Architects"]
 
 
+def test_leading_copyright_symbol_is_removed_from_valid_company_name() -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+
+    accumulator.add_name("\u00a9 KSR Architects")
+
+    assert accumulator.result.architect_company_names == ["KSR Architects"]
+
+
+def test_two_letter_drawing_label_is_not_accepted_as_a_company_name() -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+
+    accumulator.add_name("AD")
+
+    assert accumulator.result.architect_company_names == []
+
+
 def test_company_address_is_safely_trimmed_after_first_postcode() -> None:
     accumulator = enrichment._Accumulator(enrichment._Exclusions())
 
@@ -736,6 +752,24 @@ def test_one_character_ocr_email_variants_are_deduplicated_per_domain() -> None:
     assert accumulator.result.email_addresses == ["michael@neoarchitects.co.uk"]
 
 
+@pytest.mark.parametrize(
+    "values",
+    [
+        ("home@desewing.com", "ehome@desewing.com"),
+        ("ehome@desewing.com", "home@desewing.com"),
+    ],
+)
+def test_leading_character_ocr_email_variant_keeps_shorter_address(
+    values: tuple[str, str],
+) -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+
+    for value in values:
+        accumulator.add_email(value)
+
+    assert accumulator.result.email_addresses == ["home@desewing.com"]
+
+
 def test_legitimate_close_same_domain_emails_remain_distinct() -> None:
     accumulator = enrichment._Accumulator(enrichment._Exclusions())
 
@@ -782,6 +816,36 @@ def test_site_address_similarity_rejects_reformatted_site_address() -> None:
     accumulator.add_address("David and Tamsyn Cowie, Umbrook Farm, Ashill, EX15 3LZ")
 
     assert accumulator.result.company_addresses == []
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "of NEO Architects., NEO Archltects, New Barnet, 105a Park Road, EN4 9QR",
+        "architects+, interiors, First Floor, Buoks HP7 9PN",
+        "NMA - Landscape plan, 4909 Stage 5, WSM RFC, Sunnyside Road, WSM, BS23 3PA",
+    ],
+)
+def test_title_block_fragments_are_not_accepted_as_company_addresses(
+    value: str,
+) -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+
+    accumulator.add_address(value)
+
+    assert accumulator.result.company_addresses == []
+
+
+def test_studio_ocr_zero_is_corrected_in_company_address() -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+
+    accumulator.add_address(
+        "Architectural Studi0, 26 Friday Street, Minehead, Somerset, TA24 5UE"
+    )
+
+    assert accumulator.result.company_addresses == [
+        "Architectural Studio, 26 Friday Street, Minehead, Somerset, TA24 5UE"
+    ]
 
 
 def test_missing_values_are_marked_failed_individually() -> None:
@@ -911,6 +975,19 @@ def test_drawing_annotation_does_not_trigger_narrative_rejection() -> None:
     assert classify_drawing_source("Proposed Site Plan.pdf", text).eligible is True
 
 
+def test_drawing_report_instruction_does_not_trigger_narrative_rejection() -> None:
+    text = "\n".join(
+        [
+            "PROPOSED SITE PLAN",
+            "DRAWING NUMBER P-101",
+            "SCALE 1:100",
+            "REPORT ANY DISCREPANCIES TO THE ARCHITECT BEFORE PROCEEDING",
+        ]
+    )
+
+    assert classify_drawing_source("Proposed Site Plan.pdf", text).eligible is True
+
+
 @pytest.mark.parametrize(
     ("filename", "text", "eligible"),
     [
@@ -983,6 +1060,8 @@ def test_live_narrative_filename_families_are_rejected_before_reading(
         "Agenda-2026.pdf",
         "Minutes-123.pdf",
         "Brochure-123.pdf",
+        "Meeting-2026.pdf",
+        "Budget-2026.pdf",
     ],
 )
 def test_arbitrary_numbered_documents_are_not_drawing_code_candidates(
@@ -1233,4 +1312,38 @@ def test_malformed_page_tree_closes_reader_cache() -> None:
     assert result.eligible_documents == []
     assert result.rejected_documents == {
         "Proposed Plan.pdf": "read failed: broken page tree"
+    }
+
+
+def test_reader_cache_closes_when_both_page_count_readers_fail() -> None:
+    class BrokenReader:
+        is_encrypted = False
+
+        def __init__(self) -> None:
+            self.stream = Mock()
+
+        @property
+        def pages(self):
+            raise ValueError("broken page tree")
+
+    with tempfile.TemporaryDirectory() as directory:
+        folder = Path(directory)
+        path = folder / "Proposed Plan.pdf"
+        path.touch()
+        reader = BrokenReader()
+
+        with (
+            patch.object(enrichment, "PdfReader", return_value=reader),
+            patch.object(
+                enrichment,
+                "_pdfium_page_count",
+                side_effect=RuntimeError("pdfium failed"),
+            ),
+        ):
+            result = enrichment.enrich_application_folder(folder)
+
+    reader.stream.close.assert_called_once_with()
+    assert result.eligible_documents == []
+    assert result.rejected_documents == {
+        "Proposed Plan.pdf": "read failed: pdfium failed"
     }

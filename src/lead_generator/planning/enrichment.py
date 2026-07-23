@@ -328,6 +328,7 @@ class _Accumulator:
 
     def add_name(self, value: str | None) -> None:
         value = _clean_candidate(value)
+        value = re.sub(r"^(?:\u00c2\s*)?[\u00a9\u00ae]\s*", "", value).strip()
         if (
             not value
             or _is_name_noise(value)
@@ -357,10 +358,12 @@ class _Accumulator:
         if value.startswith("email-"):
             value = value.removeprefix("email-")
         if value and not _blocked_email(value):
-            if any(
-                _similar_ocr_email(value, existing)
-                for existing in self.result.email_addresses
-            ):
+            for index, existing in enumerate(self.result.email_addresses):
+                if not _similar_ocr_email(value, existing):
+                    continue
+                if _prefer_shorter_ocr_email(value, existing):
+                    self.result.email_addresses[index] = value
+                    self._record_source("Email Address")
                 return
             self.result.email_addresses.append(value)
             self._record_source("Email Address")
@@ -533,7 +536,17 @@ def _open_pdf_cache(path: Path) -> _PdfReadCache:
         reader_error = exc
 
     if not page_count:
-        page_count = _pdfium_page_count(path)
+        try:
+            page_count = _pdfium_page_count(path)
+        except Exception:
+            _close_pdf_read_cache(
+                _PdfReadCache(
+                    reader=reader,
+                    page_count=0,
+                    reader_error=reader_error,
+                )
+            )
+            raise
     return _PdfReadCache(
         reader=reader,
         page_count=page_count,
@@ -929,6 +942,8 @@ def _is_name_noise(value: str) -> bool:
     folded = _clean_candidate(value).casefold()
     if not folded or any(marker in folded for marker in NAME_NOISE_MARKERS):
         return True
+    if len(re.sub(r"[^a-z0-9]", "", folded)) <= 2:
+        return True
     if folded in {"studio", "group limited", "group ltd"}:
         return True
     if folded.startswith("of "):
@@ -1124,11 +1139,16 @@ def _normalise_phone(value: str) -> str:
 
 def _clean_professional_address(value: str | None) -> str:
     value = _clean_candidate(value)
+    value = re.sub(r"(?i)\bstudi0\b", "Studio", value)
     postcode_match = POSTCODE_RE.search(value)
     if not value or not postcode_match:
         return ""
     address = value[:postcode_match.end()].strip(" ,;:-")
     folded = address.casefold()
+    if folded.startswith("of "):
+        return ""
+    if re.match(r"^(?:architects?|architecture|interiors?)\s*[+,;:]", folded):
+        return ""
     if any(
         marker in folded
         for marker in (
@@ -1141,6 +1161,7 @@ def _clean_professional_address(value: str | None) -> str:
             "issued on",
             "http://",
             "https://",
+            "landscape plan",
         )
     ):
         return ""
@@ -1160,7 +1181,12 @@ def _similar_ocr_email(left: str, right: str) -> bool:
         return True
     left_local, left_domain = left.rsplit("@", 1)
     right_local, right_domain = right.rsplit("@", 1)
-    if left_domain != right_domain or len(left_local) != len(right_local):
+    if left_domain != right_domain:
+        return False
+    if abs(len(left_local) - len(right_local)) == 1:
+        longer, shorter = sorted((left_local, right_local), key=len, reverse=True)
+        return longer[0] in {"e", "i", "l", "o", "0"} and longer[1:] == shorter
+    if len(left_local) != len(right_local):
         return False
     differences = [
         index
@@ -1176,6 +1202,17 @@ def _similar_ocr_email(left: str, right: str) -> bool:
         frozenset(("i", "l")),
         frozenset(("o", "0")),
     }
+
+
+def _prefer_shorter_ocr_email(candidate: str, existing: str) -> bool:
+    candidate_local, candidate_domain = candidate.rsplit("@", 1)
+    existing_local, existing_domain = existing.rsplit("@", 1)
+    return (
+        candidate_domain == existing_domain
+        and len(candidate_local) + 1 == len(existing_local)
+        and existing_local[0] in {"e", "i", "l", "o", "0"}
+        and existing_local[1:] == candidate_local
+    )
 
 
 def _text_lines(text: str) -> list[str]:
