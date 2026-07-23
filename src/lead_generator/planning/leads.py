@@ -1879,6 +1879,11 @@ def discover_application_documents(
         document for document in result.documents if _looks_like_downloadable_document(document)
     ]
     if not usable_documents and (application.raw or {}).get("portal_family") == "tascomi":
+        if (
+            defer_rate_limit
+            and _request_cooldown_remaining_seconds(application.url) > 0
+        ):
+            return result
         browser_source = normalize_url(application.url)
         successful_source_count = len(result.successful_sources)
         browser_documents = _record_document_source(
@@ -2397,9 +2402,17 @@ def _download_pdf_documents_once(
             if browser is None:
                 browser = CouncilBrowserClient(timeout_seconds=60)
             if document.source_url and browser_source_url != document.source_url:
-                browser.get(document.source_url)
+                try:
+                    browser.get(document.source_url)
+                except CouncilFetchError as exc:
+                    exc.url = document.source_url
+                    raise
                 browser_source_url = document.source_url
-            response = browser.get_bytes(document.url)
+            try:
+                response = browser.get_bytes(document.url)
+            except CouncilFetchError as exc:
+                exc.url = document.url
+                raise
             downloaded_file = DownloadedFile(
                 payload=response.body,
                 final_url=response.url,
@@ -2457,13 +2470,13 @@ def _download_pdf_documents_once(
                     if isinstance(exc, DocumentDownloadCancelledError):
                         break
                     browser_status = _council_fetch_http_status(exc)
+                    error_url = str(getattr(exc, "url", "") or "")
                     if browser_status == 429:
                         _set_request_cooldown(
-                            document.url,
+                            error_url or document.url,
                             RATE_LIMIT_DEFAULT_RETRY_DELAY_SECONDS,
                         )
                     if _is_transient_document_error(exc):
-                        error_url = str(getattr(exc, "url", "") or "")
                         error_host = urlsplit(error_url).netloc.casefold()
                         if not (isinstance(exc, HTTPError) and exc.code == 404):
                             blocked_hosts.update(
@@ -4296,13 +4309,15 @@ def _throttle_request(
                     0.0,
                 )
             if not cooldown_wait:
-                if throttle_wait and not _wait_for_cancelable_delay(
-                    throttle_wait,
-                    should_cancel,
-                ):
-                    raise DocumentDownloadCancelledError(
-                        "Document download cancelled"
-                    )
+                if throttle_wait:
+                    if not _wait_for_cancelable_delay(
+                        throttle_wait,
+                        should_cancel,
+                    ):
+                        raise DocumentDownloadCancelledError(
+                            "Document download cancelled"
+                        )
+                    continue
                 with _REQUEST_THROTTLE_LOCK:
                     _LAST_REQUEST_AT[netloc] = monotonic()
                 return

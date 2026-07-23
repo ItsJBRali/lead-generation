@@ -2567,6 +2567,45 @@ class LeadSearchTest(unittest.TestCase):
         self.assertEqual(result.failed_sources, [])
         self.assertIn(application.url, result.successful_sources)
 
+    def test_tascomi_rate_limit_deferral_cannot_become_successful_empty(self) -> None:
+        application = PlanningApplication(
+            authority="Rother",
+            uid="RR/2026/0814/FULL",
+            url="https://planning.example.test/planning/index.html?fa=getApplication&id=123",
+            raw={"portal_family": "tascomi"},
+        )
+
+        with (
+            patch(
+                "lead_generator.planning.leads.application_document_source_urls",
+                return_value=[application.url],
+            ),
+            patch(
+                "lead_generator.planning.leads.fetch_planit_documents",
+                side_effect=leads_module._HostRateLimitDeferredError(
+                    application.url
+                ),
+            ),
+            patch(
+                "lead_generator.planning.leads._request_cooldown_remaining_seconds",
+                return_value=60.0,
+            ),
+            patch(
+                "lead_generator.planning.leads.fetch_browser_document_list",
+                return_value=[],
+            ) as browser_fallback,
+        ):
+            result = discover_application_documents(
+                application,
+                defer_rate_limit=True,
+            )
+
+        browser_fallback.assert_not_called()
+        self.assertEqual(result.documents, [])
+        self.assertEqual(result.successful_sources, [])
+        self.assertEqual(len(result.failed_sources), 1)
+        self.assertEqual(result.failed_sources[0].source_url, application.url)
+
     def test_tascomi_browser_failure_retains_same_source_failure(self) -> None:
         application = PlanningApplication(
             authority="Rother",
@@ -3877,6 +3916,72 @@ class LeadSearchTest(unittest.TestCase):
         waited_seconds, waited_callback = wait.call_args.args
         self.assertLessEqual(waited_seconds, 120.0)
         self.assertIs(waited_callback, should_cancel)
+
+    def test_throttle_rechecks_cooldown_installed_during_spacing_wait(self) -> None:
+        url = "https://planning.example.gov.uk/docs/proposed-plan.pdf"
+        cooldowns: dict[str, float] = {}
+
+        def install_cooldown(seconds: float, should_cancel) -> bool:
+            cooldowns["planning.example.gov.uk"] = 200.0
+            return True
+
+        with (
+            patch(
+                "lead_generator.planning.leads._REQUEST_COOLDOWN_UNTIL",
+                cooldowns,
+            ),
+            patch(
+                "lead_generator.planning.leads._LAST_REQUEST_AT",
+                {"planning.example.gov.uk": 0.0},
+            ),
+            patch(
+                "lead_generator.planning.leads.monotonic",
+                side_effect=[0.0, 0.25],
+            ),
+            patch(
+                "lead_generator.planning.leads._wait_for_cancelable_delay",
+                side_effect=install_cooldown,
+            ),
+        ):
+            with self.assertRaises(leads_module._HostRateLimitDeferredError):
+                _throttle_request(url, defer_rate_limit=True)
+
+    def test_browser_source_rate_limit_cools_source_host(self) -> None:
+        document = PlanningDocument(
+            title="Browser plan.pdf",
+            url="https://files.example-cdn.test/index.html?fa=downloaddocument&id=1",
+            source_url="https://planning.example.gov.uk/index.html?fa=getApplication&id=1",
+        )
+
+        class SourceLimitedBrowser:
+            def __init__(self, timeout_seconds):
+                pass
+
+            def get(self, url):
+                raise CouncilFetchError(f"HTTP 429 while fetching {url}")
+
+            def close(self):
+                pass
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch(
+                "lead_generator.planning.leads.CouncilBrowserClient",
+                SourceLimitedBrowser,
+            ),
+            patch("lead_generator.planning.leads._throttle_request"),
+            patch(
+                "lead_generator.planning.leads._set_request_cooldown",
+            ) as set_cooldown,
+        ):
+            result = _download_pdf_documents_once(
+                [document],
+                Path(directory),
+                defer_transient=True,
+            )
+
+        self.assertEqual(result.transient_documents, [document])
+        set_cooldown.assert_called_once_with(document.source_url, 60.0)
 
     def test_host_cooldown_wait_is_cancelable(self) -> None:
         url = "https://planning.example.gov.uk/docs/proposed-plan.pdf"
