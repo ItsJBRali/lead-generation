@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
@@ -23,6 +24,7 @@ from lead_generator.planning.leads import (
     _document_identity,
     _document_identity_title,
     _download_pdf_documents_once,
+    _known_file_extensions,
     _looks_like_downloadable_document,
     _wait_for_document_retry_cooldown,
     append_csv_rows,
@@ -383,17 +385,47 @@ def _logical_document_key(
 
 
 def _existing_file_matches_document(path: Path, document: PlanningDocument) -> bool:
-    existing_name = sanitize_path_part(path.name).casefold()
-    expected_name = sanitize_path_part(_document_identity_title(document)).casefold()
-    if existing_name == expected_name:
-        return True
-    if Path(expected_name).suffix:
-        return False
-    existing_path = Path(existing_name)
-    return (
-        existing_path.suffix.casefold() == ".pdf"
-        and existing_path.stem.casefold() == expected_name
+    existing_base, existing_extensions = _saved_file_identity(path.name)
+    expected_base, expected_extensions = _saved_file_identity(
+        _document_identity_title(document)
     )
+    if not expected_base:
+        return False
+    if (
+        existing_base == expected_base
+        and existing_extensions == expected_extensions
+    ):
+        return True
+    if not _compatible_saved_extensions(
+        existing_extensions,
+        expected_extensions,
+    ):
+        return False
+    if existing_base == expected_base:
+        return True
+    collision_match = re.fullmatch(r"(.+)-([2-9]\d*)", existing_base)
+    return bool(collision_match and collision_match.group(1) == expected_base)
+
+
+def _saved_file_identity(value: str) -> tuple[str, tuple[str, ...]]:
+    name = sanitize_path_part(Path(value.replace("\\", "/")).name).casefold()
+    extensions: list[str] = []
+    while True:
+        suffix = Path(name).suffix.casefold()
+        if suffix not in _known_file_extensions():
+            break
+        extensions.append(suffix)
+        name = Path(name).stem
+    return name, tuple(extensions)
+
+
+def _compatible_saved_extensions(
+    existing_extensions: tuple[str, ...],
+    expected_extensions: tuple[str, ...],
+) -> bool:
+    if not expected_extensions:
+        return bool(existing_extensions) and set(existing_extensions) == {".pdf"}
+    return bool(set(existing_extensions).intersection(expected_extensions))
 
 
 def recover_search_output(

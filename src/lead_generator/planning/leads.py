@@ -10,6 +10,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from email.utils import parsedate_to_datetime
+from hashlib import sha256
 from http.cookiejar import CookieJar
 from email.message import Message
 from importlib import resources
@@ -196,10 +197,11 @@ DOCUMENT_DOWNLOAD_DELAY_SECONDS = 0.0
 DOCUMENT_DOWNLOAD_RETRY_DELAY_SECONDS = 10.0
 DOCUMENT_DOWNLOAD_ATTEMPTS = 2
 DOCUMENT_DOWNLOAD_MAX_RETRY_DELAY_SECONDS = 15.0
+RATE_LIMIT_DEFAULT_RETRY_DELAY_SECONDS = 60.0
 MAX_ASSOCIATED_DOCUMENT_SOURCE_DEPTH = 2
 MAX_CONCURRENT_DOCUMENT_BATCHES = 2
 RATE_LIMIT_HTTP_CODES = {429, 503}
-MAX_RETRY_AFTER_SECONDS = 60.0
+MAX_RETRY_AFTER_SECONDS = 120.0
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 20.0
 REQUEST_THROTTLE_SECONDS = 0.25
 PLANIT_REQUEST_THROTTLE_SECONDS = 1.5
@@ -2047,15 +2049,16 @@ def _associated_document_source_urls(html_text: str, page_url: str) -> list[str]
         if _is_page_chrome_link(anchor):
             continue
         label = (clean_text(" ".join(anchor.xpath(".//text()"))) or "").casefold()
-        if not any(
-            marker in label
-            for marker in (
-                "associated application documents",
-                "view associated documents",
-                "view related documents",
-                "documents for this application",
-                "plans & documents",
-                "plans and documents",
+        if not (
+            _is_associated_document_source_label(label)
+            or any(
+                marker in label
+                for marker in (
+                    "view related documents",
+                    "documents for this application",
+                    "plans & documents",
+                    "plans and documents",
+                )
             )
         ):
             continue
@@ -2256,6 +2259,11 @@ def _download_pdf_documents_once(
                 source_cache=source_cache,
                 should_cancel=should_cancel,
             )
+        existing_path = _find_identical_payload(destination, downloaded_file.payload)
+        if existing_path is not None:
+            result.downloaded_count += 1
+            _log(log, f"Already captured identical document: {existing_path.name}")
+            return
         filename = document_filename(document, downloaded_file, fallback=f"document-{index}")
         path = _unique_path(destination / filename)
         path.write_bytes(downloaded_file.payload)
@@ -2514,7 +2522,7 @@ def _download_document_file(
             if should_cancel and should_cancel():
                 raise DocumentDownloadCancelledError("Document download cancelled")
             try:
-                _throttle_request(url)
+                _throttle_request(url, should_cancel=should_cancel)
                 with opener.open(request, timeout=30) as response:
                     payload = response.read()
                     content_type = response.headers.get("Content-Type", "").lower()
@@ -2538,17 +2546,23 @@ def _download_document_file(
                 last_error = exc
                 if exc.code == 404:
                     break
-                if exc.code not in RATE_LIMIT_HTTP_CODES or attempt == DOCUMENT_DOWNLOAD_ATTEMPTS - 1:
+                if exc.code not in RATE_LIMIT_HTTP_CODES:
                     raise
-                delay = min(
-                    _retry_delay_seconds(exc, min(5.0 * (2**attempt), 45.0)),
-                    DOCUMENT_DOWNLOAD_MAX_RETRY_DELAY_SECONDS,
+                delay = _rate_limit_aware_retry_delay_seconds(
+                    exc,
+                    min(5.0 * (2**attempt), 45.0),
+                    generic_max_seconds=DOCUMENT_DOWNLOAD_MAX_RETRY_DELAY_SECONDS,
                 )
-                _set_request_cooldown(url, delay)
+                if exc.code == 429:
+                    _set_request_cooldown(url, delay)
+                if attempt == DOCUMENT_DOWNLOAD_ATTEMPTS - 1:
+                    raise
                 if not _wait_for_cancelable_delay(delay, should_cancel):
-                    _clear_request_cooldown(url)
+                    if exc.code == 429:
+                        _clear_request_cooldown(url)
                     raise DocumentDownloadCancelledError("Document download cancelled")
-                _clear_request_cooldown(url)
+                if exc.code == 429:
+                    _clear_request_cooldown(url)
                 _skip_next_throttle(url)
             except Exception as exc:
                 last_error = exc
@@ -2746,6 +2760,8 @@ def iter_document_links(document: html.HtmlElement, page_url: str) -> Iterable[t
         title = _document_link_title(" ".join(anchor.itertext()), absolute_url)
         if not title:
             continue
+        if _is_associated_document_source_label(title):
+            continue
         if _is_generic_site_document(absolute_url, title):
             continue
         if not _is_document_href(href) and not _is_document_link_text(title, href):
@@ -2770,6 +2786,8 @@ def iter_document_links(document: html.HtmlElement, page_url: str) -> Iterable[t
             title = re.sub(r"^link\s*\(\s*download\s*\)\s*", "", title, flags=re.IGNORECASE).strip()
             if not title:
                 continue
+            if _is_associated_document_source_label(title):
+                continue
             if _is_generic_site_document(absolute_url, title):
                 continue
             if _is_application_tab_href(absolute_url):
@@ -2783,6 +2801,8 @@ def iter_document_links(document: html.HtmlElement, page_url: str) -> Iterable[t
             absolute_url = urljoin(page_url, href)
             title = _document_link_title(" ".join(element.itertext()), absolute_url)
             if not title:
+                continue
+            if _is_associated_document_source_label(title):
                 continue
             if _is_generic_site_document(absolute_url, title):
                 continue
@@ -2808,6 +2828,8 @@ def iter_document_links(document: html.HtmlElement, page_url: str) -> Iterable[t
         href = _with_query_items(parts, [*parse_qsl(parts.query, keep_blank_values=True), *query_items])
         title = _document_link_title(" ".join(form.itertext()), href)
         if not title:
+            continue
+        if _is_associated_document_source_label(title):
             continue
         if _is_generic_site_document(href, title):
             continue
@@ -3500,6 +3522,18 @@ def _is_document_link_text(title: str | None, href: str | None) -> bool:
     return any(token in lowered_href for token in ("searchresult", "publicaccess", "documents", "runthirdpartysearch"))
 
 
+def _is_associated_document_source_label(value: str | None) -> bool:
+    normalized = (clean_text(value) or "").casefold()
+    return normalized in {
+        "associated application documents",
+        "associated documents",
+        "click to view associated application documents",
+        "click to view associated documents",
+        "view associated application documents",
+        "view associated documents",
+    }
+
+
 def _is_application_tab_href(href: str | None) -> bool:
     if not href:
         return False
@@ -3679,9 +3713,19 @@ def _open_url_with_retry(request: Request, *, timeout: float, opener=None):
                 return opener.open(request, timeout=timeout)
             return urlopen(request, timeout=timeout)
         except HTTPError as exc:
-            if exc.code not in RATE_LIMIT_HTTP_CODES or attempt == 3:
+            if exc.code not in RATE_LIMIT_HTTP_CODES:
                 raise
-            sleep(_retry_delay_seconds(exc, 5.0 * (attempt + 1)))
+            delay = _rate_limit_aware_retry_delay_seconds(
+                exc,
+                5.0 * (attempt + 1),
+            )
+            if exc.code == 429:
+                _set_request_cooldown(request.full_url, delay)
+            if attempt == 3:
+                raise
+            _wait_for_cancelable_delay(delay, None)
+            if exc.code == 429:
+                _clear_request_cooldown(request.full_url)
             _skip_next_throttle(request.full_url)
     raise RuntimeError(f"Could not fetch {request.full_url}")
 
@@ -3802,9 +3846,20 @@ def _fetch_json_with_retry(url: str) -> dict[str, object]:
             with response_context as response:
                 return json.loads(response.read().decode("utf-8", errors="replace"))
         except HTTPError as exc:
-            if exc.code not in RATE_LIMIT_HTTP_CODES or attempt == attempts - 1:
+            if exc.code not in RATE_LIMIT_HTTP_CODES:
                 raise
-            sleep(min(_retry_delay_seconds(exc, 2.0 * (attempt + 1)), 8.0))
+            delay = _rate_limit_aware_retry_delay_seconds(
+                exc,
+                2.0 * (attempt + 1),
+                generic_max_seconds=8.0,
+            )
+            if exc.code == 429:
+                _set_request_cooldown(url, delay)
+            if attempt == attempts - 1:
+                raise
+            sleep(delay)
+            if exc.code == 429:
+                _clear_request_cooldown(url)
             _skip_next_throttle(url)
         except URLError as exc:
             if not _should_retry_json_without_tls_verification(url, exc) or attempt == attempts - 1:
@@ -3821,7 +3876,11 @@ def _should_retry_json_without_tls_verification(url: str, exc: URLError) -> bool
     return isinstance(reason, ssl.SSLCertVerificationError)
 
 
-def _throttle_request(url: str) -> None:
+def _throttle_request(
+    url: str,
+    *,
+    should_cancel: CancelCallback | None = None,
+) -> None:
     netloc = urlsplit(url).netloc.casefold()
     if not netloc:
         return
@@ -3836,8 +3895,8 @@ def _throttle_request(url: str) -> None:
                 _REQUEST_COOLDOWN_UNTIL.get(netloc, 0.0),
             )
             wait = max(ready_at - now, 0.0)
-        if wait:
-            sleep(wait)
+        if wait and not _wait_for_cancelable_delay(wait, should_cancel):
+            raise DocumentDownloadCancelledError("Document download cancelled")
         with _REQUEST_THROTTLE_LOCK:
             _LAST_REQUEST_AT[netloc] = monotonic()
 
@@ -3886,6 +3945,23 @@ def _retry_delay_seconds(exc: HTTPError, fallback_seconds: float) -> float:
                 delay = (retry_after_date - datetime.now(timezone.utc)).total_seconds()
                 return min(max(delay, 0.0), MAX_RETRY_AFTER_SECONDS)
     return fallback_seconds
+
+
+def _rate_limit_aware_retry_delay_seconds(
+    exc: HTTPError,
+    generic_fallback_seconds: float,
+    *,
+    generic_max_seconds: float | None = None,
+) -> float:
+    fallback = (
+        RATE_LIMIT_DEFAULT_RETRY_DELAY_SECONDS
+        if exc.code == 429
+        else generic_fallback_seconds
+    )
+    delay = _retry_delay_seconds(exc, fallback)
+    if exc.code != 429 and generic_max_seconds is not None:
+        return min(delay, generic_max_seconds)
+    return delay
 
 
 def _record_string(record: object, key: str) -> str | None:
@@ -4170,6 +4246,23 @@ def _unique_path(path: Path) -> Path:
         if not candidate.exists():
             return candidate
     raise FileExistsError(path)
+
+
+def _find_identical_payload(destination: Path, payload: bytes) -> Path | None:
+    payload_digest = sha256(payload).digest()
+    for path in destination.iterdir():
+        try:
+            if not path.is_file() or path.stat().st_size != len(payload):
+                continue
+            digest = sha256()
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            if digest.digest() == payload_digest:
+                return path
+        except OSError:
+            continue
+    return None
 
 
 def _log(callback: LogCallback | None, message: str) -> None:

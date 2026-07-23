@@ -25,6 +25,7 @@ from lead_generator.planning.models import PlanningApplication, PlanningDocument
 from lead_generator.planning.recovery import (
     _application_from_row,
     _catalogue_index,
+    _existing_file_matches_document,
     _recovery_item,
     recover_search_output,
 )
@@ -888,6 +889,53 @@ def test_extensionless_title_only_matches_existing_pdf(
         recover_search_output(tmp_path)
 
     assert captured == ([document] if expected_download else [])
+
+
+@pytest.mark.parametrize(
+    "existing_name",
+    [
+        "plan.pdf.PDF",
+        "plan-2.PDF",
+    ],
+)
+def test_recovery_matches_repeated_extension_and_generated_collision_name(
+    tmp_path: Path,
+    existing_name: str,
+) -> None:
+    existing = tmp_path / existing_name
+    existing.write_bytes(b"%PDF-existing")
+    document = PlanningDocument(
+        "plan.pdf",
+        "https://docs.test/plan.pdf",
+    )
+
+    assert _existing_file_matches_document(existing, document)
+
+
+def test_recovery_does_not_strip_collision_suffix_from_document_identity(
+    tmp_path: Path,
+) -> None:
+    existing = tmp_path / "plan.pdf"
+    existing.write_bytes(b"%PDF-existing")
+    numbered_document = PlanningDocument(
+        "plan-2.pdf",
+        "https://docs.test/plan-2.pdf",
+    )
+
+    assert not _existing_file_matches_document(existing, numbered_document)
+
+
+def test_recovery_preserves_exact_extensionless_filename_match(
+    tmp_path: Path,
+) -> None:
+    existing = tmp_path / "Proposed Elevations"
+    existing.write_bytes(b"%PDF-existing")
+    document = PlanningDocument(
+        "Proposed Elevations",
+        "https://docs.test/download?id=1",
+    )
+
+    assert _existing_file_matches_document(existing, document)
 
 
 def test_recovery_summary_counts_each_unresolved_failure_entry(tmp_path: Path) -> None:
