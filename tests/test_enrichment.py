@@ -968,6 +968,7 @@ def test_arbitrary_numbered_documents_are_not_drawing_code_candidates(
         "P_01_100.pdf",
         "ABC.123.P1.pdf",
         "1234-A-101.pdf",
+        "5033211-RDG-01-ZZ-D-GS-010000-P01.pdf",
     ],
 )
 def test_structured_drawing_codes_remain_title_block_candidates(
