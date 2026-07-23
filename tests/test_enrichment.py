@@ -421,6 +421,53 @@ def test_application_form_alone_produces_failed_fields() -> None:
     }
 
 
+def test_application_form_applicant_is_used_only_as_an_exclusion() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        folder = Path(directory)
+        form_path = folder / "APPLICATION_FORM.pdf"
+        drawing_path = folder / "Proposed Site Plan.pdf"
+        form_path.touch()
+        drawing_path.touch()
+        form = _fake_pdf(form_path, APPLICATION_FORM_TEXT, application_form=True)
+        drawing = _fake_pdf(
+            drawing_path,
+            "PROPOSED SITE PLAN\nDRAWING NUMBER P01\nSCALE 1:100\n"
+            "Acme Homes Ltd\nStudio Arc Architects Ltd\n"
+            "020 7123 4567\nstudio@studioarc.co.uk\n"
+            "12 Design Road\nLondon\nSW1A 1AA",
+            application_form=False,
+        )
+
+        with (
+            patch.object(
+                enrichment,
+                "extract_pdf_application_form_text",
+                return_value=form,
+                create=True,
+            ),
+            patch.object(
+                enrichment,
+                "extract_pdf_first_page_text",
+                return_value=drawing,
+            ),
+            patch.object(enrichment, "extract_pdf_text", return_value=drawing),
+        ):
+            result = enrichment.enrich_application_folder(folder)
+
+    assert result.to_csv_row() == {
+        "Architect / Company Name": "Studio Arc Architects Ltd",
+        "Phone Number": "020 7123 4567",
+        "Email Address": "studio@studioarc.co.uk",
+        "Company Address": "12 Design Road, London, SW1A 1AA",
+    }
+    assert result.field_sources == {
+        "Architect / Company Name": ["Proposed Site Plan.pdf"],
+        "Phone Number": ["Proposed Site Plan.pdf"],
+        "Email Address": ["Proposed Site Plan.pdf"],
+        "Company Address": ["Proposed Site Plan.pdf"],
+    }
+
+
 def test_misnamed_application_form_cannot_contribute_contact_details() -> None:
     with tempfile.TemporaryDirectory() as directory:
         folder = Path(directory)
@@ -630,6 +677,20 @@ def test_valid_uk_02_area_phone_numbers_remain_accepted(value: str) -> None:
     assert enrichment._normalise_phone(value) == value
 
 
+def test_fax_labelled_number_is_not_added_as_a_phone_number() -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+
+    enrichment.extract_professional_details(
+        "Des Ewing Residential Architects\n"
+        "T 028 9022 0500 F 028 9022 0505\n"
+        "E home@desewing.com",
+        "Proposed Elevations.pdf",
+        accumulator,
+    )
+
+    assert accumulator.result.phone_numbers == ["028 9022 0500"]
+
+
 def test_copyright_and_drawing_labels_are_not_names() -> None:
     accumulator = enrichment._Accumulator(enrichment._Exclusions())
     enrichment.extract_professional_details(
@@ -670,6 +731,19 @@ def test_valid_company_name_remains_accepted_after_noise_filtering() -> None:
     accumulator.add_name("NEO Architects")
 
     assert accumulator.result.architect_company_names == ["NEO Architects"]
+
+
+def test_company_name_corrects_studio_ocr_zero() -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+
+    enrichment.extract_professional_details(
+        "Architectural Studi0\n01643 705275\ndesign@architecturalstudio.co.uk\n"
+        "26 Friday Street\nMinehead\nSomerset\nTA24 5UE",
+        "Existing Site Block Plan.pdf",
+        accumulator,
+    )
+
+    assert accumulator.result.architect_company_names == ["Architectural Studio"]
 
 
 def test_leading_copyright_symbol_is_removed_from_valid_company_name() -> None:

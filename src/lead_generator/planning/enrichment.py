@@ -26,6 +26,7 @@ ENRICHMENT_CSV_FIELDS = [
 MIN_SELECTABLE_PAGE_CHARACTERS = 50
 MAX_OCR_PAGES_PER_DOCUMENT = 6
 OCR_RENDER_SCALE = 1.0
+APPLICATION_FORM_EXCLUSION_PAGE_LIMIT = 4
 
 EMAIL_RE = re.compile(
     r"(?i)(?<![\w.+-])([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})(?![\w.-])"
@@ -405,6 +406,7 @@ def enrich_application_folder(
         (path for path in folder.iterdir() if path.is_file() and _is_pdf(path)),
         key=lambda path: path.name.casefold(),
     ) if folder.exists() else []
+    _add_application_form_applicant_exclusions(pdf_paths, exclusions, log)
 
     if not pdf_paths and log:
         log("No downloaded PDFs were available to enrich")
@@ -491,6 +493,19 @@ def extract_pdf_first_page_text(path: Path) -> _PdfText:
     try:
         _read_selectable_pages(cache, [0])
         return _pdf_text_from_cache(path, cache, [0])
+    except Exception:
+        _close_pdf_read_cache(cache)
+        raise
+
+
+def extract_pdf_application_form_text(path: Path) -> _PdfText:
+    cache = _open_pdf_cache(path)
+    page_indexes = range(
+        min(cache.page_count, APPLICATION_FORM_EXCLUSION_PAGE_LIMIT)
+    )
+    try:
+        _read_selectable_pages(cache, page_indexes)
+        return _pdf_text_from_cache(path, cache, page_indexes)
     except Exception:
         _close_pdf_read_cache(cache)
         raise
@@ -690,7 +705,11 @@ def extract_professional_details(text: str, filename: str, accumulator: _Accumul
                     accumulator.add_name(company)
 
         for phone_match in PHONE_RE.finditer(line):
-            if has_contact_evidence and not excluded_context:
+            if (
+                has_contact_evidence
+                and not excluded_context
+                and not _fax_context(line, phone_match.start())
+            ):
                 accumulator.add_phone(phone_match.group(0))
                 company = _nearest_company(lines, index)
                 if company:
@@ -704,6 +723,39 @@ def extract_professional_details(text: str, filename: str, accumulator: _Accumul
                 and not excluded_context
             ):
                 accumulator.add_address(address)
+
+
+def _add_application_form_applicant_exclusions(
+    pdf_paths: Iterable[Path],
+    exclusions: _Exclusions,
+    log: Callable[[str], None] | None,
+) -> None:
+    for path in pdf_paths:
+        if not is_application_form(path, ""):
+            continue
+        document: _PdfText | None = None
+        try:
+            document = extract_pdf_application_form_text(path)
+            applicant, _agent = extract_application_form_parties(document.text)
+            if not applicant:
+                continue
+            exclusions.add_party(applicant.person_name)
+            exclusions.add_party(applicant.company_name)
+            exclusions.add_address(applicant.address)
+        except Exception as exc:
+            if log:
+                log(f"Could not read {path.name} for applicant exclusions: {exc}")
+        finally:
+            _close_pdf_cache(document)
+
+
+def _fax_context(line: str, phone_start: int) -> bool:
+    prefix = line[:phone_start]
+    if re.search(r"(?i)\b(?:tel|t)\s*/\s*(?:fax|f)\s*[:.]?\s*$", prefix):
+        return False
+    return bool(
+        re.search(r"(?i)(?:\bfax|\bf)\s*[:.]?\s*$", prefix)
+    )
 
 
 def _parse_form_party(lines: list[str]) -> _Party:
@@ -1221,6 +1273,7 @@ def _text_lines(text: str) -> list[str]:
 
 def _clean_candidate(value: str | None) -> str:
     value = re.sub(r"\s+", " ", value or "").strip(" \t\r\n|,;:")
+    value = re.sub(r"(?i)\bstudi0\b", "Studio", value)
     if not value or "redacted" in value.casefold() or value.casefold() in {"n/a", "none", "not applicable"}:
         return ""
     return value
