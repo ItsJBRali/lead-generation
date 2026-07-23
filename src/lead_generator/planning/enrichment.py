@@ -485,8 +485,12 @@ def enrich_application_folder(
 
 def extract_pdf_first_page_text(path: Path) -> _PdfText:
     cache = _open_pdf_cache(path)
-    _read_selectable_pages(cache, [0])
-    return _pdf_text_from_cache(path, cache, [0])
+    try:
+        _read_selectable_pages(cache, [0])
+        return _pdf_text_from_cache(path, cache, [0])
+    except Exception:
+        _close_pdf_read_cache(cache)
+        raise
 
 
 def extract_pdf_first_page_with_ocr(path: Path, first_page: _PdfText) -> _PdfText:
@@ -596,7 +600,12 @@ def _pdf_text_from_cache(
 
 def _close_pdf_cache(document: _PdfText | None) -> None:
     cache = document.cache if document else None
-    if not cache or cache.reader is None:
+    if cache:
+        _close_pdf_read_cache(cache)
+
+
+def _close_pdf_read_cache(cache: _PdfReadCache) -> None:
+    if cache.reader is None:
         return
     stream = getattr(cache.reader, "stream", None)
     close = getattr(stream, "close", None)

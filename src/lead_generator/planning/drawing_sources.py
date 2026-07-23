@@ -35,7 +35,17 @@ NARRATIVE_PHRASES = (
     "environmental statement volume", "es vol", "es volume",
     "non technical summary", "desk study",
     "chapter", "figure", "figures", "summary", "study", "studies",
-    "justification", "cover", "contents", "das",
+    "justification", "cover", "contents", "agenda", "minutes", "brochure",
+    "invoice", "receipt", "das",
+)
+TITLE_NARRATIVE_PHRASES = (
+    "application form", "planning statement", "design and access statement",
+    "supporting statement", "report", "assessment", "strategy", "travel plan",
+    "environmental statement", "landscape visual impact", "appendix",
+    "presentation", "material schedule", "drawing register", "cemp", "wms",
+    "method statement", "consultation", "heritage statement",
+    "management plan", "planning application appendix", "non technical summary",
+    "desk study", "chapter", "das",
 )
 DRAWING_EVIDENCE_PATTERNS = (
     re.compile(r"(?i)\bdrawing\s*(?:no|number)\b"),
@@ -58,8 +68,9 @@ DRAWING_CODE_RE = re.compile(
     r"[-_.](?=[a-z0-9]*[a-z])(?=[a-z0-9]*\d)[a-z0-9]{2,8}"
     r")$"
 )
-TITLE_PAGE_LINE_LIMIT = 30
-TITLE_PAGE_TEXT_LIMIT = 3_000
+TITLE_PAGE_START_LINE_LIMIT = 30
+TITLE_PAGE_END_LINE_LIMIT = 80
+TITLE_HEADING_LINE_LIMIT = 12
 TITLE_BLOCK_WINDOW_LINES = 10
 
 
@@ -71,11 +82,14 @@ def _tokens(value: str) -> set[str]:
     return set(re.findall(r"[a-z0-9]+", value.casefold()))
 
 
-def _has_narrative_marker(value: str) -> bool:
+def _has_narrative_marker(
+    value: str,
+    phrases: tuple[str, ...] = NARRATIVE_PHRASES,
+) -> bool:
     phrase_text = _phrase_text(value)
     normalized = f" {phrase_text} "
     compact = phrase_text.replace(" ", "")
-    for phrase in NARRATIVE_PHRASES:
+    for phrase in phrases:
         normalized_phrase = _phrase_text(phrase)
         if f" {normalized_phrase} " in normalized:
             return True
@@ -88,11 +102,16 @@ def _has_narrative_marker(value: str) -> bool:
 
 
 def _title_page_lines(text: str) -> list[str]:
-    bounded = "\n".join(text.splitlines()[:TITLE_PAGE_LINE_LIMIT])
-    return [
+    lines = [
         line.strip()
-        for line in bounded[:TITLE_PAGE_TEXT_LIMIT].splitlines()
+        for line in text.splitlines()
         if line.strip()
+    ]
+    if len(lines) <= TITLE_PAGE_START_LINE_LIMIT + TITLE_PAGE_END_LINE_LIMIT:
+        return lines
+    return [
+        *lines[:TITLE_PAGE_START_LINE_LIMIT],
+        *lines[-TITLE_PAGE_END_LINE_LIMIT:],
     ]
 
 
@@ -100,6 +119,15 @@ def _has_ambiguous_drawing_evidence(filename: str, title_lines: list[str]) -> bo
     filename_tokens = _tokens(Path(filename).stem)
     filename_has_status = bool(filename_tokens & STATUS_TOKENS)
     filename_has_drawing_type = bool(filename_tokens & DRAWING_TOKENS)
+    filename_has_drawing_code = bool(
+        DRAWING_CODE_RE.fullmatch(Path(filename).stem.strip())
+    )
+    if not (
+        filename_has_status
+        or filename_has_drawing_type
+        or filename_has_drawing_code
+    ):
+        return False
     for start in range(len(title_lines)):
         window = "\n".join(title_lines[start:start + TITLE_BLOCK_WINDOW_LINES])
         tokens = _tokens(window)
@@ -137,8 +165,15 @@ def preclassify_drawing_source(filename: str) -> DrawingSourceDecision:
 
 def classify_drawing_source(filename: str, text: str) -> DrawingSourceDecision:
     title_lines = _title_page_lines(text)
-    title_text = "\n".join(title_lines)
-    if _has_narrative_marker(Path(filename).stem) or _has_narrative_marker(title_text):
+    heading_text = "\n".join(
+        line.strip()
+        for line in text.splitlines()[:TITLE_HEADING_LINE_LIMIT]
+        if line.strip()
+    )
+    if _has_narrative_marker(Path(filename).stem) or _has_narrative_marker(
+        heading_text,
+        TITLE_NARRATIVE_PHRASES,
+    ):
         return DrawingSourceDecision(False, False, "narrative document marker")
     filename_tokens = _tokens(Path(filename).stem)
     clear_filename = bool(filename_tokens & STATUS_TOKENS) and bool(

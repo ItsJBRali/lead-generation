@@ -881,6 +881,36 @@ def test_ambiguous_car_park_accepts_late_first_page_title_block_evidence() -> No
     assert classify_drawing_source("PROPOSED_CAR_PARK.pdf", text).eligible is True
 
 
+def test_ambiguous_car_park_accepts_bottom_title_block_after_drawing_notes() -> None:
+    text = "\n".join(
+        [
+            "Top of Tree 67.78",
+            "Tree has been surveyed at high position",
+            *(f"Drawing object {index}" for index in range(4_000)),
+            "Scale: Revision: Drawing:",
+            "Land at Hitcham Farm, Burnham",
+            "Proposed Car Park",
+            "1:500",
+            "2411039-18G",
+        ]
+    )
+
+    assert classify_drawing_source("PROPOSED_CAR_PARK.pdf", text).eligible is True
+
+
+def test_drawing_annotation_does_not_trigger_narrative_rejection() -> None:
+    text = "\n".join(
+        [
+            "PROPOSED SITE PLAN",
+            "DRAWING NUMBER P-101",
+            "SCALE 1:100",
+            "MANHOLE COVER LEVELS ARE INDICATIVE",
+        ]
+    )
+
+    assert classify_drawing_source("Proposed Site Plan.pdf", text).eligible is True
+
+
 @pytest.mark.parametrize(
     ("filename", "text", "eligible"),
     [
@@ -950,6 +980,9 @@ def test_live_narrative_filename_families_are_rejected_before_reading(
         "PL_26_05353_FA-123.pdf",
         "PL_26_05353_FA_REPORT_123.pdf",
         "Housing Report 2026.pdf",
+        "Agenda-2026.pdf",
+        "Minutes-123.pdf",
+        "Brochure-123.pdf",
     ],
 )
 def test_arbitrary_numbered_documents_are_not_drawing_code_candidates(
@@ -1170,4 +1203,34 @@ def test_field_source_audit_uses_exact_normalized_filename_deduplication() -> No
 
     assert accumulator.result.field_sources == {
         "Phone Number": ["Proposed Plan.pdf", "123 Proposed Plan.pdf"]
+    }
+
+
+def test_malformed_page_tree_closes_reader_cache() -> None:
+    class BrokenReader:
+        is_encrypted = False
+
+        def __init__(self) -> None:
+            self.stream = Mock()
+
+        @property
+        def pages(self):
+            raise ValueError("broken page tree")
+
+    with tempfile.TemporaryDirectory() as directory:
+        folder = Path(directory)
+        path = folder / "Proposed Plan.pdf"
+        path.touch()
+        reader = BrokenReader()
+
+        with (
+            patch.object(enrichment, "PdfReader", return_value=reader),
+            patch.object(enrichment, "_pdfium_page_count", return_value=0),
+        ):
+            result = enrichment.enrich_application_folder(folder)
+
+    reader.stream.close.assert_called_once_with()
+    assert result.eligible_documents == []
+    assert result.rejected_documents == {
+        "Proposed Plan.pdf": "read failed: broken page tree"
     }
