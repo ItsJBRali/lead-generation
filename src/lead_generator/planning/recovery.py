@@ -295,7 +295,10 @@ def _recover_documents(
     log: Callable[[str], None] | None,
 ) -> None:
     try:
-        discovery = discover_application_documents(item.application)
+        discovery = discover_application_documents(
+            item.application,
+            defer_rate_limit=not final_attempt,
+        )
     except Exception as exc:
         discovery = DocumentDiscoveryResult(
             failed_sources=[DocumentSourceFailure(item.application.url, str(exc))]
@@ -445,7 +448,13 @@ def _compatible_saved_extensions(
 ) -> bool:
     if not expected_extensions:
         return bool(existing_extensions) and set(existing_extensions) == {".pdf"}
-    return bool(set(existing_extensions).intersection(expected_extensions))
+    if not existing_extensions:
+        return False
+    return (
+        len(set(existing_extensions)) == 1
+        and len(set(expected_extensions)) == 1
+        and existing_extensions[0] == expected_extensions[0]
+    )
 
 
 def recover_search_output(

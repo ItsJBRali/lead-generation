@@ -966,7 +966,12 @@ class LeadSearchTest(unittest.TestCase):
                     )
                 ]
 
-            def fake_document_discovery(application, *, should_cancel=None):
+            def fake_document_discovery(
+                application,
+                *,
+                should_cancel=None,
+                defer_rate_limit=False,
+            ):
                 return DocumentDiscoveryResult(documents=[
                     PlanningDocument(
                         title=f"{application.reference}.pdf",
@@ -1025,7 +1030,12 @@ class LeadSearchTest(unittest.TestCase):
             ]
             events: list[str] = []
 
-            def fake_document_discovery(application, *, should_cancel=None):
+            def fake_document_discovery(
+                application,
+                *,
+                should_cancel=None,
+                defer_rate_limit=False,
+            ):
                 return DocumentDiscoveryResult(documents=[
                     PlanningDocument(
                         title=f"{application.reference}.pdf",
@@ -1127,6 +1137,13 @@ class LeadSearchTest(unittest.TestCase):
 
         self.assertEqual(download_batches, [[first.url], [second.url]])
         self.assertEqual(discover_documents.call_count, 2)
+        self.assertEqual(
+            [
+                call.kwargs["defer_rate_limit"]
+                for call in discover_documents.call_args_list
+            ],
+            [True, False],
+        )
         self.assertEqual(progress, [(0, 1), (1, 1)])
         self.assertEqual(result.captured_documents, 1)
 
@@ -1695,7 +1712,12 @@ class LeadSearchTest(unittest.TestCase):
                     ),
                 ]
 
-            def fake_document_discovery(application, *, should_cancel=None):
+            def fake_document_discovery(
+                application,
+                *,
+                should_cancel=None,
+                defer_rate_limit=False,
+            ):
                 return DocumentDiscoveryResult(documents=[
                     PlanningDocument(
                         title="Proposed plan.pdf",
@@ -2449,7 +2471,12 @@ class LeadSearchTest(unittest.TestCase):
         }
         visits: list[str] = []
 
-        def fake_fetch(url: str, *, timeout: float):
+        def fake_fetch(
+            url: str,
+            *,
+            timeout: float,
+            defer_rate_limit: bool = False,
+        ):
             visits.append(url)
             return pages[url], url, object()
 
@@ -2979,7 +3006,8 @@ class LeadSearchTest(unittest.TestCase):
                 first.start()
                 self.assertTrue(cooldown_recorded.wait(timeout=1.0))
                 second.start()
-                self.assertTrue(second_waiting.wait(timeout=1.0))
+                second.join(timeout=1.0)
+                self.assertFalse(second.is_alive())
                 third.start()
                 try:
                     self.assertTrue(available_started.wait(timeout=0.5))
@@ -2990,6 +3018,164 @@ class LeadSearchTest(unittest.TestCase):
 
         self.assertEqual(results["limited-first"].transient_documents, [limited_first])
         self.assertEqual(results["limited-second"].transient_documents, [limited_second])
+        self.assertEqual(results["available"].downloaded_count, 1)
+        self.assertFalse(second_waiting.is_set())
+
+    def test_two_precooled_same_host_jobs_do_not_occupy_both_batch_slots(self) -> None:
+        limited_documents = [
+            PlanningDocument(
+                title=f"Limited plan {index}.pdf",
+                url=f"https://limited.example.gov.uk/docs/plan-{index}.pdf",
+            )
+            for index in range(1, 3)
+        ]
+        available = PlanningDocument(
+            title="Available plan.pdf",
+            url="https://available.example.gov.uk/docs/available.pdf",
+        )
+        release_waits = threading.Event()
+        available_started = threading.Event()
+        ready_for_available = threading.Event()
+        limited_finished = 0
+        state_lock = threading.Lock()
+        results: dict[str, DocumentDownloadBatchResult] = {}
+
+        class TrackingGate:
+            def __init__(self) -> None:
+                self._semaphore = threading.BoundedSemaphore(2)
+                self._lock = threading.Lock()
+                self._active = 0
+
+            def __enter__(self):
+                self._semaphore.acquire()
+                with self._lock:
+                    self._active += 1
+                    if self._active == 2:
+                        ready_for_available.set()
+                return self
+
+            def __exit__(self, *args):
+                with self._lock:
+                    self._active -= 1
+                self._semaphore.release()
+
+        class FakeResponse:
+            headers = {"Content-Type": "application/pdf"}
+
+            def __init__(self, url: str) -> None:
+                self.url = url
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return b"%PDF-available"
+
+            def geturl(self) -> str:
+                return self.url
+
+        class HostAwareOpener:
+            def open(self, request, timeout):
+                if "limited.example.gov.uk" in request.full_url:
+                    raise HTTPError(
+                        request.full_url,
+                        429,
+                        "Too Many Requests",
+                        {},
+                        None,
+                    )
+                available_started.set()
+                return FakeResponse(request.full_url)
+
+        def controlled_wait(seconds: float, should_cancel) -> bool:
+            return release_waits.wait(timeout=2.0)
+
+        def run_limited(name: str, document: PlanningDocument, destination: Path) -> None:
+            nonlocal limited_finished
+            results[name] = _download_pdf_documents_once(
+                [document],
+                destination,
+                defer_transient=True,
+            )
+            with state_lock:
+                limited_finished += 1
+                if limited_finished == 2:
+                    ready_for_available.set()
+
+        def run_available(destination: Path) -> None:
+            results["available"] = _download_pdf_documents_once(
+                [available],
+                destination,
+                defer_transient=True,
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            destinations = {
+                name: root / name
+                for name in ("limited-1", "limited-2", "available")
+            }
+            for destination in destinations.values():
+                destination.mkdir()
+            cooldowns = {
+                "limited.example.gov.uk": leads_module.monotonic() + 60.0,
+            }
+            with (
+                patch(
+                    "lead_generator.planning.leads._build_document_opener",
+                    return_value=HostAwareOpener(),
+                ),
+                patch(
+                    "lead_generator.planning.leads._DOCUMENT_DOWNLOAD_GATE",
+                    TrackingGate(),
+                ),
+                patch(
+                    "lead_generator.planning.leads._REQUEST_COOLDOWN_UNTIL",
+                    cooldowns,
+                ),
+                patch("lead_generator.planning.leads._LAST_REQUEST_AT", {}),
+                patch(
+                    "lead_generator.planning.leads._wait_for_cancelable_delay",
+                    side_effect=controlled_wait,
+                ),
+            ):
+                limited_workers = [
+                    threading.Thread(
+                        target=run_limited,
+                        args=(
+                            f"limited-{index}",
+                            document,
+                            destinations[f"limited-{index}"],
+                        ),
+                    )
+                    for index, document in enumerate(limited_documents, start=1)
+                ]
+                for worker in limited_workers:
+                    worker.start()
+                self.assertTrue(ready_for_available.wait(timeout=1.0))
+                available_worker = threading.Thread(
+                    target=run_available,
+                    args=(destinations["available"],),
+                )
+                available_worker.start()
+                try:
+                    self.assertTrue(available_started.wait(timeout=0.25))
+                finally:
+                    release_waits.set()
+                    for worker in (*limited_workers, available_worker):
+                        worker.join(timeout=2.0)
+
+        self.assertEqual(
+            results["limited-1"].transient_documents,
+            [limited_documents[0]],
+        )
+        self.assertEqual(
+            results["limited-2"].transient_documents,
+            [limited_documents[1]],
+        )
         self.assertEqual(results["available"].downloaded_count, 1)
 
     def test_document_batch_reuses_identical_payload_in_same_folder(self) -> None:
@@ -3299,6 +3485,52 @@ class LeadSearchTest(unittest.TestCase):
             [(60.0, None)] * 3,
         )
 
+    def test_first_pass_source_page_429_defers_without_waiting(self) -> None:
+        source_url = "https://planning.example.gov.uk/documents/ABC123"
+        application = PlanningApplication(
+            authority="Example",
+            uid="ABC123",
+            url=source_url,
+            reference="ABC123",
+            raw={"docs_url": source_url},
+        )
+
+        class RateLimitedOpener:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def open(self, request, timeout):
+                self.calls += 1
+                raise HTTPError(
+                    request.full_url,
+                    429,
+                    "Too Many Requests",
+                    {"Retry-After": "120"},
+                    None,
+                )
+
+        opener = RateLimitedOpener()
+        with (
+            patch(
+                "lead_generator.planning.leads._build_document_opener",
+                return_value=opener,
+            ),
+            patch("lead_generator.planning.leads._REQUEST_COOLDOWN_UNTIL", {}),
+            patch("lead_generator.planning.leads._LAST_REQUEST_AT", {}),
+            patch(
+                "lead_generator.planning.leads._wait_for_cancelable_delay",
+            ) as wait,
+        ):
+            discovery = discover_application_documents(
+                application,
+                defer_rate_limit=True,
+            )
+
+        self.assertEqual(opener.calls, 1)
+        self.assertEqual(len(discovery.failed_sources), 1)
+        self.assertIn("HTTP Error 429", discovery.failed_sources[0].reason)
+        wait.assert_not_called()
+
     def test_document_discovery_rate_limit_wait_propagates_cancellation(self) -> None:
         source_url = "https://planning.example.gov.uk/documents/ABC123"
         application = PlanningApplication(
@@ -3557,6 +3789,10 @@ class LeadSearchTest(unittest.TestCase):
 
         for status in (429, 503):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                with leads_module._REQUEST_THROTTLE_LOCK:
+                    leads_module._LAST_REQUEST_AT.clear()
+                    leads_module._REQUEST_COOLDOWN_UNTIL.clear()
+
                 class RateLimitedBrowser:
                     def __init__(self, timeout_seconds):
                         pass
@@ -3594,6 +3830,53 @@ class LeadSearchTest(unittest.TestCase):
                     set_cooldown.assert_called_once_with(documents[0].url, 60.0)
                 else:
                     set_cooldown.assert_not_called()
+
+    def test_final_browser_retry_waits_for_retained_cooldown_cancelably(self) -> None:
+        document = PlanningDocument(
+            title="Browser plan.pdf",
+            url="https://planning.example.gov.uk/index.html?fa=downloaddocument&id=1",
+            source_url="https://planning.example.gov.uk/index.html?fa=getApplication&id=1",
+        )
+        browser_created = False
+
+        class UnexpectedBrowser:
+            def __init__(self, timeout_seconds):
+                nonlocal browser_created
+                browser_created = True
+
+            def close(self):
+                pass
+
+        should_cancel = lambda: False
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch(
+                "lead_generator.planning.leads.CouncilBrowserClient",
+                UnexpectedBrowser,
+            ),
+            patch(
+                "lead_generator.planning.leads._REQUEST_COOLDOWN_UNTIL",
+                {"planning.example.gov.uk": leads_module.monotonic() + 120.0},
+            ),
+            patch("lead_generator.planning.leads._LAST_REQUEST_AT", {}),
+            patch(
+                "lead_generator.planning.leads._wait_for_cancelable_delay",
+                return_value=False,
+            ) as wait,
+        ):
+            result = _download_pdf_documents_once(
+                [document],
+                Path(directory),
+                should_cancel=should_cancel,
+                defer_transient=False,
+            )
+
+        self.assertFalse(browser_created)
+        self.assertEqual(result.downloaded_count, 0)
+        wait.assert_called_once()
+        waited_seconds, waited_callback = wait.call_args.args
+        self.assertLessEqual(waited_seconds, 120.0)
+        self.assertIs(waited_callback, should_cancel)
 
     def test_host_cooldown_wait_is_cancelable(self) -> None:
         url = "https://planning.example.gov.uk/docs/proposed-plan.pdf"
@@ -3820,7 +4103,13 @@ class LeadSearchTest(unittest.TestCase):
                 verified_opener = VerifiedOpener()
                 unverified_opener = UnverifiedOpener()
 
-                def fake_source_candidates(document, opener, *, cache=None):
+                def fake_source_candidates(
+                    document,
+                    opener,
+                    *,
+                    cache=None,
+                    defer_rate_limit=False,
+                ):
                     if opener is verified_opener:
                         discoveries.append("verified")
                         return [verified_url]

@@ -493,7 +493,11 @@ def test_recovery_retries_partial_discovery_after_other_rows(tmp_path: Path) -> 
     discovery_calls = {"REF-1": 0, "REF-2": 0}
     events: list[str] = []
 
-    def fake_discovery(application: PlanningApplication) -> DocumentDiscoveryResult:
+    def fake_discovery(
+        application: PlanningApplication,
+        *,
+        defer_rate_limit: bool = False,
+    ) -> DocumentDiscoveryResult:
         reference = application.reference or ""
         discovery_calls[reference] += 1
         attempt = "first" if discovery_calls[reference] == 1 else "final"
@@ -552,7 +556,11 @@ def test_recovery_isolates_row_errors_and_categorizes_missing_drawings(tmp_path:
     append_csv_rows(tmp_path / "applications.csv", APPLICATION_CSV_FIELDS, rows)
     catalogue = json.loads(_catalogue_json("Example Council"))
 
-    def fake_discovery(application: PlanningApplication) -> DocumentDiscoveryResult:
+    def fake_discovery(
+        application: PlanningApplication,
+        *,
+        defer_rate_limit: bool = False,
+    ) -> DocumentDiscoveryResult:
         if application.reference == "REF-1":
             raise RuntimeError("portal unavailable")
         return DocumentDiscoveryResult(successful_sources=[application.url])
@@ -679,7 +687,11 @@ def test_recovery_clears_only_matching_rotated_url_failure(tmp_path: Path) -> No
     )
     discovery_calls = 0
 
-    def fake_discovery(application: PlanningApplication) -> DocumentDiscoveryResult:
+    def fake_discovery(
+        application: PlanningApplication,
+        *,
+        defer_rate_limit: bool = False,
+    ) -> DocumentDiscoveryResult:
         nonlocal discovery_calls
         discovery_calls += 1
         return DocumentDiscoveryResult(
@@ -936,6 +948,28 @@ def test_recovery_does_not_strip_collision_suffix_from_document_identity(
     )
 
     assert not _existing_file_matches_document(existing, numbered_document)
+
+
+@pytest.mark.parametrize(
+    ("existing_name", "document_name"),
+    [
+        ("plan.pdf.doc", "plan.pdf"),
+        ("plan.doc.pdf", "plan.doc"),
+    ],
+)
+def test_recovery_does_not_match_mixed_saved_extensions(
+    tmp_path: Path,
+    existing_name: str,
+    document_name: str,
+) -> None:
+    existing = tmp_path / existing_name
+    existing.write_bytes(b"%PDF-existing")
+    document = PlanningDocument(
+        document_name,
+        f"https://docs.test/{document_name}",
+    )
+
+    assert not _existing_file_matches_document(existing, document)
 
 
 def test_recovery_preserves_exact_extensionless_filename_match(

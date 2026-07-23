@@ -472,6 +472,14 @@ class DocumentDiscoveryTransientError(RuntimeError):
         super().__init__(f"{source_url}: {reason}")
 
 
+class _HostRateLimitDeferredError(RuntimeError):
+    """A first-pass request was deferred behind an active host cooldown."""
+
+    def __init__(self, url: str) -> None:
+        self.url = url
+        super().__init__(f"{url}: host rate-limit cooldown is active")
+
+
 @dataclass(frozen=True, slots=True)
 class DocumentSourceFailure:
     source_url: str
@@ -979,6 +987,7 @@ def run_lead_search(
                 discovery = discover_application_documents(
                     job.application,
                     should_cancel=cancellation_requested,
+                    defer_rate_limit=not final_attempt,
                 )
                 job.successful_document_sources.update(discovery.successful_sources)
                 job.document_source_failures = list(discovery.failed_sources)
@@ -1804,6 +1813,7 @@ def discover_application_documents(
     application: PlanningApplication,
     *,
     should_cancel: CancelCallback | None = None,
+    defer_rate_limit: bool = False,
 ) -> DocumentDiscoveryResult:
     result = DocumentDiscoveryResult()
     seen: set[str] = set()
@@ -1846,6 +1856,7 @@ def discover_application_documents(
                 docs_url,
                 discovery_result=result,
                 should_cancel=should_cancel,
+                defer_rate_limit=defer_rate_limit,
             ),
         )
         for document in fetched:
@@ -1857,6 +1868,7 @@ def discover_application_documents(
                         document_url,
                         discovery_result=result,
                         should_cancel=should_cancel,
+                        defer_rate_limit=defer_rate_limit,
                     ),
                 )
                 merge(nested_documents)
@@ -2007,6 +2019,7 @@ def fetch_planit_documents(
     follow_associated: bool = True,
     discovery_result: DocumentDiscoveryResult | None = None,
     should_cancel: CancelCallback | None = None,
+    defer_rate_limit: bool = False,
     _associated_depth: int = 0,
     _visited_sources: set[str] | None = None,
 ) -> list[PlanningDocument]:
@@ -2019,12 +2032,14 @@ def fetch_planit_documents(
         text, page_url, opener = _fetch_html_document_page(
             docs_url,
             timeout=45,
+            defer_rate_limit=defer_rate_limit,
         )
     else:
         text, page_url, opener = _fetch_html_document_page(
             docs_url,
             timeout=45,
             should_cancel=should_cancel,
+            defer_rate_limit=defer_rate_limit,
         )
     visited_sources.add(normalize_url(page_url))
     document = html.fromstring(text)
@@ -2042,6 +2057,7 @@ def fetch_planit_documents(
             page_url,
             opener,
             should_cancel=should_cancel,
+            defer_rate_limit=defer_rate_limit,
         ),
         discovery_result,
     )
@@ -2061,6 +2077,7 @@ def fetch_planit_documents(
             page_url,
             opener,
             should_cancel=should_cancel,
+            defer_rate_limit=defer_rate_limit,
         ),
         discovery_result,
     )
@@ -2076,6 +2093,7 @@ def fetch_planit_documents(
                 page_url,
                 opener,
                 should_cancel=should_cancel,
+                defer_rate_limit=defer_rate_limit,
             ),
             discovery_result,
         )
@@ -2094,6 +2112,7 @@ def fetch_planit_documents(
                     follow_associated=True,
                     discovery_result=discovery_result,
                     should_cancel=should_cancel,
+                    defer_rate_limit=defer_rate_limit,
                     _associated_depth=_associated_depth + 1,
                     _visited_sources=visited_sources,
                 )
@@ -2340,6 +2359,18 @@ def _download_pdf_documents_once(
     defer_transient: bool = True,
 ) -> DocumentDownloadBatchResult:
     result = DocumentDownloadBatchResult()
+    ready_documents: list[tuple[int, PlanningDocument]] = []
+    for index, document in enumerate(list(documents), start=1):
+        if not _looks_like_downloadable_document(document):
+            _log(log, f"Skipped excluded document link: {document.title}")
+            continue
+        if defer_transient and _document_has_active_rate_limit_cooldown(document):
+            result.transient_documents.append(document)
+            continue
+        ready_documents.append((index, document))
+    if not ready_documents:
+        return result
+
     blocked_hosts: set[str] = set()
     browser: CouncilBrowserClient | None = None
     browser_source_url: str | None = None
@@ -2349,6 +2380,20 @@ def _download_pdf_documents_once(
     def download_one(index: int, document: PlanningDocument) -> None:
         nonlocal browser, browser_source_url
         if _requires_browser_download(document):
+            request_urls_by_host: dict[str, str] = {}
+            for request_url in (document.source_url, document.url):
+                if not request_url:
+                    continue
+                request_urls_by_host.setdefault(
+                    urlsplit(request_url).netloc.casefold(),
+                    request_url,
+                )
+            for request_url in request_urls_by_host.values():
+                _throttle_request(
+                    request_url,
+                    should_cancel=should_cancel,
+                    defer_rate_limit=defer_transient,
+                )
             if browser is None:
                 browser = CouncilBrowserClient(timeout_seconds=60)
             if document.source_url and browser_source_url != document.source_url:
@@ -2382,11 +2427,13 @@ def _download_pdf_documents_once(
 
     with _DOCUMENT_DOWNLOAD_GATE:
         try:
-            for index, document in enumerate(documents, start=1):
+            for index, document in ready_documents:
                 if should_cancel and should_cancel():
                     break
-                if not _looks_like_downloadable_document(document):
-                    _log(log, f"Skipped excluded document link: {document.title}")
+                if defer_transient and _document_has_active_rate_limit_cooldown(
+                    document
+                ):
+                    result.transient_documents.append(document)
                     continue
                 document_host = urlsplit(document.source_url or document.url).netloc.casefold()
                 if document_host and document_host in blocked_hosts:
@@ -2454,6 +2501,15 @@ def _council_fetch_http_status(exc: Exception) -> int | None:
         return None
     match = re.search(r"\bHTTP\s+(\d{3})\b", str(exc), flags=re.IGNORECASE)
     return int(match.group(1)) if match else None
+
+
+def _document_has_active_rate_limit_cooldown(
+    document: PlanningDocument,
+) -> bool:
+    urls = [document.url]
+    if _requires_browser_download(document) and document.source_url:
+        urls.insert(0, document.source_url)
+    return any(_request_cooldown_remaining_seconds(url) > 0 for url in urls)
 
 
 def _wait_for_document_retry_cooldown(
@@ -2624,6 +2680,7 @@ def _download_document_file(
                         document,
                         opener,
                         cache=source_cache,
+                        defer_rate_limit=defer_rate_limit,
                     )
                 else:
                     discovered_candidates = source_document_candidates(
@@ -2631,6 +2688,7 @@ def _download_document_file(
                         opener,
                         cache=source_cache,
                         should_cancel=should_cancel,
+                        defer_rate_limit=defer_rate_limit,
                     )
                 pending.extend(discovered_candidates)
             except Exception as exc:
@@ -2659,6 +2717,7 @@ def _download_document_file(
                     url,
                     should_cancel=should_cancel,
                     ignore_cooldown_through=waited_cooldown_through,
+                    defer_rate_limit=defer_rate_limit,
                 )
                 waited_cooldown_through = None
                 with opener.open(request, timeout=30) as response:
@@ -2702,6 +2761,8 @@ def _download_document_file(
                     raise DocumentDownloadCancelledError("Document download cancelled")
                 waited_cooldown_through = cooldown_deadline
                 _skip_next_throttle(url)
+            except _HostRateLimitDeferredError:
+                raise
             except Exception as exc:
                 last_error = exc
                 if replace_opener_for_tls(exc):
@@ -2760,6 +2821,7 @@ def source_document_candidates(
     *,
     cache: dict[str, list[PlanningDocument]] | None = None,
     should_cancel: CancelCallback | None = None,
+    defer_rate_limit: bool = False,
 ) -> list[str]:
     if not document.source_url:
         return []
@@ -2778,6 +2840,7 @@ def source_document_candidates(
                 opener,
                 timeout=30,
                 should_cancel=should_cancel,
+                defer_rate_limit=defer_rate_limit,
             )
         except DocumentDownloadCancelledError:
             raise
@@ -2802,6 +2865,7 @@ def source_document_candidates(
                     page_url,
                     opener,
                     should_cancel=should_cancel,
+                    defer_rate_limit=defer_rate_limit,
                 )
             )
         )
@@ -2813,6 +2877,7 @@ def source_document_candidates(
                     page_url,
                     opener,
                     should_cancel=should_cancel,
+                    defer_rate_limit=defer_rate_limit,
                 )
             )
         )
@@ -2824,6 +2889,7 @@ def source_document_candidates(
                         page_url,
                         opener,
                         should_cancel=should_cancel,
+                        defer_rate_limit=defer_rate_limit,
                     )
                 )
             )
@@ -3045,6 +3111,7 @@ def fetch_publisher_document_list(
     opener,
     *,
     should_cancel: CancelCallback | None = None,
+    defer_rate_limit: bool = False,
 ) -> list[PlanningDocument]:
     match = re.search(r'"url"\s*:\s*"([^"]*getDocumentList[^"]*)"', text)
     if not match:
@@ -3066,6 +3133,7 @@ def fetch_publisher_document_list(
             timeout=45,
             opener=opener,
             should_cancel=should_cancel,
+            defer_rate_limit=defer_rate_limit,
         ) as response:
             payload = response.read().decode("utf-8", errors="replace")
         data = json.loads(payload)
@@ -3158,6 +3226,7 @@ def fetch_enterprise_document_list(
     opener,
     *,
     should_cancel: CancelCallback | None = None,
+    defer_rate_limit: bool = False,
 ) -> list[PlanningDocument]:
     try:
         document = html.fromstring(text)
@@ -3192,6 +3261,7 @@ def fetch_enterprise_document_list(
             timeout=45,
             opener=opener,
             should_cancel=should_cancel,
+            defer_rate_limit=defer_rate_limit,
         ) as response:
             fragment = response.read().decode("utf-8", errors="replace")
         fragment_document = html.fromstring(fragment)
@@ -3225,6 +3295,7 @@ def _fetch_arcus_aura_actions(
     source_name: str,
     *,
     should_cancel: CancelCallback | None = None,
+    defer_rate_limit: bool = False,
 ) -> list[dict[str, object]]:
     try:
         with _open_url_with_retry(
@@ -3232,6 +3303,7 @@ def _fetch_arcus_aura_actions(
             timeout=45,
             opener=opener,
             should_cancel=should_cancel,
+            defer_rate_limit=defer_rate_limit,
         ) as response:
             response_text = response.read().decode("utf-8", errors="replace")
         payload_data = json.loads(response_text)
@@ -3276,6 +3348,7 @@ def fetch_arcus_salesforce_document_list(
     opener,
     *,
     should_cancel: CancelCallback | None = None,
+    defer_rate_limit: bool = False,
 ) -> list[PlanningDocument]:
     record_id = _salesforce_arcus_record_id(page_url)
     context = _salesforce_aura_context(text)
@@ -3334,6 +3407,7 @@ def fetch_arcus_salesforce_document_list(
         opener,
         "Arcus Salesforce",
         should_cancel=should_cancel,
+        defer_rate_limit=defer_rate_limit,
     )
     return_value = _arcus_action_return_value(
         actions,
@@ -3357,6 +3431,7 @@ def fetch_arcus_public_register_file_list(
     opener,
     *,
     should_cancel: CancelCallback | None = None,
+    defer_rate_limit: bool = False,
 ) -> list[PlanningDocument]:
     record_id = _salesforce_arcus_record_id(page_url)
     context = _salesforce_aura_context(text)
@@ -3415,6 +3490,7 @@ def fetch_arcus_public_register_file_list(
         opener,
         "Arcus public register",
         should_cancel=should_cancel,
+        defer_rate_limit=defer_rate_limit,
     )
     return_value = _arcus_action_return_value(
         actions,
@@ -3470,6 +3546,7 @@ def fetch_arcus_files_public_document_list(
     opener,
     *,
     should_cancel: CancelCallback | None = None,
+    defer_rate_limit: bool = False,
 ) -> list[PlanningDocument]:
     record_id = _salesforce_arcus_record_id(page_url)
     context = _salesforce_aura_context(text)
@@ -3522,6 +3599,7 @@ def fetch_arcus_files_public_document_list(
         opener,
         "Arcus FilesPublic",
         should_cancel=should_cancel,
+        defer_rate_limit=defer_rate_limit,
     )
     return_value = _arcus_action_return_value(
         actions,
@@ -3934,6 +4012,7 @@ def _open_url_with_retry(
     timeout: float,
     opener=None,
     should_cancel: CancelCallback | None = None,
+    defer_rate_limit: bool = False,
 ):
     waited_cooldown_through: float | None = None
     for attempt in range(4):
@@ -3944,6 +4023,7 @@ def _open_url_with_retry(
                 request.full_url,
                 should_cancel=should_cancel,
                 ignore_cooldown_through=waited_cooldown_through,
+                defer_rate_limit=defer_rate_limit,
             )
             waited_cooldown_through = None
             if opener is not None:
@@ -3962,6 +4042,8 @@ def _open_url_with_retry(
                     request.full_url,
                     delay,
                 )
+                if defer_rate_limit:
+                    raise
             if attempt == 3:
                 raise
             if not _wait_for_cancelable_delay(delay, should_cancel):
@@ -3988,6 +4070,7 @@ def _fetch_html_with_portal_session(
     *,
     timeout: float,
     should_cancel: CancelCallback | None = None,
+    defer_rate_limit: bool = False,
 ) -> tuple[str, str]:
     page_url = url
     text = ""
@@ -3998,6 +4081,7 @@ def _fetch_html_with_portal_session(
             timeout=timeout,
             opener=opener,
             should_cancel=should_cancel,
+            defer_rate_limit=defer_rate_limit,
         ) as response:
             text = response.read().decode("utf-8", errors="replace")
             page_url = response.geturl()
@@ -4024,6 +4108,7 @@ def _fetch_html_with_portal_session(
             timeout=timeout,
             opener=opener,
             should_cancel=should_cancel,
+            defer_rate_limit=defer_rate_limit,
         ) as response:
             text = response.read().decode("utf-8", errors="replace")
             page_url = response.geturl()
@@ -4035,6 +4120,7 @@ def _fetch_html_document_page(
     *,
     timeout: float,
     should_cancel: CancelCallback | None = None,
+    defer_rate_limit: bool = False,
 ):
     opener = _build_document_opener()
     try:
@@ -4043,6 +4129,7 @@ def _fetch_html_document_page(
             opener,
             timeout=timeout,
             should_cancel=should_cancel,
+            defer_rate_limit=defer_rate_limit,
         )
         return text, page_url, opener
     except Exception as exc:
@@ -4053,6 +4140,7 @@ def _fetch_html_document_page(
                 opener,
                 timeout=timeout,
                 should_cancel=should_cancel,
+                defer_rate_limit=defer_rate_limit,
             )
             return text, page_url, opener
         if not _is_tls_certificate_error(exc):
@@ -4063,6 +4151,7 @@ def _fetch_html_document_page(
         opener,
         timeout=timeout,
         should_cancel=should_cancel,
+        defer_rate_limit=defer_rate_limit,
     )
     return text, page_url, opener
 
@@ -4180,6 +4269,7 @@ def _throttle_request(
     *,
     should_cancel: CancelCallback | None = None,
     ignore_cooldown_through: float | None = None,
+    defer_rate_limit: bool = False,
 ) -> None:
     netloc = urlsplit(url).netloc.casefold()
     if not netloc:
@@ -4187,24 +4277,47 @@ def _throttle_request(
     delay = PLANIT_REQUEST_THROTTLE_SECONDS if netloc.endswith("planit.org.uk") else REQUEST_THROTTLE_SECONDS
     with _REQUEST_THROTTLE_LOCK:
         host_lock = _REQUEST_HOST_LOCKS.setdefault(netloc, threading.Lock())
-    with host_lock:
-        with _REQUEST_THROTTLE_LOCK:
-            now = monotonic()
-            cooldown_until = _REQUEST_COOLDOWN_UNTIL.get(netloc, 0.0)
-            if (
-                ignore_cooldown_through is not None
-                and cooldown_until <= ignore_cooldown_through
-            ):
-                cooldown_until = 0.0
-            ready_at = max(
-                _LAST_REQUEST_AT.get(netloc, 0.0) + delay,
-                cooldown_until,
-            )
-            wait = max(ready_at - now, 0.0)
-        if wait and not _wait_for_cancelable_delay(wait, should_cancel):
+    cooldown_bypass = ignore_cooldown_through
+    while True:
+        with host_lock:
+            with _REQUEST_THROTTLE_LOCK:
+                now = monotonic()
+                cooldown_until = _REQUEST_COOLDOWN_UNTIL.get(netloc, 0.0)
+                if (
+                    cooldown_bypass is not None
+                    and cooldown_until <= cooldown_bypass
+                ):
+                    cooldown_until = 0.0
+                cooldown_wait = max(cooldown_until - now, 0.0)
+                if defer_rate_limit and cooldown_wait:
+                    raise _HostRateLimitDeferredError(url)
+                throttle_wait = max(
+                    _LAST_REQUEST_AT.get(netloc, 0.0) + delay - now,
+                    0.0,
+                )
+            if not cooldown_wait:
+                if throttle_wait and not _wait_for_cancelable_delay(
+                    throttle_wait,
+                    should_cancel,
+                ):
+                    raise DocumentDownloadCancelledError(
+                        "Document download cancelled"
+                    )
+                with _REQUEST_THROTTLE_LOCK:
+                    _LAST_REQUEST_AT[netloc] = monotonic()
+                return
+        if not _wait_for_cancelable_delay(cooldown_wait, should_cancel):
             raise DocumentDownloadCancelledError("Document download cancelled")
-        with _REQUEST_THROTTLE_LOCK:
-            _LAST_REQUEST_AT[netloc] = monotonic()
+        cooldown_bypass = max(cooldown_bypass or 0.0, cooldown_until)
+
+
+def _request_cooldown_remaining_seconds(url: str) -> float:
+    netloc = urlsplit(url).netloc.casefold()
+    if not netloc:
+        return 0.0
+    with _REQUEST_THROTTLE_LOCK:
+        cooldown_until = _REQUEST_COOLDOWN_UNTIL.get(netloc, 0.0)
+    return max(cooldown_until - monotonic(), 0.0)
 
 
 def _set_request_cooldown(url: str, seconds: float) -> float:
