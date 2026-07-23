@@ -101,7 +101,11 @@ AUTHOR_ROLE_MARKERS = (
 NAME_NOISE_MARKERS = (
     "copyright",
     "all rights reserved",
+    "this drawing",
+    "property of",
+    "not copied",
     "checked by",
+    "checked and",
     "approved by",
     "surveyed",
     "authorised",
@@ -311,7 +315,12 @@ class _Accumulator:
 
     def add_name(self, value: str | None) -> None:
         value = _clean_candidate(value)
-        if not value or self.exclusions.matches_party(value) or _is_generic_company_heading(value):
+        if (
+            not value
+            or _is_name_noise(value)
+            or self.exclusions.matches_party(value)
+            or _is_generic_company_heading(value)
+        ):
             return
         if any(
             _same_value(value, existing) or _similar_company_name(value, existing)
@@ -335,13 +344,16 @@ class _Accumulator:
         if value.startswith("email-"):
             value = value.removeprefix("email-")
         if value and not _blocked_email(value):
-            before = len(self.result.email_addresses)
-            _append_unique(self.result.email_addresses, value)
-            if len(self.result.email_addresses) > before:
-                self._record_source("Email Address")
+            if any(
+                _similar_ocr_email(value, existing)
+                for existing in self.result.email_addresses
+            ):
+                return
+            self.result.email_addresses.append(value)
+            self._record_source("Email Address")
 
     def add_address(self, value: str | None) -> None:
-        value = _clean_candidate(value)
+        value = _clean_professional_address(value)
         if not value or self.exclusions.matches_address(value):
             return
         value_postcodes = set(_postcodes(value))
@@ -773,6 +785,10 @@ def _is_name_noise(value: str) -> bool:
     folded = _clean_candidate(value).casefold()
     if not folded or any(marker in folded for marker in NAME_NOISE_MARKERS):
         return True
+    if folded in {"studio", "group limited", "group ltd"}:
+        return True
+    if folded.startswith("of "):
+        return True
     if re.search(r"(?:^|\s)rev(?:ision)?\s*[:\-]", folded):
         return True
     if re.search(r"(?:^|\s)date\s*[:\-]", folded):
@@ -908,18 +924,35 @@ def _needs_ocr(text: str) -> bool:
 
 
 def _blocked_email(value: str) -> bool:
-    if "@" not in value:
+    if value.count("@") != 1 or not re.fullmatch(
+        r"(?i)[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", value
+    ):
         return True
-    domain = value.rsplit("@", 1)[-1]
+    local_part, domain = value.rsplit("@", 1)
+    if re.match(r"\d{3,}", local_part):
+        return True
+    if re.search(
+        r"(?i)(?:\.(?:co|org|ac|gov)\.uk|\.(?:com|net|org))[a-z0-9]",
+        domain,
+    ):
+        return True
+    public_suffixes = re.findall(
+        r"(?i)\.(?:co\.uk|org\.uk|ac\.uk|gov\.uk|com|net|org)\b",
+        domain,
+    )
+    if len(public_suffixes) > 1:
+        return True
     return any(domain.endswith(blocked) for blocked in BLOCKED_EMAIL_DOMAINS)
 
 
 def _normalise_phone(value: str) -> str:
+    if value.count("(") != value.count(")"):
+        return ""
     if re.search(r"\b\d{4,6}\.\d{3,}\b", value):
         return ""
     if re.search(r"(?:^|\s)0(?:[\s./-]+0){2,}(?:\s|$)", value):
         return ""
-    if re.fullmatch(r"\s*\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\s*", value):
+    if re.fullmatch(r"\s*\d{1,2}[./-]\d{1,6}[./-]\d{1,4}\s*", value):
         return ""
     digits = re.sub(r"\D", "", value)
     if digits.startswith("00440"):
@@ -932,7 +965,55 @@ def _normalise_phone(value: str) -> str:
         digits = "0" + digits[2:]
     if len(digits) not in {10, 11} or not digits.startswith(("01", "02", "03", "07", "08")):
         return ""
+    if digits.startswith("02") and digits[:3] not in {"020", "023", "024", "028", "029"}:
+        return ""
     return re.sub(r"\s+", " ", value).strip(" .,;:-")
+
+
+def _clean_professional_address(value: str | None) -> str:
+    value = _clean_candidate(value)
+    postcode_match = POSTCODE_RE.search(value)
+    if not value or not postcode_match:
+        return ""
+    address = value[:postcode_match.end()].strip(" ,;:-")
+    folded = address.casefold()
+    if any(
+        marker in folded
+        for marker in (
+            "copyright",
+            "all rights reserved",
+            "this drawing",
+            "property of",
+            "not copied",
+            "construction",
+            "issued on",
+            "www.",
+            "http://",
+            "https://",
+        )
+    ):
+        return ""
+    if re.search(r"(?i)\b(?:tel(?:ephone)?|phone|email|web)\s*:", address):
+        return ""
+    if EMAIL_RE.search(address) or PHONE_RE.search(address):
+        return ""
+    if not ADDRESS_WORD_RE.search(address) and address.count(",") < 2:
+        return ""
+    return address
+
+
+def _similar_ocr_email(left: str, right: str) -> bool:
+    left_local, left_domain = left.rsplit("@", 1)
+    right_local, right_domain = right.rsplit("@", 1)
+    if left_domain != right_domain or abs(len(left_local) - len(right_local)) > 1:
+        return False
+    if len(left_local) == len(right_local):
+        return sum(a != b for a, b in zip(left_local, right_local)) <= 1
+    shorter, longer = sorted((left_local, right_local), key=len)
+    for index in range(len(longer)):
+        if shorter == longer[:index] + longer[index + 1:]:
+            return True
+    return False
 
 
 def _text_lines(text: str) -> list[str]:

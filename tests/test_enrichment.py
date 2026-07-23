@@ -201,6 +201,85 @@ def test_management_plan_never_enriches_even_with_drawing_markers() -> None:
     assert result.rejected_documents == {filename: "narrative document title"}
 
 
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "FRAMEWORK_TRAVEL_PLAN.pdf",
+        "ENERGY_STRATEGY_AND_SUSTAINABILITY_STATEMENT.pdf",
+        "LANDSCAPE_AND_VISUAL_IMPACT_ASSESSMENT.pdf",
+        "ENVIRONMENTAL_STATEMENT_APPENDIX_12_PROPOSED_DRAWINGS.pdf",
+        "GREEN_BELT_REVIEW.pdf",
+        "EXTERNAL_MATERIALS.pdf",
+        "DRAWING_REGISTER.pdf",
+        "NMA_COMPARISON_PRESENTATION.pdf",
+        "WORKING_METHOD_STATEMENT_WMS.pdf",
+        "CONSTRUCTION_ENVIRONMENTAL_MANAGEMENT_PLAN_CEMP.pdf",
+        "PLANNING_REPORT.pdf",
+        "PLANNING_STATEMENT.pdf",
+        "PLANNING_APPLICATION_APPENDIX.pdf",
+        "PROPOSED_DRAWINGS_SUPPORTING_REPORTS.pdf",
+        "PROPOSED_PLANS_TECHNICAL_ASSESSMENTS.pdf",
+        "PROPOSED_LAYOUT_MATERIAL_SPECIFICATIONS.pdf",
+    ],
+)
+def test_narrative_document_filenames_are_rejected_before_pdf_reading(
+    filename: str,
+) -> None:
+    misleading_body = (
+        "PROPOSED DRAWING\nDRAWING NUMBER A-101\nSCALE 1:100\nREVISION P1"
+    )
+
+    preliminary = preclassify_drawing_source(filename)
+
+    assert preliminary.eligible is False
+    assert preliminary.needs_text is False
+    assert classify_drawing_source(filename, misleading_body).eligible is False
+
+
+def test_narrative_document_is_not_read_or_ocr_processed() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        folder = Path(directory)
+        filename = "FRAMEWORK_TRAVEL_PLAN.pdf"
+        (folder / filename).touch()
+
+        with patch.object(enrichment, "extract_pdf_text") as extract_pdf_text:
+            result = enrichment.enrich_application_folder(folder)
+
+    extract_pdf_text.assert_not_called()
+    assert result.eligible_documents == []
+    assert result.rejected_documents == {filename: "narrative document title"}
+
+
+def test_later_report_body_drawing_references_cannot_make_document_eligible() -> None:
+    text = "\n".join(
+        [
+            "GENERAL DEVELOPMENT NOTES",
+            *(f"Narrative paragraph {index}" for index in range(35)),
+            "PROPOSED SITE PLAN",
+            "DRAWING NUMBER A-101",
+            "SCALE 1:100",
+            "REVISION P1",
+        ]
+    )
+
+    assert classify_drawing_source("Document 123.pdf", text).eligible is False
+
+
+def test_ambiguous_drawing_evidence_must_be_close_together_on_title_page() -> None:
+    text = "\n".join(
+        [
+            "PROPOSED DEVELOPMENT",
+            *(f"General note {index}" for index in range(15)),
+            "SITE PLAN",
+            *(f"Additional note {index}" for index in range(15)),
+            "DRAWING NUMBER A-101",
+            "SCALE 1:100",
+        ]
+    )
+
+    assert classify_drawing_source("Document 123.pdf", text).eligible is False
+
+
 def test_application_form_alone_produces_failed_fields() -> None:
     with tempfile.TemporaryDirectory() as directory:
         folder = Path(directory)
@@ -217,6 +296,26 @@ def test_application_form_alone_produces_failed_fields() -> None:
         "Email Address": "Failed",
         "Company Address": "Failed",
     }
+
+
+def test_misnamed_application_form_cannot_contribute_contact_details() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        folder = Path(directory)
+        form_path = folder / "Proposed Site Plan.pdf"
+        form_path.touch()
+        document = _fake_pdf(form_path, APPLICATION_FORM_TEXT, application_form=True)
+
+        with patch.object(enrichment, "extract_pdf_text", return_value=document):
+            result = enrichment.enrich_application_folder(folder)
+
+    assert result.to_csv_row() == {
+        "Architect / Company Name": "Failed",
+        "Phone Number": "Failed",
+        "Email Address": "Failed",
+        "Company Address": "Failed",
+    }
+    assert result.eligible_documents == []
+    assert result.rejected_documents == {"Proposed Site Plan.pdf": "application form"}
 
 
 def test_partial_drawing_contact_keeps_only_available_fields() -> None:
@@ -246,6 +345,39 @@ def test_decimal_coordinates_are_not_phone_numbers() -> None:
     assert enrichment._normalise_phone("0.0306 0.557 0") == ""
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "0)1494 123 456",
+        "(01494 123456",
+        "07.202613.07",
+        "021 1234 5678",
+        "022 1234 5678",
+        "025 1234 5678",
+        "026 1234 5678",
+        "027 1234 5678",
+    ],
+)
+def test_malformed_date_like_and_invalid_area_phone_numbers_are_rejected(
+    value: str,
+) -> None:
+    assert enrichment._normalise_phone(value) == ""
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "020 7123 4567",
+        "023 8012 3456",
+        "024 7612 3456",
+        "028 9012 3456",
+        "029 2012 3456",
+    ],
+)
+def test_valid_uk_02_area_phone_numbers_remain_accepted(value: str) -> None:
+    assert enrichment._normalise_phone(value) == value
+
+
 def test_copyright_and_drawing_labels_are_not_names() -> None:
     accumulator = enrichment._Accumulator(enrichment._Exclusions())
     enrichment.extract_professional_details(
@@ -259,6 +391,95 @@ def test_copyright_and_drawing_labels_are_not_names() -> None:
     row = accumulator.result.to_csv_row()
     assert row["Architect / Company Name"] == "XL Planning LTD"
     assert "COPYRIGHT" not in row["Architect / Company Name"].upper()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "ALL RIGHTS RESERVED COPYRIGHT \u00c2\u00a9 2026 XL PLANNING LIMITED",
+        "This drawing is the property of CUTLERURCH LTD",
+        "checked and NEO Architects",
+        "of NEO Architects",
+        "STUDIO",
+        "GROUP LIMITED",
+    ],
+)
+def test_drawing_note_and_generic_company_names_are_rejected(value: str) -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+
+    accumulator.add_name(value)
+
+    assert accumulator.result.architect_company_names == []
+
+
+def test_valid_company_name_remains_accepted_after_noise_filtering() -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+
+    accumulator.add_name("NEO Architects")
+
+    assert accumulator.result.architect_company_names == ["NEO Architects"]
+
+
+def test_company_address_is_safely_trimmed_after_first_postcode() -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+
+    accumulator.add_address(
+        "Motion, Quadrant House, Broad Street Mall, Reading, RG1 7QE "
+        "Tel: 0118 467 4498 www.motion.co.uk"
+    )
+
+    assert accumulator.result.company_addresses == [
+        "Motion, Quadrant House, Broad Street Mall, Reading, RG1 7QE"
+    ]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "This drawing is the property of CUTLERURCH LTD, 1 Design Road, "
+        "London, SW1A 1AA",
+        "construction. This drawing, 2 Design Road, London, SW1A 1AA",
+        "Studio Arc Ltd, www.studioarc.co.uk, 3 Design Road, London, SW1A 1AA",
+        "Studio Arc Ltd, Tel: 020 7123 4567, 4 Design Road, London, SW1A 1AA",
+        "Copyright notice SW1A 1AA Telephone 020 7123 4567",
+    ],
+)
+def test_company_addresses_containing_drawing_or_contact_prose_are_rejected(
+    value: str,
+) -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+
+    accumulator.add_address(value)
+
+    assert accumulator.result.company_addresses == []
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "246317sionthaysen@yahoo.co.uk",
+        "hello@example.co.uk.co.uk",
+        "hello@example.co.ukinfo",
+        "hello@example.comcontact",
+        "studio@practice.co.ukinfo@other.co.uk",
+        "michael@@neoarchitects.co.uk",
+    ],
+)
+def test_damaged_email_addresses_are_rejected(value: str) -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+
+    accumulator.add_email(value)
+
+    assert accumulator.result.email_addresses == []
+
+
+def test_one_character_ocr_email_variants_are_deduplicated_per_domain() -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+
+    accumulator.add_email("michael@neoarchitects.co.uk")
+    accumulator.add_email("nichael@neoarchitects.co.uk")
+
+    assert accumulator.result.email_addresses == ["michael@neoarchitects.co.uk"]
 
 
 def test_client_company_and_coordinates_are_rejected_from_drawing() -> None:

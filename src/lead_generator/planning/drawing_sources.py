@@ -19,16 +19,30 @@ DRAWING_TOKENS = {
 }
 NARRATIVE_PHRASES = (
     "application form", "planning statement", "design and access statement",
-    "supporting statement", "report", "assessment", "survey", "letter",
-    "notice", "certificate", "schedule", "specification", "consultation",
-    "photograph", "photos", "method statement", "heritage statement",
-    "management plan",
+    "supporting statement", "report", "reports", "statement", "statements",
+    "assessment", "assessments", "survey", "surveys", "strategy",
+    "strategies", "travel plan", "environmental statement",
+    "landscape visual impact", "appendix", "appendices", "review", "reviews",
+    "presentation", "presentations",
+    "external materials", "material schedule", "materials schedule",
+    "drawing register", "cemp", "wms", "method statement", "letter",
+    "notice", "notices", "certificate", "certificates", "schedule",
+    "schedules", "specification", "specifications", "consultation",
+    "consultations",
+    "photograph", "photographs", "photos", "heritage statement",
+    "management plan", "design access statement", "das",
 )
-DRAWING_EVIDENCE_RE = re.compile(
-    r"(?i)\b(?:drawing\s*(?:no|number)|scale|revision|rev|drawn\s+by|checked\s+by)\b"
+DRAWING_EVIDENCE_PATTERNS = (
+    re.compile(r"(?i)\bdrawing\s*(?:no|number)\b"),
+    re.compile(r"(?i)\bscale\b"),
+    re.compile(r"(?i)\brev(?:ision)?\b"),
+    re.compile(r"(?i)\bdrawn\s+by\b"),
+    re.compile(r"(?i)\bchecked\s+by\b"),
 )
 DRAWING_CODE_RE = re.compile(r"(?i)^(?=.*\d)[a-z0-9][a-z0-9._ -]{2,}$")
-CLASSIFICATION_TEXT_LIMIT = 12_000
+TITLE_PAGE_LINE_LIMIT = 30
+TITLE_PAGE_TEXT_LIMIT = 3_000
+TITLE_BLOCK_WINDOW_LINES = 10
 
 
 def _phrase_text(value: str) -> str:
@@ -40,8 +54,37 @@ def _tokens(value: str) -> set[str]:
 
 
 def _has_narrative_marker(value: str) -> bool:
-    normalized = _phrase_text(value)
-    return any(phrase in normalized for phrase in NARRATIVE_PHRASES)
+    normalized = f" {_phrase_text(value)} "
+    return any(f" {_phrase_text(phrase)} " in normalized for phrase in NARRATIVE_PHRASES)
+
+
+def _title_page_lines(text: str) -> list[str]:
+    bounded = "\n".join(text.splitlines()[:TITLE_PAGE_LINE_LIMIT])
+    return [
+        line.strip()
+        for line in bounded[:TITLE_PAGE_TEXT_LIMIT].splitlines()
+        if line.strip()
+    ]
+
+
+def _has_ambiguous_drawing_evidence(filename: str, title_lines: list[str]) -> bool:
+    lines = [Path(filename).stem, *title_lines]
+    for start in range(len(lines)):
+        window = "\n".join(lines[start:start + TITLE_BLOCK_WINDOW_LINES])
+        tokens = _tokens(window)
+        evidence_count = sum(
+            bool(pattern.search(window)) for pattern in DRAWING_EVIDENCE_PATTERNS
+        )
+        has_drawing_type = bool(tokens & DRAWING_TOKENS) or bool(
+            DRAWING_EVIDENCE_PATTERNS[0].search(window)
+        )
+        if (
+            bool(tokens & STATUS_TOKENS)
+            and has_drawing_type
+            and evidence_count >= 2
+        ):
+            return True
+    return False
 
 
 def preclassify_drawing_source(filename: str) -> DrawingSourceDecision:
@@ -59,24 +102,17 @@ def preclassify_drawing_source(filename: str) -> DrawingSourceDecision:
 
 
 def classify_drawing_source(filename: str, text: str) -> DrawingSourceDecision:
-    title_text = "\n".join(text.splitlines()[:30])[:3_000]
-    bounded_text = "\n".join(
-        (text[:CLASSIFICATION_TEXT_LIMIT], text[-CLASSIFICATION_TEXT_LIMIT:])
-    )
-    combined = f"{Path(filename).stem}\n{bounded_text}"
+    title_lines = _title_page_lines(text)
+    title_text = "\n".join(title_lines)
     if _has_narrative_marker(Path(filename).stem) or _has_narrative_marker(title_text):
         return DrawingSourceDecision(False, False, "narrative document marker")
     filename_tokens = _tokens(Path(filename).stem)
-    tokens = _tokens(combined)
-    has_status = bool(tokens & STATUS_TOKENS)
     clear_filename = bool(filename_tokens & STATUS_TOKENS) and bool(
         filename_tokens & DRAWING_TOKENS
     )
-    evidence = {
-        match.group(0).casefold()
-        for match in DRAWING_EVIDENCE_RE.finditer(bounded_text)
-    }
-    eligible = clear_filename or (has_status and len(evidence) >= 2)
+    eligible = clear_filename or _has_ambiguous_drawing_evidence(
+        filename, title_lines
+    )
     reason = "eligible drawing" if eligible else "drawing status/type evidence incomplete"
     return DrawingSourceDecision(eligible, False, reason)
 
