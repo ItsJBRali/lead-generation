@@ -1048,6 +1048,9 @@ class LeadSearchTest(unittest.TestCase):
             captured_counts: list[int] = []
             reconciliation_thread_ids: list[int] = []
             calling_thread_id = threading.get_ident()
+            final_reconciliation_log = (
+                "Second Council: reconciliation primary=0 secondary=1 added=1"
+            )
 
             def fake_primary(target, start_date, end_date, *, should_cancel=None):
                 events.append(f"primary-query:{target.authority}")
@@ -1064,8 +1067,17 @@ class LeadSearchTest(unittest.TestCase):
                 if target.authority == "First Council":
                     events.append("first-planit-query")
                     return [duplicate, first_secondary]
-                events.append("last-planit-query")
                 return [second_secondary]
+
+            def record_captured(current: int) -> None:
+                captured_counts.append(current)
+                if current == 3:
+                    events.append("final-reconciliation-row-committed")
+
+            def record_log(message: str) -> None:
+                logs.append(message)
+                if message == final_reconciliation_log:
+                    events.append("final-reconciliation-complete")
 
             def fake_document_discovery(application, *, should_cancel=None, defer_rate_limit=False):
                 events.append("first-document-discovery")
@@ -1091,9 +1103,9 @@ class LeadSearchTest(unittest.TestCase):
             ):
                 result = run_lead_search(
                     config,
-                    log=logs.append,
+                    log=record_log,
                     progress=record_progress,
-                    captured=captured_counts.append,
+                    captured=record_captured,
                 )
 
             with result.csv_path.open(newline="", encoding="utf-8") as handle:
@@ -1113,7 +1125,7 @@ class LeadSearchTest(unittest.TestCase):
             reconciliation_messages,
             [
                 "First Council: reconciliation primary=1 secondary=2 added=1",
-                "Second Council: reconciliation primary=0 secondary=1 added=1",
+                final_reconciliation_log,
             ],
         )
         self.assertEqual(
@@ -1127,7 +1139,11 @@ class LeadSearchTest(unittest.TestCase):
             events.index("first-planit-query"),
         )
         self.assertLess(
-            events.index("last-planit-query"),
+            events.index("final-reconciliation-row-committed"),
+            events.index("final-reconciliation-complete"),
+        )
+        self.assertLess(
+            events.index("final-reconciliation-complete"),
             events.index("first-document-discovery"),
         )
 
