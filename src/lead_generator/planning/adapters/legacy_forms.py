@@ -746,6 +746,7 @@ class AstunPlanningScraper(NativeListingScraper):
 
 class StatMapPlanningScraper(NativeListingScraper):
     family = "statmap"
+    MAX_PAGED_RESULT_PAGES = 100
 
     def search(
         self,
@@ -763,8 +764,12 @@ class StatMapPlanningScraper(NativeListingScraper):
         seen_page_signatures: set[tuple[str, ...]] = set()
         seen_references: set[str] = set()
         applications: list[PlanningApplication] = []
+        processed_pages = 0
 
         while True:
+            if processed_pages >= self.MAX_PAGED_RESULT_PAGES:
+                raise PortalSearchCompletenessError("StatMap exceeded the maximum page request limit")
+            processed_pages += 1
             payload = {
                 "pageSize": page_size,
                 "offset": offset,

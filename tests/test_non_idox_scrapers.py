@@ -955,6 +955,28 @@ class NonIdoxScraperTest(unittest.TestCase):
                 limit=None,
             )
 
+    def test_statmap_raises_when_more_than_one_hundred_pages_are_required(self) -> None:
+        http = PaginatedStatMapHttp(
+            {
+                offset: {"total": 101, "records": [statmap_record(f"MO/{offset + 1}", "2026-07-21")]}
+                for offset in range(101)
+            }
+        )
+        scraper = StatMapPlanningScraper(
+            LegacyFormsCouncilConfig("Mole Valley", "https://molevalley.example"),
+            http_client=http,
+        )
+
+        with self.assertRaises(PortalSearchCompletenessError):
+            scraper.search(
+                "https://molevalley.example/horizoNext/",
+                start_date=date(2026, 7, 20),
+                end_date=date(2026, 7, 26),
+                limit=1,
+            )
+
+        self.assertEqual(len(http.posts), 100)
+
     def test_statmap_raises_for_invalid_page_metadata(self) -> None:
         for page in ({"total": "one", "records": []}, {"total": 0, "records": {}}):
             with self.subTest(page=page):
