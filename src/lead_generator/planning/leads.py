@@ -1352,45 +1352,51 @@ def run_lead_search(
                 if cancellation_requested():
                     break
 
-    if not cancelled:
-        for state in council_states.values():
-            if state.date_valid_references:
-                if state.primary_error:
-                    save_failure(state.target, state.primary_error)
-                if state.reconciliation_error:
-                    save_failure(
-                        state.target,
-                        f"PlanIt reconciliation warning: "
-                        f"{state.reconciliation_error}",
-                    )
-                continue
+    for state in council_states.values():
+        reconciliation_completed = (
+            state.reconciliation_succeeded
+            or state.reconciliation_error is not None
+        )
+        if not reconciliation_completed:
+            continue
 
-            any_source_succeeded = (
-                state.primary_succeeded or state.reconciliation_succeeded
-            )
-            if not any_source_succeeded:
-                failed_councils.append(state.target.authority)
-                had_error = True
-                primary_reason = state.primary_error or "Primary search did not complete"
-                reconciliation_reason = (
-                    state.reconciliation_error
-                    or "PlanIt reconciliation did not complete"
-                )
-                save_failure(
-                    state.target,
-                    f"Primary search failed: {primary_reason}; "
-                    f"PlanIt reconciliation failed: {reconciliation_reason}",
-                )
-                continue
-
+        if state.date_valid_references:
             if state.primary_error:
                 save_failure(state.target, state.primary_error)
             if state.reconciliation_error:
                 save_failure(
                     state.target,
-                    f"PlanIt reconciliation warning: {state.reconciliation_error}",
+                    f"PlanIt reconciliation warning: "
+                    f"{state.reconciliation_error}",
                 )
-            no_application_councils.append(state.target.authority)
+            continue
+
+        any_source_succeeded = (
+            state.primary_succeeded or state.reconciliation_succeeded
+        )
+        if not any_source_succeeded:
+            failed_councils.append(state.target.authority)
+            had_error = True
+            primary_reason = state.primary_error or "Primary search did not complete"
+            reconciliation_reason = (
+                state.reconciliation_error
+                or "PlanIt reconciliation did not complete"
+            )
+            save_failure(
+                state.target,
+                f"Primary search failed: {primary_reason}; "
+                f"PlanIt reconciliation failed: {reconciliation_reason}",
+            )
+            continue
+
+        if state.primary_error:
+            save_failure(state.target, state.primary_error)
+        if state.reconciliation_error:
+            save_failure(
+                state.target,
+                f"PlanIt reconciliation warning: {state.reconciliation_error}",
+            )
+        no_application_councils.append(state.target.authority)
 
     if config.download_application_files:
         total_document_jobs = len(document_jobs)

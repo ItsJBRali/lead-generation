@@ -1310,6 +1310,99 @@ class LeadSearchTest(unittest.TestCase):
             ["PRIMARY", "SECONDARY-1"],
         )
 
+    def test_run_lead_search_reconciliation_cancel_finalizes_completed_councils(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_geojson, catalogue = write_search_fixture(
+                root,
+                [
+                    "Warning Council",
+                    "Failed Council",
+                    "Interrupted Council",
+                    "Unreconciled Council",
+                ],
+            )
+            config = LeadSearchConfig(
+                geojson_path=user_geojson,
+                output_root=root,
+                start_date=date(2026, 7, 20),
+                end_date=date(2026, 7, 26),
+                keywords=["gates"],
+                catalogue_path=catalogue,
+                worker_count=1,
+            )
+            captured_primary = PlanningApplication(
+                authority="Interrupted Council",
+                uid="INTERRUPTED-1",
+                url="https://planning.example.test/interrupted-1",
+                reference="INTERRUPTED/1",
+                description="Install driveway gates",
+                date_received="2026-07-22",
+            )
+            reconciliation_calls: list[str] = []
+
+            def fake_primary(target, start_date, end_date, *, should_cancel=None):
+                if target.authority == "Failed Council":
+                    raise RuntimeError("primary unavailable")
+                if target.authority == "Interrupted Council":
+                    return [captured_primary]
+                return []
+
+            def fake_reconciliation(
+                target,
+                start_date,
+                end_date,
+                *,
+                should_cancel=None,
+            ):
+                reconciliation_calls.append(target.authority)
+                if target.authority == "Warning Council":
+                    raise RuntimeError("reconciliation warning")
+                if target.authority == "Failed Council":
+                    raise RuntimeError("reconciliation unavailable")
+                raise CouncilSearchCancelledError("cancelled during reconciliation")
+
+            with (
+                patch(
+                    "lead_generator.planning.leads.discover_portal_applications",
+                    side_effect=fake_primary,
+                ),
+                patch(
+                    "lead_generator.planning.leads.discover_planit_reconciliation_applications",
+                    side_effect=fake_reconciliation,
+                ),
+                patch(
+                    "lead_generator.planning.leads.discover_application_documents",
+                    side_effect=AssertionError(
+                        "document discovery started after cancellation"
+                    ),
+                ),
+            ):
+                result = run_lead_search(config)
+
+            with result.csv_path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            with result.failure_csv_path.open(newline="", encoding="utf-8") as handle:
+                failures = list(csv.DictReader(handle))
+
+        self.assertEqual(result.completion, "Cancelled")
+        self.assertEqual(
+            reconciliation_calls,
+            ["Warning Council", "Failed Council", "Interrupted Council"],
+        )
+        self.assertEqual(result.failed_councils, ["Failed Council"])
+        self.assertEqual(result.no_application_councils, ["Warning Council"])
+        self.assertEqual([row["Reference"] for row in rows], ["INTERRUPTED/1"])
+        self.assertEqual(
+            [row["council"] for row in failures],
+            ["Warning Council", "Failed Council"],
+        )
+        self.assertIn("reconciliation warning", failures[0]["reason"])
+        self.assertIn("primary unavailable", failures[1]["reason"])
+        self.assertIn("reconciliation unavailable", failures[1]["reason"])
+
     def test_run_lead_search_reconciliation_phase_records_warning_and_continues(
         self,
     ) -> None:
