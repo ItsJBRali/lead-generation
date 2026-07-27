@@ -247,16 +247,6 @@ PLANIT_AUTHORITY_ALIASES = {
     "Wycombe": ("Buckinghamshire",),
 }
 
-PLANIT_FIRST_AUTHORITIES = {
-    "Birmingham",
-    "South Cambridgeshire",
-    "Surrey",
-}
-
-PLANIT_SUPPLEMENT_AUTHORITIES = {
-    "Elmbridge",
-}
-
 CURRENT_PORTAL_OVERRIDES = {
     "East Hampshire": {
         "portal_family": "tascomi",
@@ -337,8 +327,6 @@ class CouncilTarget:
 
 
 def council_platform_key(target: CouncilTarget) -> str:
-    if target.authority in PLANIT_AUTHORITY_ALIASES or target.authority in PLANIT_FIRST_AUTHORITIES:
-        return "planit"
     authority = target.authority.casefold()
     portal = f"{target.scraper_type} {target.portal_family}".casefold()
     if authority in {"eastleigh", "wiltshire"}:
@@ -1373,34 +1361,14 @@ def discover_portal_applications(
     *,
     should_cancel: CancelCallback | None = None,
 ) -> list[PlanningApplication]:
-    if target.authority in PLANIT_AUTHORITY_ALIASES or target.authority in PLANIT_FIRST_AUTHORITIES:
-        planit_applications = discover_planit_fallback_applications(
-            target,
-            start_date,
-            end_date,
-            should_cancel=should_cancel,
-        )
-        if planit_applications:
-            return planit_applications
-
     try:
         discovery, scraper = _discover_portal_listing(target, start_date, end_date)
     except Exception as exc:
-        planit_applications = discover_planit_fallback_applications(
-            target,
-            start_date,
-            end_date,
-            portal_error=exc,
-            should_cancel=should_cancel,
-        )
-        if planit_applications:
-            return planit_applications
         if _portal_error_proves_service_responded(exc):
             raise CouncilSearchDegradedError(str(exc)) from exc
         raise
     applications: list[PlanningApplication] = []
     seen: set[str] = set()
-    detail_fetch_failed = False
     try:
         for stub in discovery.applications:
             application = stub
@@ -1408,7 +1376,6 @@ def discover_portal_applications(
                 try:
                     application = scraper.fetch_application(stub.uid, stub.url, include_documents=False)
                 except Exception as exc:
-                    detail_fetch_failed = True
                     stub.raw = {**(stub.raw or {}), "detail_fetch_error": str(exc)}
             application = with_portal_metadata(application, stub, target, discovery.source_url)
             key = application.reference or application.uid or application.url
@@ -1421,61 +1388,11 @@ def discover_portal_applications(
                 if received is not None and (received < start_date or received > end_date):
                     continue
             applications.append(application)
-        if (
-            not applications
-            or detail_fetch_failed
-            or target.authority in PLANIT_SUPPLEMENT_AUTHORITIES
-        ):
-            planit_applications = discover_planit_fallback_applications(
-                target,
-                start_date,
-                end_date,
-                should_cancel=should_cancel,
-            )
-            if planit_applications:
-                return _merge_portal_and_planit_applications(applications, planit_applications)
         return applications
     finally:
         close = getattr(scraper, "close", None)
         if callable(close):
             close()
-
-
-def _merge_portal_and_planit_applications(
-    portal_applications: list[PlanningApplication],
-    planit_applications: list[PlanningApplication],
-) -> list[PlanningApplication]:
-    by_reference = {
-        (application.reference or application.uid).strip(): application
-        for application in portal_applications
-        if application.reference or application.uid
-    }
-    merged = list(portal_applications)
-    for fallback in planit_applications:
-        reference = (fallback.reference or fallback.uid).strip()
-        existing = by_reference.get(reference)
-        if existing is None:
-            by_reference[reference] = fallback
-            merged.append(fallback)
-            continue
-        for field in (
-            "address",
-            "description",
-            "status",
-            "decision",
-            "date_received",
-            "date_validated",
-            "postcode",
-        ):
-            if not getattr(existing, field) and getattr(fallback, field):
-                setattr(existing, field, getattr(fallback, field))
-        existing.raw = {
-            **(fallback.raw or {}),
-            **(existing.raw or {}),
-            "planit_supplemented": True,
-        }
-    return merged
-
 
 def _discover_portal_listing(target: CouncilTarget, start_date: date, end_date: date):
     last_error: Exception | None = None
@@ -1516,57 +1433,55 @@ def _portal_error_text(exc: Exception) -> str:
     return " | ".join(parts).casefold()
 
 
-def discover_planit_fallback_applications(
+def planit_authority_candidates(authority: str) -> tuple[str, ...]:
+    aliases = PLANIT_AUTHORITY_ALIASES.get(authority, ())
+    return (*aliases, authority)
+
+
+def discover_planit_reconciliation_applications(
     target: CouncilTarget,
     start_date: date,
     end_date: date,
     *,
-    portal_error: Exception | None = None,
     should_cancel: CancelCallback | None = None,
 ) -> list[PlanningApplication]:
-    last_error: Exception | None = None
+    successful_query = False
+    errors: list[str] = []
     for authority in planit_authority_candidates(target.authority):
         try:
-            if should_cancel is None:
-                applications = discover_planit_applications(
-                    authority,
-                    start_date,
-                    end_date,
-                )
-            else:
-                applications = discover_planit_applications(
-                    authority,
-                    start_date,
-                    end_date,
-                    should_cancel=should_cancel,
-                )
+            applications = discover_planit_applications(
+                authority,
+                start_date,
+                end_date,
+                should_cancel=should_cancel,
+            )
         except CouncilSearchCancelledError:
             raise
         except Exception as exc:
-            last_error = exc
+            errors.append(f"{authority}: {exc}")
             continue
-        if not applications:
-            continue
-        for application in applications:
-            application.authority = target.authority
-            application.raw = {
-                **(application.raw or {}),
-                "portal_family": target.portal_family,
-                "scraper_type": target.scraper_type,
-                "source": "planit_fallback",
-                "planit_authority": authority,
-            }
-            if portal_error:
-                application.raw["portal_fetch_error"] = str(portal_error)
-        return applications
-    if portal_error and last_error:
-        portal_error.add_note(f"Public planning metadata fallback also failed: {last_error}")
-    return []
+        successful_query = True
+        if applications:
+            return [_tag_planit_application(target, authority, application) for application in applications]
+    if successful_query:
+        return []
+    raise RuntimeError("; ".join(errors) or "PlanIt reconciliation did not complete")
 
 
-def planit_authority_candidates(authority: str) -> tuple[str, ...]:
-    aliases = PLANIT_AUTHORITY_ALIASES.get(authority, ())
-    return (*aliases, authority)
+def _tag_planit_application(
+    target: CouncilTarget,
+    planit_authority: str,
+    application: PlanningApplication,
+) -> PlanningApplication:
+    application.authority = target.authority
+    application.raw = {
+        **(application.raw or {}),
+        "portal_family": target.portal_family,
+        "scraper_type": target.scraper_type,
+        "source": "planit_reconciliation",
+        "planit_authority": planit_authority,
+    }
+    return application
 
 
 def planning_scraper_for_target(target: CouncilTarget) -> PlanningScraper:
@@ -1782,7 +1697,11 @@ def _discover_planit_applications_serial(
         seen_pages.add(page_signature)
         records.extend(batch)
         total = int(payload.get("total") or len(records))
-        if not batch or len(records) >= total:
+        if not batch:
+            if len(records) < total:
+                raise RuntimeError(f"PlanIt pagination ended at {len(records)} of {total} for {authority}")
+            break
+        if len(records) >= total:
             break
         if page >= PLANIT_MAX_PAGES:
             raise RuntimeError(

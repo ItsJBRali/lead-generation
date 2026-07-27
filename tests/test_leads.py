@@ -11,7 +11,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from lxml import html
 
@@ -47,6 +47,7 @@ from lead_generator.planning.leads import (
     document_filename,
     document_download_candidates,
     discover_application_documents,
+    discover_planit_reconciliation_applications,
     discover_portal_applications,
     discover_portal_applications_with_deadline,
     download_document_bytes,
@@ -68,6 +69,7 @@ from lead_generator.planning.leads import (
     point_in_geometry,
     run_lead_search,
     sanitize_path_part,
+    scheduled_council_task,
     select_overlapping_authorities,
     source_document_candidates,
 )
@@ -503,41 +505,42 @@ class LeadSearchTest(unittest.TestCase):
 
         self.assertTrue(application_matches_search_area(application, user_geojson))
 
-    def test_discover_portal_applications_falls_back_to_planit_after_portal_error(self) -> None:
-        class BrokenScraper:
-            def discover_ids(self, **kwargs):
-                raise RuntimeError("portal unavailable")
-
+    def test_primary_discovery_does_not_wait_for_planit(self) -> None:
         target = CouncilTarget(
-            authority="Hampshire",
-            portal_family="unknown",
-            scraper_type="Custom",
-            base_url="https://maps.hants.gov.uk/MwpMapping/",
-            listing_url="https://maps.hants.gov.uk/MwpMapping/",
+            authority="Example",
+            portal_family="idox",
+            scraper_type="Idox",
+            base_url="https://planning.example.gov.uk",
+            listing_url="https://planning.example.gov.uk/search",
             geometry={},
         )
-        fallback = [
-            PlanningApplication(
-                authority="Hampshire",
-                uid="26/01274/DDTPO",
-                url="https://example.test/app",
-                reference="26/01274/DDTPO",
-                date_received="2026-06-10",
-            )
-        ]
+        direct = PlanningApplication(
+            authority="Example",
+            uid="26/00001/FUL",
+            url="https://planning.example.gov.uk/application/1",
+            reference="26/00001/FUL",
+            date_received="2026-06-10",
+            raw={"detail_complete": True},
+        )
+        discovery = DiscoveryResult(
+            authority="Example",
+            source_url=target.listing_url,
+            applications=[direct],
+        )
 
         with (
-            patch("lead_generator.planning.leads.planning_scraper_for_target", return_value=BrokenScraper()),
-            patch("lead_generator.planning.leads.discover_planit_applications", return_value=fallback) as planit,
+            patch(
+                "lead_generator.planning.leads._discover_portal_listing",
+                return_value=(discovery, object()),
+            ),
+            patch("lead_generator.planning.leads.discover_planit_applications") as planit,
         ):
             applications = discover_portal_applications(target, date(2026, 6, 8), date(2026, 6, 14))
 
-        planit.assert_called_once_with("Hampshire", date(2026, 6, 8), date(2026, 6, 14))
-        self.assertEqual(applications[0].authority, "Hampshire")
-        self.assertEqual(applications[0].raw["source"], "planit_fallback")
-        self.assertIn("portal unavailable", applications[0].raw["portal_fetch_error"])
+        self.assertEqual(applications, discovery.applications)
+        planit.assert_not_called()
 
-    def test_discover_portal_applications_uses_planit_alias_before_shared_buckinghamshire_portal(self) -> None:
+    def test_primary_discovery_groups_planit_alias_authority_by_its_portal(self) -> None:
         target = CouncilTarget(
             authority="Wycombe",
             portal_family="idox",
@@ -546,123 +549,112 @@ class LeadSearchTest(unittest.TestCase):
             listing_url="https://publicaccess.buckinghamshire.gov.uk/online-applications/search.do?action=advanced",
             geometry={},
         )
-        fallback = [
-            PlanningApplication(
-                authority="Buckinghamshire",
-                uid="PL/26/00001/FA",
-                url="https://example.test/app",
-                reference="PL/26/00001/FA",
-                date_received="2026-06-10",
-            )
-        ]
+        task = scheduled_council_task(target)
 
-        with (
-            patch("lead_generator.planning.leads.planning_scraper_for_target") as scraper_factory,
-            patch("lead_generator.planning.leads.discover_planit_applications", return_value=fallback) as planit,
-        ):
-            applications = discover_portal_applications(target, date(2026, 6, 8), date(2026, 6, 14))
+        self.assertEqual(task.platform, "idox")
+        self.assertEqual(task.host, "publicaccess.buckinghamshire.gov.uk")
 
-        scraper_factory.assert_not_called()
-        planit.assert_called_once_with("Buckinghamshire", date(2026, 6, 8), date(2026, 6, 14))
-        self.assertEqual(applications[0].authority, "Wycombe")
-        self.assertEqual(applications[0].raw["source"], "planit_fallback")
-
-    def test_discover_portal_applications_uses_planit_first_for_problem_portals(self) -> None:
+    def test_reconciliation_tries_aliases_and_retags_selected_council(self) -> None:
         target = CouncilTarget(
-            authority="Surrey",
-            portal_family="unknown",
-            scraper_type="Atrium",
-            base_url="https://planning.surreycc.gov.uk/",
-            listing_url="https://planning.surreycc.gov.uk/planappsearch.aspx",
+            authority="Wycombe",
+            portal_family="idox",
+            scraper_type="Idox",
+            base_url="https://publicaccess.buckinghamshire.gov.uk",
+            listing_url="https://publicaccess.buckinghamshire.gov.uk/online-applications/search.do?action=advanced",
             geometry={},
         )
-        fallback = [
-            PlanningApplication(
-                authority="Surrey",
-                uid="PLAN/2026/0498",
-                url="https://example.test/app",
-                reference="PLAN/2026/0498",
-                date_received="2026-06-10",
-            )
-        ]
-
-        with (
-            patch("lead_generator.planning.leads.planning_scraper_for_target") as scraper_factory,
-            patch("lead_generator.planning.leads.discover_planit_applications", return_value=fallback) as planit,
-        ):
-            applications = discover_portal_applications(target, date(2026, 6, 8), date(2026, 6, 14))
-
-        scraper_factory.assert_not_called()
-        planit.assert_called_once_with("Surrey", date(2026, 6, 8), date(2026, 6, 14))
-        self.assertEqual([application.reference for application in applications], ["PLAN/2026/0498"])
-        self.assertEqual(applications[0].raw["source"], "planit_fallback")
-
-    def test_discover_portal_applications_supplements_incomplete_elmbridge_results(self) -> None:
-        class ElmbridgeScraper:
-            def fetch_application(self, *args, **kwargs):
-                raise AssertionError("Complete listing rows should not fetch details")
-
-            def close(self) -> None:
-                pass
-
-        target = CouncilTarget(
-            authority="Elmbridge",
-            portal_family="astun",
-            scraper_type="Astun",
-            base_url="https://emaps.elmbridge.gov.uk/",
-            listing_url="https://emaps.elmbridge.gov.uk/ebc_planning.aspx",
-            geometry={},
-        )
-        direct = PlanningApplication(
-            authority="Elmbridge",
-            uid="2026/1682",
-            url="https://emaps.elmbridge.gov.uk/application/2026/1682",
-            reference="2026/1682",
-            description="New boundary wall",
-            date_received="2026-07-08",
-            raw={"detail_complete": True, "date_range_filtered": True},
-        )
-        missing = PlanningApplication(
-            authority="Elmbridge",
-            uid="2026/1681",
-            url="https://emaps.elmbridge.gov.uk/application/2026/1681",
-            reference="2026/1681",
-            description="New entrance gates",
-            date_received="2026-07-08",
-            raw={"source": "planit_fallback", "date_range_filtered": True},
-        )
-        discovery = DiscoveryResult(
-            authority="Elmbridge",
-            source_url=target.listing_url,
-            applications=[direct],
+        application = PlanningApplication(
+            authority="Buckinghamshire",
+            uid="PL/26/00001/FA",
+            url="https://www.planit.org.uk/planapplic/PL/26/00001/FA",
+            reference="PL/26/00001/FA",
+            date_received="2026-06-10",
         )
 
-        with (
-            patch(
-                "lead_generator.planning.leads._discover_portal_listing",
-                return_value=(discovery, ElmbridgeScraper()),
-            ),
-            patch(
-                "lead_generator.planning.leads.discover_planit_fallback_applications",
-                return_value=[missing],
-            ) as planit,
-        ):
-            applications = discover_portal_applications(
+        with patch(
+            "lead_generator.planning.leads.discover_planit_applications",
+            side_effect=[RuntimeError("alias unavailable"), [application]],
+        ) as discover:
+            applications = discover_planit_reconciliation_applications(
                 target,
-                date(2026, 7, 6),
-                date(2026, 7, 12),
+                date(2026, 6, 8),
+                date(2026, 6, 14),
             )
 
-        planit.assert_called_once_with(
-            target,
-            date(2026, 7, 6),
-            date(2026, 7, 12),
-            should_cancel=None,
+        self.assertEqual(discover.call_args_list, [
+            call("Buckinghamshire", date(2026, 6, 8), date(2026, 6, 14), should_cancel=None),
+            call("Wycombe", date(2026, 6, 8), date(2026, 6, 14), should_cancel=None),
+        ])
+        self.assertEqual([item.authority for item in applications], ["Wycombe"])
+        self.assertEqual(applications[0].raw["source"], "planit_reconciliation")
+        self.assertEqual(applications[0].raw["planit_authority"], "Wycombe")
+
+    def test_reconciliation_returns_empty_after_a_successful_empty_query(self) -> None:
+        target = CouncilTarget(
+            authority="Example",
+            portal_family="idox",
+            scraper_type="Idox",
+            base_url="https://planning.example.gov.uk",
+            listing_url="https://planning.example.gov.uk/search",
+            geometry={},
         )
-        self.assertEqual(
-            [application.reference for application in applications],
-            ["2026/1682", "2026/1681"],
+
+        with patch(
+            "lead_generator.planning.leads.discover_planit_applications",
+            return_value=[],
+        ):
+            applications = discover_planit_reconciliation_applications(
+                target,
+                date(2026, 6, 8),
+                date(2026, 6, 14),
+            )
+
+        self.assertEqual(applications, [])
+
+    def test_reconciliation_raises_when_every_candidate_fails(self) -> None:
+        target = CouncilTarget(
+            authority="Wycombe",
+            portal_family="idox",
+            scraper_type="Idox",
+            base_url="https://publicaccess.buckinghamshire.gov.uk",
+            listing_url="https://publicaccess.buckinghamshire.gov.uk/online-applications/search.do?action=advanced",
+            geometry={},
         )
+
+        with patch(
+            "lead_generator.planning.leads.discover_planit_applications",
+            side_effect=[RuntimeError("alias unavailable"), RuntimeError("authority unavailable")],
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "Buckinghamshire: alias unavailable; Wycombe: authority unavailable",
+            ):
+                discover_planit_reconciliation_applications(
+                    target,
+                    date(2026, 6, 8),
+                    date(2026, 6, 14),
+                )
+
+    def test_reconciliation_propagates_cancellation(self) -> None:
+        target = CouncilTarget(
+            authority="Example",
+            portal_family="idox",
+            scraper_type="Idox",
+            base_url="https://planning.example.gov.uk",
+            listing_url="https://planning.example.gov.uk/search",
+            geometry={},
+        )
+
+        with patch(
+            "lead_generator.planning.leads.discover_planit_applications",
+            side_effect=CouncilSearchCancelledError("cancelled"),
+        ):
+            with self.assertRaisesRegex(CouncilSearchCancelledError, "cancelled"):
+                discover_planit_reconciliation_applications(
+                    target,
+                    date(2026, 6, 8),
+                    date(2026, 6, 14),
+                )
 
     def test_discover_portal_applications_marks_blocked_but_responsive_portal_as_degraded(self) -> None:
         class BlockedScraper:
@@ -678,10 +670,7 @@ class LeadSearchTest(unittest.TestCase):
             geometry={},
         )
 
-        with (
-            patch("lead_generator.planning.leads.planning_scraper_for_target", return_value=BlockedScraper()),
-            patch("lead_generator.planning.leads.discover_planit_applications", return_value=[]),
-        ):
+        with patch("lead_generator.planning.leads.planning_scraper_for_target", return_value=BlockedScraper()):
             with self.assertRaisesRegex(CouncilSearchDegradedError, "HTTP 403"):
                 discover_portal_applications(target, date(2026, 6, 8), date(2026, 6, 14))
 
@@ -699,10 +688,7 @@ class LeadSearchTest(unittest.TestCase):
             geometry={},
         )
 
-        with (
-            patch("lead_generator.planning.leads.planning_scraper_for_target", return_value=UnavailableScraper()),
-            patch("lead_generator.planning.leads.discover_planit_applications", return_value=[]),
-        ):
+        with patch("lead_generator.planning.leads.planning_scraper_for_target", return_value=UnavailableScraper()):
             with self.assertRaisesRegex(RuntimeError, "HTTP 503"):
                 discover_portal_applications(target, date(2026, 6, 8), date(2026, 6, 14))
 
@@ -720,10 +706,7 @@ class LeadSearchTest(unittest.TestCase):
             geometry={},
         )
 
-        with (
-            patch("lead_generator.planning.leads.planning_scraper_for_target", return_value=TimedOutScraper()),
-            patch("lead_generator.planning.leads.discover_planit_applications", return_value=[]),
-        ):
+        with patch("lead_generator.planning.leads.planning_scraper_for_target", return_value=TimedOutScraper()):
             with self.assertRaisesRegex(CouncilSearchDegradedError, "timed out"):
                 discover_portal_applications(target, date(2026, 6, 8), date(2026, 6, 14))
 
@@ -774,41 +757,6 @@ class LeadSearchTest(unittest.TestCase):
         self.assertEqual(scraper_factory.call_count, 2)
         planit.assert_not_called()
 
-    def test_discover_portal_applications_uses_planit_for_empty_portal_result(self) -> None:
-        class EmptyScraper:
-            def discover_ids(self, **kwargs):
-                from lead_generator.planning.models import DiscoveryResult
-
-                return DiscoveryResult(authority="Example", source_url="https://planning.example.gov.uk", applications=[])
-
-        target = CouncilTarget(
-            authority="Example",
-            portal_family="idox",
-            scraper_type="Idox",
-            base_url="https://planning.example.gov.uk",
-            listing_url="https://planning.example.gov.uk/online-applications/search.do?action=advanced",
-            geometry={},
-        )
-        fallback = [
-            PlanningApplication(
-                authority="Example",
-                uid="26/01723/NMC",
-                url="https://example.test/app",
-                reference="26/01723/NMC",
-                date_received="2026-06-10",
-            )
-        ]
-
-        with (
-            patch("lead_generator.planning.leads.planning_scraper_for_target", return_value=EmptyScraper()),
-            patch("lead_generator.planning.leads.discover_planit_applications", return_value=fallback) as planit,
-        ):
-            applications = discover_portal_applications(target, date(2026, 6, 8), date(2026, 6, 14))
-
-        planit.assert_called_once_with("Example", date(2026, 6, 8), date(2026, 6, 14))
-        self.assertEqual([application.reference for application in applications], ["26/01723/NMC"])
-        self.assertEqual(applications[0].raw["source"], "planit_fallback")
-
     def test_portal_filtered_weekly_result_is_not_removed_by_received_date(self) -> None:
         from lead_generator.planning.models import DiscoveryResult
 
@@ -839,69 +787,10 @@ class LeadSearchTest(unittest.TestCase):
             geometry={},
         )
 
-        with (
-            patch("lead_generator.planning.leads.planning_scraper_for_target", return_value=WeeklyScraper()),
-            patch("lead_generator.planning.leads.discover_planit_applications", return_value=[]),
-        ):
+        with patch("lead_generator.planning.leads.planning_scraper_for_target", return_value=WeeklyScraper()):
             applications = discover_portal_applications(target, date(2026, 7, 13), date(2026, 7, 19))
 
         self.assertEqual([application.reference for application in applications], ["26/00001/FUL"])
-
-    def test_discover_portal_applications_supplements_failed_details_from_planit(self) -> None:
-        from lead_generator.planning.models import DiscoveryResult
-
-        class PartialScraper:
-            def discover_ids(self, **kwargs):
-                return DiscoveryResult(
-                    authority="Example",
-                    source_url="https://planning.example.gov.uk/search",
-                    applications=[
-                        PlanningApplication(
-                            authority="Example",
-                            uid="APP1",
-                            url="https://planning.example.gov.uk/application/APP1",
-                            reference="26/00001/FUL",
-                            date_received="2026-06-10",
-                        )
-                    ],
-                )
-
-            def fetch_application(self, *args, **kwargs):
-                raise RuntimeError("detail page changed")
-
-        target = CouncilTarget(
-            authority="Example",
-            portal_family="custom",
-            scraper_type="Custom",
-            base_url="https://planning.example.gov.uk",
-            listing_url="https://planning.example.gov.uk/search",
-            geometry={},
-        )
-        fallback = [
-            PlanningApplication(
-                authority="Example",
-                uid="PLANIT1",
-                url="https://planit.example.test/application/1",
-                reference="26/00001/FUL",
-                address="1 High Street AB1 2CD",
-                description="Install entrance gates",
-                date_received="2026-06-10",
-                raw={"location": {"type": "Point", "coordinates": [-0.1, 51.5]}},
-            )
-        ]
-
-        with (
-            patch("lead_generator.planning.leads.planning_scraper_for_target", return_value=PartialScraper()),
-            patch("lead_generator.planning.leads.discover_planit_applications", return_value=fallback),
-        ):
-            applications = discover_portal_applications(target, date(2026, 6, 8), date(2026, 6, 14))
-
-        self.assertEqual(len(applications), 1)
-        self.assertEqual(applications[0].url, "https://planning.example.gov.uk/application/APP1")
-        self.assertEqual(applications[0].address, "1 High Street AB1 2CD")
-        self.assertEqual(applications[0].description, "Install entrance gates")
-        self.assertTrue(applications[0].raw["planit_supplemented"])
-        self.assertIn("location", applications[0].raw)
 
     def test_run_lead_search_writes_only_location_matched_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -5714,6 +5603,46 @@ class LeadSearchTest(unittest.TestCase):
                 )
 
         self.assertEqual(fetch.call_count, 2)
+
+    def test_planit_pagination_rejects_an_empty_page_before_the_advertised_total(self) -> None:
+        first_page = {
+            "records": [{"uid": f"26/{index:05d}/FUL"} for index in range(100)],
+            "total": 150,
+        }
+        empty_second_page = {"records": [], "total": 150}
+
+        with patch(
+            "lead_generator.planning.leads._fetch_json_with_retry",
+            side_effect=[first_page, empty_second_page],
+        ):
+            with self.assertRaisesRegex(RuntimeError, "ended at 100 of 150"):
+                _discover_planit_applications_serial(
+                    "Example",
+                    date(2026, 6, 1),
+                    date(2026, 6, 30),
+                )
+
+    def test_planit_pagination_returns_later_page_records_once(self) -> None:
+        first_page = {
+            "records": [{"uid": f"26/{index:05d}/FUL"} for index in range(100)],
+            "total": 101,
+        }
+        second_page = {"records": [{"uid": "26/00100/FUL"}], "total": 101}
+
+        with patch(
+            "lead_generator.planning.leads._fetch_json_with_retry",
+            side_effect=[first_page, second_page],
+        ):
+            applications = _discover_planit_applications_serial(
+                "Example",
+                date(2026, 6, 1),
+                date(2026, 6, 30),
+            )
+
+        self.assertEqual(
+            [application.reference for application in applications],
+            [f"26/{index:05d}/FUL" for index in range(101)],
+        )
 
     def test_fetch_json_waits_and_retries_after_rate_limit(self) -> None:
         class FakeResponse:
