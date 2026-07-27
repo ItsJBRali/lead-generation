@@ -353,6 +353,109 @@ def application_is_in_date_range(
     return received is not None and start_date <= received <= end_date
 
 
+def _process_discovered_applications(
+    target: CouncilTarget,
+    applications: list[PlanningApplication],
+    source: str,
+    *,
+    state: CouncilDiscoveryState,
+    start_date: date,
+    end_date: date,
+    keywords: list[str],
+    user_geojson: dict[str, object],
+    total_application_references: set[str],
+    reserve_reference: Callable[[str], bool],
+    release_reference: Callable[[str], None],
+    prepare_output: Callable[[PlanningApplication, str], Callable[[], int]],
+    notify_output_saved: Callable[[PlanningApplication, str, int], None],
+    state_lock: threading.Lock | None = None,
+    log: LogCallback | None = None,
+    should_cancel: CancelCallback | None = None,
+) -> int:
+    source_date_valid_references: set[str] = set()
+    excluded_without_usable_date = 0
+    matched_count = 0
+
+    def update_state(action: Callable[[], None]) -> None:
+        if state_lock is None:
+            action()
+            return
+        with state_lock:
+            action()
+
+    def reset_source_count() -> None:
+        if source == "primary":
+            state.primary_date_valid_count = 0
+        else:
+            state.secondary_date_valid_count = 0
+
+    update_state(reset_source_count)
+
+    for application in applications:
+        if should_cancel and should_cancel():
+            break
+        if not application_is_in_date_range(application, start_date, end_date):
+            if _parse_iso_date(application.date_received) is None:
+                excluded_without_usable_date += 1
+            continue
+
+        reference = application_reference_key(application)
+        if reference not in source_date_valid_references:
+            source_date_valid_references.add(reference)
+
+            def add_date_valid_reference() -> None:
+                if source == "primary":
+                    state.primary_date_valid_count += 1
+                else:
+                    state.secondary_date_valid_count += 1
+                state.date_valid_references.add(reference)
+                total_application_references.add(reference)
+
+            update_state(add_date_valid_reference)
+
+        if not application_matches(application, start_date, end_date, keywords):
+            continue
+        if not application_matches_search_area(application, user_geojson):
+            continue
+        if not reserve_reference(reference):
+            _log(log, f"{target.authority}: skipped duplicate reference {reference}")
+            continue
+
+        try:
+            commit_output = prepare_output(application, reference)
+            current = commit_output()
+        except Exception:
+            release_reference(reference)
+            raise
+
+        matched_count += 1
+        notify_output_saved(application, reference, current)
+
+    if excluded_without_usable_date:
+        update_state(
+            lambda: setattr(
+                state,
+                "undated_count",
+                state.undated_count + excluded_without_usable_date,
+            )
+        )
+        _log(
+            log,
+            f"{target.authority}: excluded {excluded_without_usable_date} application(s) "
+            "without a usable in-range received date",
+        )
+    date_valid_count = len(source_date_valid_references)
+    _log(
+        log,
+        f"{target.authority}: found {date_valid_count} applications in the date range",
+    )
+    _log(
+        log,
+        f"{target.authority}: {matched_count} applications matched keywords and location",
+    )
+    return date_valid_count
+
+
 def council_platform_key(target: CouncilTarget) -> str:
     authority = target.authority.casefold()
     portal = f"{target.scraper_type} {target.portal_family}".casefold()
@@ -757,132 +860,119 @@ def run_lead_search(
             saved_references.add(reference)
         return True
 
+    def release_reference(reference: str) -> None:
+        with lock:
+            saved_references.discard(reference)
+
     def save_row(
         row: dict[str, str],
         enrichment_job: EnrichmentJob | None = None,
         document_job: DocumentDownloadJob | None = None,
-    ) -> None:
-        current = 0
+    ) -> int:
         with lock:
+            append_csv_row(csv_path, APPLICATION_CSV_FIELDS, row)
             rows.append(row)
             if document_job:
                 document_jobs.append(document_job)
             if enrichment_job:
                 enrichment_jobs.append(enrichment_job)
-            append_csv_row(csv_path, APPLICATION_CSV_FIELDS, row)
             current = len(rows)
+        return current
+
+    def prepare_discovered_application_output(
+        target: CouncilTarget,
+        application: PlanningApplication,
+        reference: str,
+    ) -> Callable[[], int]:
+        if config.download_application_files:
+            lead_folder = create_lead_folder(output_dir, target.authority, application)
+        else:
+            lead_folder = None
+        row = {
+            "Reference": reference,
+            "address": application.address or "",
+            "application link": application_link(application),
+            "proposal": application.description or "",
+            "date received": application.date_received or application.date_validated or "",
+            "council": target.authority,
+            **empty_enrichment_row(requested=config.download_application_files),
+        }
+        enrichment_job = None
+        if lead_folder is not None:
+            enrichment_job = EnrichmentJob(
+                reference=reference,
+                folder=lead_folder,
+                row=row,
+                applicant_name=application.applicant_name,
+                agent_name=application.agent_name,
+                site_address=application.address,
+            )
+        document_job = None
+        if lead_folder is not None:
+            document_job = DocumentDownloadJob(
+                reference=reference,
+                council=target.authority,
+                application=application,
+                folder=lead_folder,
+                row=row,
+            )
+
+        def commit_output() -> int:
+            return save_row(row, enrichment_job, document_job)
+
+        return commit_output
+
+    def notify_discovered_application_saved(
+        target: CouncilTarget,
+        application: PlanningApplication,
+        reference: str,
+        current: int,
+    ) -> None:
         _captured(captured, current)
+        if config.download_application_files:
+            _log(
+                log,
+                f"{target.authority}: saved {reference} (documents queued)",
+            )
+        else:
+            _log(
+                log,
+                f"{target.authority}: saved {reference} "
+                "(file downloads not requested)",
+            )
 
     def process_discovered_applications(
         target: CouncilTarget,
         applications: list[PlanningApplication],
         source: str,
     ) -> int:
-        state = council_states[target.authority]
-        source_date_valid_references: set[str] = set()
-        excluded_without_usable_date = 0
-        matched_count = 0
-
-        for application in applications:
-            if cancellation_requested():
-                break
-            if not application_is_in_date_range(
-                application,
-                config.start_date,
-                config.end_date,
-            ):
-                if _parse_iso_date(application.date_received) is None:
-                    excluded_without_usable_date += 1
-                continue
-
-            reference = application_reference_key(application)
-            if reference not in source_date_valid_references:
-                source_date_valid_references.add(reference)
-                with lock:
-                    if source == "primary":
-                        state.primary_date_valid_count += 1
-                    else:
-                        state.secondary_date_valid_count += 1
-                    state.date_valid_references.add(reference)
-                    total_application_references.add(reference)
-
-            if not application_matches(
-                application,
-                config.start_date,
-                config.end_date,
-                config.keywords,
-            ):
-                continue
-            if not application_matches_search_area(application, user_geojson):
-                continue
-            if not reserve_reference(reference):
-                _log(log, f"{target.authority}: skipped duplicate reference {reference}")
-                continue
-
-            matched_count += 1
-            if config.download_application_files:
-                lead_folder = create_lead_folder(output_dir, target.authority, application)
-            else:
-                lead_folder = None
-            row = {
-                "Reference": reference,
-                "address": application.address or "",
-                "application link": application_link(application),
-                "proposal": application.description or "",
-                "date received": application.date_received or application.date_validated or "",
-                "council": target.authority,
-                **empty_enrichment_row(requested=config.download_application_files),
-            }
-            enrichment_job = None
-            if lead_folder is not None:
-                enrichment_job = EnrichmentJob(
-                    reference=reference,
-                    folder=lead_folder,
-                    row=row,
-                    applicant_name=application.applicant_name,
-                    agent_name=application.agent_name,
-                    site_address=application.address,
+        return _process_discovered_applications(
+            target,
+            applications,
+            source,
+            state=council_states[target.authority],
+            start_date=config.start_date,
+            end_date=config.end_date,
+            keywords=config.keywords,
+            user_geojson=user_geojson,
+            total_application_references=total_application_references,
+            reserve_reference=reserve_reference,
+            release_reference=release_reference,
+            prepare_output=lambda application, reference: (
+                prepare_discovered_application_output(target, application, reference)
+            ),
+            notify_output_saved=lambda application, reference, current: (
+                notify_discovered_application_saved(
+                    target,
+                    application,
+                    reference,
+                    current,
                 )
-            document_job = None
-            if lead_folder is not None:
-                document_job = DocumentDownloadJob(
-                    reference=reference,
-                    council=target.authority,
-                    application=application,
-                    folder=lead_folder,
-                    row=row,
-                )
-            save_row(row, enrichment_job, document_job)
-            if config.download_application_files:
-                _log(
-                    log,
-                    f"{target.authority}: saved {reference} (documents queued)",
-                )
-            else:
-                _log(
-                    log,
-                    f"{target.authority}: saved {reference} "
-                    "(file downloads not requested)",
-                )
-
-        if excluded_without_usable_date:
-            with lock:
-                state.undated_count += excluded_without_usable_date
-            _log(
-                log,
-                f"{target.authority}: excluded {excluded_without_usable_date} application(s) "
-                "without a usable in-range received date",
-            )
-        date_valid_count = len(source_date_valid_references)
-        _log(
-            log,
-            f"{target.authority}: found {date_valid_count} applications in the date range",
+            ),
+            state_lock=lock,
+            log=log,
+            should_cancel=cancellation_requested,
         )
-        _log(
-            log,
-            f"{target.authority}: {matched_count} applications matched keywords and location",
-        )
-        return date_valid_count
 
     def add_captured_document_application(reference: str) -> None:
         nonlocal captured_documents
@@ -4415,8 +4505,15 @@ def _record_string(record: object, key: str) -> str | None:
 def _parse_iso_date(value: str | None) -> date | None:
     if not value:
         return None
+    text = value.strip()
     try:
-        return date.fromisoformat(value[:10])
+        return date.fromisoformat(text)
+    except ValueError:
+        pass
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        return datetime.fromisoformat(text).date()
     except ValueError:
         return None
 

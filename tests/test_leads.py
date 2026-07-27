@@ -171,14 +171,36 @@ class LeadSearchTest(unittest.TestCase):
                 )
 
     def test_application_received_date_in_range_is_in_range(self) -> None:
+        for value in [
+            "2026-07-20",
+            "2026-07-20T14:30:00Z",
+            "2026-07-20 14:30:00+01:00",
+        ]:
+            with self.subTest(value=value):
+                application = PlanningApplication(
+                    authority="A",
+                    uid="uid",
+                    url="u",
+                    date_received=value,
+                )
+
+                self.assertTrue(
+                    leads_module.application_is_in_date_range(
+                        application,
+                        date(2026, 7, 20),
+                        date(2026, 7, 26),
+                    )
+                )
+
+    def test_application_malformed_date_with_valid_prefix_is_not_in_range(self) -> None:
         application = PlanningApplication(
             authority="A",
             uid="uid",
             url="u",
-            date_received="2026-07-20",
+            date_received="2026-07-22garbage",
         )
 
-        self.assertTrue(
+        self.assertFalse(
             leads_module.application_is_in_date_range(
                 application,
                 date(2026, 7, 20),
@@ -869,6 +891,15 @@ class LeadSearchTest(unittest.TestCase):
                 )
                 for index in range(2_000)
             )
+            applications.append(
+                PlanningApplication(
+                    authority="Example Council",
+                    uid="MALFORMED-DATE",
+                    url="https://planning.example.gov.uk/malformed",
+                    reference="MALFORMED-DATE",
+                    date_received="2026-07-22garbage",
+                )
+            )
 
             with patch(
                 "lead_generator.planning.leads.discover_portal_applications",
@@ -947,6 +978,168 @@ class LeadSearchTest(unittest.TestCase):
             rows[0]["application link"],
             "https://planning.example.gov.uk/primary/ABC-1",
         )
+
+    def test_shared_pipeline_cross_source_counts_secondary_and_keeps_primary_record(
+        self,
+    ) -> None:
+        target = CouncilTarget(
+            authority="Example Council",
+            portal_family="idox",
+            scraper_type="Idox",
+            base_url="https://planning.example.gov.uk",
+            listing_url="https://planning.example.gov.uk/search",
+            geometry={},
+        )
+        state = leads_module.CouncilDiscoveryState(target=target)
+        user_geojson = {
+            "type": "FeatureCollection",
+            "features": [polygon_feature("search area", 0, 0, 1, 1)],
+        }
+        primary = PlanningApplication(
+            authority=target.authority,
+            uid="PRIMARY-1",
+            url="https://planning.example.gov.uk/primary/ABC-1",
+            reference="ABC/1",
+            description="Install driveway gates",
+            date_received="2026-07-22",
+            raw={"location": {"type": "Point", "coordinates": [0.5, 0.5]}},
+        )
+        secondary = PlanningApplication(
+            authority=target.authority,
+            uid="SECONDARY-1",
+            url="https://planit.example.test/secondary/ABC-1",
+            reference="ABC/1",
+            description="Install driveway gates",
+            date_received="2026-07-22",
+            raw={"location": {"type": "Point", "coordinates": [0.5, 0.5]}},
+        )
+        total_references: set[str] = set()
+        reserved_references: set[str] = set()
+        emitted: list[PlanningApplication] = []
+        captured_counts: list[int] = []
+
+        def reserve_reference(reference: str) -> bool:
+            if reference in reserved_references:
+                return False
+            reserved_references.add(reference)
+            return True
+
+        def release_reference(reference: str) -> None:
+            reserved_references.discard(reference)
+
+        def prepare_output(application, reference):
+            def commit_output():
+                emitted.append(application)
+                return len(emitted)
+
+            return commit_output
+
+        def notify_output_saved(application, reference, current):
+            captured_counts.append(current)
+
+        common = {
+            "state": state,
+            "start_date": date(2026, 7, 20),
+            "end_date": date(2026, 7, 26),
+            "keywords": ["gates"],
+            "user_geojson": user_geojson,
+            "total_application_references": total_references,
+            "reserve_reference": reserve_reference,
+            "release_reference": release_reference,
+            "prepare_output": prepare_output,
+            "notify_output_saved": notify_output_saved,
+        }
+
+        primary_valid = leads_module._process_discovered_applications(
+            target,
+            [primary],
+            source="primary",
+            **common,
+        )
+        secondary_valid = leads_module._process_discovered_applications(
+            target,
+            [secondary],
+            source="PlanIt",
+            **common,
+        )
+
+        self.assertEqual(primary_valid, 1)
+        self.assertEqual(secondary_valid, 1)
+        self.assertEqual(state.primary_date_valid_count, 1)
+        self.assertEqual(state.secondary_date_valid_count, 1)
+        self.assertEqual(state.date_valid_references, {"ABC/1"})
+        self.assertEqual(total_references, {"ABC/1"})
+        self.assertEqual(captured_counts, [1])
+        self.assertEqual([application.url for application in emitted], [primary.url])
+
+    def test_run_lead_search_processing_failure_retry_releases_output_reference(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_geojson, catalogue = write_search_fixture(root, ["Example Council"])
+            config = LeadSearchConfig(
+                geojson_path=user_geojson,
+                output_root=root,
+                start_date=date(2026, 7, 20),
+                end_date=date(2026, 7, 26),
+                keywords=["gates"],
+                catalogue_path=catalogue,
+                worker_count=1,
+            )
+            application = PlanningApplication(
+                authority="Example Council",
+                uid="PRIMARY-1",
+                url="https://planning.example.gov.uk/primary/ABC-1",
+                reference="ABC/1",
+                address="1 Primary Street",
+                description="Install driveway gates",
+                date_received="2026-07-22",
+                raw={"location": {"type": "Point", "coordinates": [0.5, 0.5]}},
+            )
+            captured_counts: list[int] = []
+            create_attempts = 0
+            create_lead_folder = leads_module.create_lead_folder
+
+            def flaky_create_lead_folder(output_dir, council, discovered_application):
+                nonlocal create_attempts
+                create_attempts += 1
+                if create_attempts == 1:
+                    raise RuntimeError("lead folder unavailable")
+                return create_lead_folder(output_dir, council, discovered_application)
+
+            with (
+                patch(
+                    "lead_generator.planning.leads.discover_portal_applications",
+                    return_value=[application],
+                ),
+                patch(
+                    "lead_generator.planning.leads.create_lead_folder",
+                    side_effect=flaky_create_lead_folder,
+                ),
+                patch(
+                    "lead_generator.planning.leads.discover_application_documents",
+                    return_value=DocumentDiscoveryResult(),
+                ) as discover_documents,
+                patch(
+                    "lead_generator.planning.leads.enrich_application_folder",
+                    return_value=ContactEnrichment(),
+                ) as enrich_application,
+            ):
+                result = run_lead_search(config, captured=captured_counts.append)
+
+            with result.csv_path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertEqual(create_attempts, 2)
+        self.assertEqual(result.completion, "Completed")
+        self.assertEqual(result.total_applications, 1)
+        self.assertEqual(result.leads_found, 1)
+        self.assertEqual(captured_counts, [1])
+        self.assertEqual(discover_documents.call_count, 1)
+        self.assertEqual(enrich_application.call_count, 1)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["Reference"], "ABC/1")
 
     def test_run_lead_search_writes_only_location_matched_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
