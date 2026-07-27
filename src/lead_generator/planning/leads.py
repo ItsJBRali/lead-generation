@@ -1327,6 +1327,57 @@ def run_lead_search(
         )
         run_search_phase(list(deferred_tasks), final_attempt=True)
 
+    if not cancelled:
+        for index, target in enumerate(targets, start=1):
+            if cancellation_requested():
+                break
+            _log(
+                log,
+                f"Reconciliation {index} of {len(targets)}: checking {target.authority}",
+            )
+            state = council_states[target.authority]
+            try:
+                secondary = discover_planit_reconciliation_applications(
+                    target,
+                    config.start_date,
+                    config.end_date,
+                    should_cancel=cancellation_requested,
+                )
+                before = len(state.date_valid_references)
+                secondary_valid = process_discovered_applications(
+                    target,
+                    secondary,
+                    source="PlanIt",
+                )
+                if cancellation_requested():
+                    _log(log, f"{target.authority}: reconciliation cancelled")
+                    break
+                added = len(state.date_valid_references) - before
+                state.reconciliation_succeeded = True
+                state.reconciliation_error = None
+                _log(
+                    log,
+                    f"{target.authority}: reconciliation primary={state.primary_date_valid_count} "
+                    f"secondary={secondary_valid} added={added}",
+                )
+            except CouncilSearchCancelledError:
+                cancelled = True
+                _log(log, f"{target.authority}: reconciliation cancelled")
+                break
+            except Exception as exc:  # pragma: no cover - live PlanIt failures vary
+                state.reconciliation_succeeded = False
+                state.reconciliation_error = str(exc)
+                reason = f"PlanIt reconciliation warning: {exc}"
+                _log(log, f"{target.authority}: {reason}")
+                save_failure(
+                    target,
+                    reason,
+                    no_applications_returned=False,
+                    fatal=False,
+                )
+                if cancellation_requested():
+                    break
+
     if config.download_application_files:
         total_document_jobs = len(document_jobs)
         _document_progress(document_progress, 0, total_document_jobs)

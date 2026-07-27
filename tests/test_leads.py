@@ -130,6 +130,12 @@ class LeadSearchTest(unittest.TestCase):
         with leads_module._REQUEST_THROTTLE_LOCK:
             leads_module._LAST_REQUEST_AT.clear()
             leads_module._REQUEST_COOLDOWN_UNTIL.clear()
+        reconciliation_patcher = patch(
+            "lead_generator.planning.leads.discover_planit_reconciliation_applications",
+            return_value=[],
+        )
+        reconciliation_patcher.start()
+        self.addCleanup(reconciliation_patcher.stop)
 
     def test_existing_only_drawing_metadata(self) -> None:
         assert is_existing_only_drawing_metadata("Existing elevations.pdf")
@@ -978,6 +984,376 @@ class LeadSearchTest(unittest.TestCase):
             rows[0]["application link"],
             "https://planning.example.gov.uk/primary/ABC-1",
         )
+
+    def test_run_lead_search_reconciliation_phase_orders_primary_secondary_and_documents(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_geojson, catalogue = write_search_fixture(
+                root,
+                ["First Council", "Second Council"],
+            )
+            config = LeadSearchConfig(
+                geojson_path=user_geojson,
+                output_root=root,
+                start_date=date(2026, 7, 20),
+                end_date=date(2026, 7, 26),
+                keywords=["gates"],
+                catalogue_path=catalogue,
+                worker_count=2,
+            )
+            primary = PlanningApplication(
+                authority="First Council",
+                uid="PRIMARY-1",
+                url="https://planning.example.gov.uk/primary/ABC-1",
+                reference="ABC/1",
+                address="1 Primary Street",
+                description="Install driveway gates",
+                date_received="2026-07-22",
+                raw={"location": {"type": "Point", "coordinates": [0.5, 0.5]}},
+            )
+            duplicate = PlanningApplication(
+                authority="First Council",
+                uid="PLANIT-DUPLICATE",
+                url="https://planit.example.test/duplicate/ABC-1",
+                reference="ABC/1",
+                address="1 Secondary Street",
+                description="Install driveway gates",
+                date_received="2026-07-22",
+                raw={"location": {"type": "Point", "coordinates": [0.5, 0.5]}},
+            )
+            first_secondary = PlanningApplication(
+                authority="First Council",
+                uid="PLANIT-FIRST",
+                url="https://planit.example.test/first/ABC-2",
+                reference="ABC/2",
+                address="2 Secondary Street",
+                description="Install timber gates",
+                date_received="2026-07-23",
+                raw={"location": {"type": "Point", "coordinates": [0.5, 0.5]}},
+            )
+            second_secondary = PlanningApplication(
+                authority="Second Council",
+                uid="PLANIT-SECOND",
+                url="https://planit.example.test/second/XYZ-1",
+                reference="XYZ/1",
+                address="3 Secondary Street",
+                description="Install metal gates",
+                date_received="2026-07-24",
+                raw={"location": {"type": "Point", "coordinates": [0.5, 0.5]}},
+            )
+            events: list[str] = []
+            logs: list[str] = []
+            captured_counts: list[int] = []
+            reconciliation_thread_ids: list[int] = []
+            calling_thread_id = threading.get_ident()
+
+            def fake_primary(target, start_date, end_date, *, should_cancel=None):
+                events.append(f"primary-query:{target.authority}")
+                if target.authority == "First Council":
+                    return [primary]
+                return []
+
+            def record_progress(current: int, total: int) -> None:
+                if current == total:
+                    events.append("all-primary-finished")
+
+            def fake_reconciliation(target, start_date, end_date, *, should_cancel=None):
+                reconciliation_thread_ids.append(threading.get_ident())
+                if target.authority == "First Council":
+                    events.append("first-planit-query")
+                    return [duplicate, first_secondary]
+                events.append("last-planit-query")
+                return [second_secondary]
+
+            def fake_document_discovery(application, *, should_cancel=None, defer_rate_limit=False):
+                events.append("first-document-discovery")
+                return DocumentDiscoveryResult()
+
+            with (
+                patch(
+                    "lead_generator.planning.leads.discover_portal_applications",
+                    side_effect=fake_primary,
+                ),
+                patch(
+                    "lead_generator.planning.leads.discover_planit_reconciliation_applications",
+                    side_effect=fake_reconciliation,
+                ),
+                patch(
+                    "lead_generator.planning.leads.discover_application_documents",
+                    side_effect=fake_document_discovery,
+                ),
+                patch(
+                    "lead_generator.planning.leads.enrich_application_folder",
+                    return_value=ContactEnrichment(),
+                ),
+            ):
+                result = run_lead_search(
+                    config,
+                    log=logs.append,
+                    progress=record_progress,
+                    captured=captured_counts.append,
+                )
+
+            with result.csv_path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+
+        reconciliation_messages = [
+            message for message in logs if ": reconciliation primary=" in message
+        ]
+        primary_row = next(row for row in rows if row["Reference"] == "ABC/1")
+        self.assertEqual(result.leads_found, 3)
+        self.assertEqual(result.total_applications, 3)
+        self.assertEqual(captured_counts, [1, 2, 3])
+        self.assertTrue(
+            all("reconciliation" in message for message in reconciliation_messages)
+        )
+        self.assertEqual(
+            reconciliation_messages,
+            [
+                "First Council: reconciliation primary=1 secondary=2 added=1",
+                "Second Council: reconciliation primary=0 secondary=1 added=1",
+            ],
+        )
+        self.assertEqual(
+            primary_row["application link"],
+            "https://planning.example.gov.uk/primary/ABC-1",
+        )
+        self.assertEqual(set(reconciliation_thread_ids), {calling_thread_id})
+        self.assertEqual(len(reconciliation_thread_ids), 2)
+        self.assertLess(
+            events.index("all-primary-finished"),
+            events.index("first-planit-query"),
+        )
+        self.assertLess(
+            events.index("last-planit-query"),
+            events.index("first-document-discovery"),
+        )
+
+    def test_run_lead_search_secondary_filter_equivalence_keeps_only_matching_inside_row(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_geojson, catalogue = write_search_fixture(root, ["Partial Council"])
+            catalogue_data = json.loads(catalogue.read_text(encoding="utf-8"))
+            catalogue_data["features"][0]["geometry"] = polygon_feature(
+                "Partial Council",
+                0,
+                0,
+                2,
+                1,
+            )["geometry"]
+            catalogue.write_text(json.dumps(catalogue_data), encoding="utf-8")
+            config = LeadSearchConfig(
+                geojson_path=user_geojson,
+                output_root=root,
+                start_date=date(2026, 7, 20),
+                end_date=date(2026, 7, 26),
+                keywords=["gates"],
+                catalogue_path=catalogue,
+                download_application_files=False,
+                worker_count=1,
+            )
+
+            def secondary(
+                reference: str,
+                description: str,
+                received: str,
+                coordinates: list[float],
+            ) -> PlanningApplication:
+                return PlanningApplication(
+                    authority="Partial Council",
+                    uid=f"PLANIT-{reference}",
+                    url=f"https://planit.example.test/{reference}",
+                    reference=reference,
+                    description=description,
+                    date_received=received,
+                    raw={
+                        "source": "planit_reconciliation",
+                        "location": {"type": "Point", "coordinates": coordinates},
+                    },
+                )
+
+            applications = [
+                secondary("OUT-OF-DATE", "Install driveway gates", "2026-07-19", [0.5, 0.5]),
+                secondary(
+                    "EXCLUDED-PROPOSAL",
+                    "Discharge of condition 3 for driveway gates",
+                    "2026-07-22",
+                    [0.5, 0.5],
+                ),
+                secondary("NO-KEYWORD", "Build a garden wall", "2026-07-22", [0.5, 0.5]),
+                secondary("OUTSIDE-AREA", "Install driveway gates", "2026-07-22", [1.5, 0.5]),
+                secondary("MATCH", "Install driveway gates", "2026-07-22", [0.5, 0.5]),
+            ]
+
+            with (
+                patch(
+                    "lead_generator.planning.leads.discover_portal_applications",
+                    return_value=[],
+                ),
+                patch(
+                    "lead_generator.planning.leads.discover_planit_reconciliation_applications",
+                    return_value=applications,
+                ),
+            ):
+                result = run_lead_search(config)
+
+            with result.csv_path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertEqual(result.leads_found, 1)
+        self.assertEqual([row["Reference"] for row in rows], ["MATCH"])
+
+    def test_run_lead_search_reconciliation_cancel_preserves_rows_and_skips_documents(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_geojson, catalogue = write_search_fixture(
+                root,
+                ["First Council", "Second Council"],
+            )
+            config = LeadSearchConfig(
+                geojson_path=user_geojson,
+                output_root=root,
+                start_date=date(2026, 7, 20),
+                end_date=date(2026, 7, 26),
+                keywords=["gates"],
+                catalogue_path=catalogue,
+                worker_count=1,
+            )
+            primary = PlanningApplication(
+                authority="First Council",
+                uid="PRIMARY",
+                url="https://planning.example.test/primary",
+                reference="PRIMARY",
+                description="Install driveway gates",
+                date_received="2026-07-22",
+            )
+            secondary_rows = [
+                PlanningApplication(
+                    authority="First Council",
+                    uid=f"SECONDARY-{index}",
+                    url=f"https://planit.example.test/secondary-{index}",
+                    reference=f"SECONDARY-{index}",
+                    description="Install driveway gates",
+                    date_received="2026-07-22",
+                )
+                for index in range(1, 3)
+            ]
+            cancelled = False
+            reconciliation_calls: list[str] = []
+
+            def should_cancel() -> bool:
+                return cancelled
+
+            def capture_and_cancel(current: int) -> None:
+                nonlocal cancelled
+                if current == 2:
+                    cancelled = True
+
+            def fake_primary(target, start_date, end_date, *, should_cancel=None):
+                if target.authority == "First Council":
+                    return [primary]
+                return []
+
+            def fake_reconciliation(target, start_date, end_date, *, should_cancel=None):
+                reconciliation_calls.append(target.authority)
+                return secondary_rows
+
+            with (
+                patch(
+                    "lead_generator.planning.leads.discover_portal_applications",
+                    side_effect=fake_primary,
+                ),
+                patch(
+                    "lead_generator.planning.leads.discover_planit_reconciliation_applications",
+                    side_effect=fake_reconciliation,
+                ),
+                patch(
+                    "lead_generator.planning.leads.discover_application_documents",
+                    side_effect=AssertionError("document discovery started after cancellation"),
+                ),
+            ):
+                result = run_lead_search(
+                    config,
+                    captured=capture_and_cancel,
+                    should_cancel=should_cancel,
+                )
+
+            with result.csv_path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertEqual(result.completion, "Cancelled")
+        self.assertEqual(reconciliation_calls, ["First Council"])
+        self.assertEqual(
+            [row["Reference"] for row in rows],
+            ["PRIMARY", "SECONDARY-1"],
+        )
+
+    def test_run_lead_search_reconciliation_phase_records_warning_and_continues(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_geojson, catalogue = write_search_fixture(
+                root,
+                ["Broken Council", "Working Council"],
+            )
+            config = LeadSearchConfig(
+                geojson_path=user_geojson,
+                output_root=root,
+                start_date=date(2026, 7, 20),
+                end_date=date(2026, 7, 26),
+                keywords=["gates"],
+                catalogue_path=catalogue,
+                download_application_files=False,
+                worker_count=1,
+            )
+            recovered = PlanningApplication(
+                authority="Working Council",
+                uid="WORKING-1",
+                url="https://planit.example.test/working-1",
+                reference="WORKING-1",
+                description="Install driveway gates",
+                date_received="2026-07-22",
+            )
+            reconciliation_calls: list[str] = []
+
+            def fake_reconciliation(target, start_date, end_date, *, should_cancel=None):
+                reconciliation_calls.append(target.authority)
+                if target.authority == "Broken Council":
+                    raise RuntimeError("PlanIt unavailable")
+                return [recovered]
+
+            with (
+                patch(
+                    "lead_generator.planning.leads.discover_portal_applications",
+                    return_value=[],
+                ),
+                patch(
+                    "lead_generator.planning.leads.discover_planit_reconciliation_applications",
+                    side_effect=fake_reconciliation,
+                ),
+            ):
+                result = run_lead_search(config)
+
+            with result.failure_csv_path.open(newline="", encoding="utf-8") as handle:
+                failures = list(csv.DictReader(handle))
+
+        self.assertEqual(
+            reconciliation_calls,
+            ["Broken Council", "Working Council"],
+        )
+        self.assertEqual(result.leads_found, 1)
+        self.assertEqual(result.failed_councils, [])
+        self.assertEqual(result.completion, "Completed")
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["council"], "Broken Council")
+        self.assertIn("PlanIt unavailable", failures[0]["reason"])
 
     def test_shared_pipeline_cross_source_counts_secondary_and_keeps_primary_record(
         self,
