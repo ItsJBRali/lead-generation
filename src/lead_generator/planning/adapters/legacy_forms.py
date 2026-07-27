@@ -13,6 +13,7 @@ from lead_generator.planning.http import (
     CouncilBrowserClient,
     CouncilFetchError,
     CouncilHttpClient,
+    FetchResponse,
     browser_fallback_recommended,
 )
 from lead_generator.planning.models import DiscoveryResult, PlanningApplication
@@ -396,7 +397,10 @@ class EnterpriseStorePlanningScraper(NativeListingScraper):
             data,
             headers={"X-Requested-With": "XMLHttpRequest"},
         )
-        applications = self.parse_cards(response.text, response.url)
+        applications = _merge_linked_page_applications(
+            _linked_result_pages(self.http, response),
+            self.parse_cards,
+        )
         return applications[:limit] if limit is not None else applications
 
     def parse_cards(self, html_text: str, page_url: str) -> list[PlanningApplication]:
@@ -465,7 +469,10 @@ class AppSearchServPlanningScraper(NativeListingScraper):
                 data[key] = ""
         data["button"] = data.get("button") or "Search"
         response = self.http.post_form(self._absolute_action(response.url, form), data)
-        applications = parse_header_tables(response.text, response.url, self.authority, self.family)
+        applications = _merge_linked_page_applications(
+            _linked_result_pages(self.http, response),
+            lambda text, page_url: parse_header_tables(text, page_url, self.authority, self.family),
+        )
         return applications[:limit] if limit is not None else applications
 
 
@@ -697,6 +704,13 @@ class AstunPlanningScraper(NativeListingScraper):
         if form is None:
             return []
         data = self._form_defaults(form)
+        page_sizes = {
+            int(value)
+            for value in form.xpath(".//select[@name='pagerecs']/option/@value")
+            if value.isdigit()
+        }
+        if page_sizes:
+            data["pagerecs"] = str(max(page_sizes))
         if start_date:
             data["DATEAPRECV:FROM:DATE"] = start_date.strftime("%d/%m/%Y")
             for key in list(data):
@@ -712,9 +726,12 @@ class AstunPlanningScraper(NativeListingScraper):
         action = self._absolute_action(response.url, form)
         method = (form.get("method") or "get").lower()
         response = self.http.post_form(action, data) if method == "post" else self.http.get(action, data)
-        applications = parse_header_tables(response.text, response.url, self.authority, self.family)
-        if not applications:
-            applications = self.parse_text_results(response.text, response.url)
+        pages = _linked_result_pages(self.http, response)
+        applications = _merge_linked_page_applications(
+            pages,
+            lambda text, page_url: parse_header_tables(text, page_url, self.authority, self.family)
+            or self.parse_text_results(text, page_url),
+        )
         return applications[:limit] if limit is not None else applications
 
     def parse_text_results(self, html_text: str, page_url: str) -> list[PlanningApplication]:
@@ -885,17 +902,32 @@ class SocrataPlanningScraper(NativeListingScraper):
         dataset = dataset_match.group(1) if dataset_match else "2eiu-s2cw"
         parts = urlsplit(listing_url)
         api_url = f"{parts.scheme}://{parts.netloc}/resource/{dataset}.json"
-        params = {"$limit": str(limit or 100), "$order": "registered_date DESC"}
+        base_params = {"$limit": "100", "$order": "registered_date DESC"}
         where: list[str] = []
         if start_date:
             where.append(f"registered_date >= '{start_date.isoformat()}T00:00:00'")
         if end_date:
             where.append(f"registered_date <= '{end_date.isoformat()}T23:59:59'")
         if where:
-            params["$where"] = " AND ".join(where)
-        response = self.http.get(api_url, params)
-        rows = json.loads(response.text)
-        return filter_by_date([self._from_row(row, api_url) for row in rows], start_date, end_date)
+            base_params["$where"] = " AND ".join(where)
+
+        applications: list[PlanningApplication] = []
+        seen_page_signatures: set[tuple[str, ...]] = set()
+        offset = 0
+        while True:
+            params = {**base_params, "$offset": str(offset)}
+            rows = json.loads(self.http.get(api_url, params).text)
+            page_signature = tuple(json.dumps(row, sort_keys=True, default=str) for row in rows)
+            if page_signature and page_signature in seen_page_signatures:
+                raise PortalSearchCompletenessError("Socrata returned a repeated page")
+            seen_page_signatures.add(page_signature)
+            applications.extend(self._from_row(row, api_url) for row in rows)
+            if limit is not None and len(applications) >= limit:
+                return filter_by_date(applications[:limit], start_date, end_date)
+            if len(rows) < 100:
+                break
+            offset += len(rows)
+        return filter_by_date(applications, start_date, end_date)
 
     def _from_row(self, row: dict[str, object], source_url: str) -> PlanningApplication:
         reference = string_value(row.get("application_number"))
@@ -931,10 +963,16 @@ class HtmlListPlanningScraper(NativeListingScraper):
         limit: int | None,
     ) -> list[PlanningApplication]:
         response = self.http.get(self._search_url(listing_url, start_date, end_date))
-        applications = self.parse_listing(response.text, response.url)
+        applications = _merge_linked_page_applications(
+            _linked_result_pages(self.http, response),
+            self.parse_listing,
+        )
         if not applications and response.url != listing_url:
             response = self.http.get(listing_url)
-            applications = self.parse_listing(response.text, response.url)
+            applications = _merge_linked_page_applications(
+                _linked_result_pages(self.http, response),
+                self.parse_listing,
+            )
         return applications[:limit] if limit is not None else applications
 
     def _search_url(self, listing_url: str, start_date: date | None, end_date: date | None) -> str:
@@ -998,7 +1036,11 @@ class QueryFormPlanningScraper(NativeListingScraper):
         document = html.fromstring(response.text)
         form = self._pick_form(document)
         if form is None:
-            return HtmlListPlanningScraper(self.config, http_client=self.http).parse_listing(response.text, response.url)[: limit or 100]
+            applications = _merge_linked_page_applications(
+                _linked_result_pages(self.http, response),
+                HtmlListPlanningScraper(self.config, http_client=self.http).parse_listing,
+            )
+            return applications[:limit] if limit is not None else applications
         data = self._form_defaults(form)
         self._set_dates(data, start_date, end_date)
         submit = first(node.get("name") for node in form.xpath(".//input[@type='submit' and @name]"))
@@ -1007,9 +1049,11 @@ class QueryFormPlanningScraper(NativeListingScraper):
         action = self._absolute_action(response.url, form)
         method = (form.get("method") or "get").lower()
         result = self.http.post_form(action, data) if method == "post" else self.http.get(action, data)
-        applications = parse_header_tables(result.text, result.url, self.authority, self.family)
-        if not applications:
-            applications = HtmlListPlanningScraper(self.config, http_client=self.http).parse_listing(result.text, result.url)
+        parser = HtmlListPlanningScraper(self.config, http_client=self.http).parse_listing
+        applications = _merge_linked_page_applications(
+            _linked_result_pages(self.http, result),
+            lambda text, page_url: parse_header_tables(text, page_url, self.authority, self.family) or parser(text, page_url),
+        )
         applications = filter_by_date(applications, start_date, end_date)
         return applications[:limit] if limit is not None else applications
 
@@ -1060,6 +1104,83 @@ class NorthLincsPlanningScraper(HtmlListPlanningScraper):
         if end_date:
             params["endDate"] = end_date.isoformat()
         return f"{parts.scheme}://{parts.netloc}/search?" + urlencode(params)
+
+
+def _linked_result_pages(
+    http: CouncilHttpClient,
+    first_response: FetchResponse,
+    *,
+    max_pages: int = 100,
+) -> list[FetchResponse]:
+    pages = [first_response]
+    base_host = urlsplit(first_response.url).netloc.casefold()
+    seen_urls = {_normalized_page_url(first_response.url)}
+
+    while True:
+        next_url = _next_result_page_url(pages[-1].text, pages[-1].url, base_host)
+        if next_url is None:
+            return pages
+        if len(pages) >= max_pages:
+            raise PortalSearchCompletenessError("Legacy search exceeded the maximum linked result page limit")
+        normalized_url = _normalized_page_url(next_url)
+        if normalized_url in seen_urls:
+            raise PortalSearchCompletenessError("Legacy search returned a linked result page loop")
+        seen_urls.add(normalized_url)
+        pages.append(http.get(next_url))
+
+
+def _next_result_page_url(html_text: str, page_url: str, base_host: str) -> str | None:
+    document = html.fromstring(html_text)
+    for anchor in document.xpath("//a[@href]"):
+        rel = (anchor.get("rel") or "").casefold().split()
+        aria_label = clean_text(anchor.get("aria-label")) or ""
+        text = clean_text(" ".join(anchor.itertext())) or ""
+        if "next" not in rel and aria_label.casefold() != "next" and text not in {"Next", ">"}:
+            continue
+        target = urljoin(page_url, anchor.get("href") or "")
+        if urlsplit(target).netloc.casefold() == base_host:
+            return target
+    return None
+
+
+def _normalized_page_url(url: str) -> str:
+    parts = urlsplit(url)
+    return parts._replace(scheme=parts.scheme.casefold(), netloc=parts.netloc.casefold(), fragment="").geturl()
+
+
+def _reported_result_total(html_text: str) -> int | None:
+    text = clean_text(" ".join(html.fromstring(html_text).xpath("//text()"))) or ""
+    for pattern in (
+        r"\bshowing\s+\d[\d,]*\s*-\s*\d[\d,]*\s+of\s+(\d[\d,]*)\b",
+        r"\btotal\s+records\s*:\s*(\d[\d,]*)\b",
+        r"\b(\d[\d,]*)\s+results?\b",
+    ):
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return int(match.group(1).replace(",", ""))
+    return None
+
+
+def _merge_linked_page_applications(
+    pages: list[FetchResponse],
+    parse_page,
+) -> list[PlanningApplication]:
+    applications: list[PlanningApplication] = []
+    seen_references: set[str] = set()
+    reported_totals: list[int] = []
+    for page in pages:
+        reported_total = _reported_result_total(page.text)
+        if reported_total is not None:
+            reported_totals.append(reported_total)
+        for application in parse_page(page.text, page.url):
+            reference = (application.reference or application.uid).strip()
+            if reference in seen_references:
+                continue
+            seen_references.add(reference)
+            applications.append(application)
+    if reported_totals and max(reported_totals) > len(applications):
+        raise PortalSearchCompletenessError("Legacy search returned fewer unique results than its displayed total")
+    return applications
 
 
 def parse_header_tables(html_text: str, page_url: str, authority: str, family: str) -> list[PlanningApplication]:
