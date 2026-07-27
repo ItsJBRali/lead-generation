@@ -992,24 +992,11 @@ def run_lead_search(
             current = documents_completed
         _document_progress(document_progress, current, total)
 
-    def add_no_application_council(target: CouncilTarget) -> None:
-        with lock:
-            if target.authority not in no_application_councils:
-                no_application_councils.append(target.authority)
-
     def save_failure(
         target: CouncilTarget,
         reason: str,
-        *,
-        no_applications_returned: bool = True,
-        fatal: bool = True,
     ) -> None:
-        nonlocal had_error
         with lock:
-            if fatal:
-                had_error = True
-            if fatal and no_applications_returned and target.authority not in failed_councils:
-                failed_councils.append(target.authority)
             append_csv_row(
                 failure_csv_path,
                 FAILURE_CSV_FIELDS,
@@ -1074,8 +1061,6 @@ def run_lead_search(
                     log=log,
                     should_cancel=cancellation_requested,
                 )
-                if not applications:
-                    add_no_application_council(target)
                 process_discovered_applications(target, applications, source="primary")
                 with lock:
                     state = council_states[target.authority]
@@ -1119,24 +1104,19 @@ def run_lead_search(
                 continue
 
             if isinstance(attempt_error, CouncilSearchDegradedError):
+                reason = (
+                    "Responsive portal search issue after final retry: "
+                    f"{attempt_error}"
+                )
+                with lock:
+                    council_states[target.authority].primary_error = reason
                 _log(
                     log,
                     f"{target.authority}: portal responded but the final retry was unavailable: "
                     f"{attempt_error}",
                 )
-                save_failure(
-                    target,
-                    f"Responsive portal search issue after final retry: {attempt_error}",
-                    no_applications_returned=False,
-                    fatal=False,
-                )
             else:
                 _log(log, f"{target.authority}: final retry failed: {attempt_error}")
-                save_failure(
-                    target,
-                    str(attempt_error),
-                    no_applications_returned=not applications,
-                )
             mark_complete(target)
 
     def process_document_job(
@@ -1369,14 +1349,48 @@ def run_lead_search(
                 state.reconciliation_error = str(exc)
                 reason = f"PlanIt reconciliation warning: {exc}"
                 _log(log, f"{target.authority}: {reason}")
-                save_failure(
-                    target,
-                    reason,
-                    no_applications_returned=False,
-                    fatal=False,
-                )
                 if cancellation_requested():
                     break
+
+    if not cancelled:
+        for state in council_states.values():
+            if state.date_valid_references:
+                if state.primary_error:
+                    save_failure(state.target, state.primary_error)
+                if state.reconciliation_error:
+                    save_failure(
+                        state.target,
+                        f"PlanIt reconciliation warning: "
+                        f"{state.reconciliation_error}",
+                    )
+                continue
+
+            any_source_succeeded = (
+                state.primary_succeeded or state.reconciliation_succeeded
+            )
+            if not any_source_succeeded:
+                failed_councils.append(state.target.authority)
+                had_error = True
+                primary_reason = state.primary_error or "Primary search did not complete"
+                reconciliation_reason = (
+                    state.reconciliation_error
+                    or "PlanIt reconciliation did not complete"
+                )
+                save_failure(
+                    state.target,
+                    f"Primary search failed: {primary_reason}; "
+                    f"PlanIt reconciliation failed: {reconciliation_reason}",
+                )
+                continue
+
+            if state.primary_error:
+                save_failure(state.target, state.primary_error)
+            if state.reconciliation_error:
+                save_failure(
+                    state.target,
+                    f"PlanIt reconciliation warning: {state.reconciliation_error}",
+                )
+            no_application_councils.append(state.target.authority)
 
     if config.download_application_files:
         total_document_jobs = len(document_jobs)
@@ -1457,6 +1471,7 @@ def run_lead_search(
         completion = "Completed"
     _log(log, f"Finished. Saved {len(rows)} leads to {csv_path}")
     _log(log, f"Saved failed council log to {failure_csv_path}")
+    total_applications = len(total_application_references)
     result = LeadSearchResult(
         output_dir=output_dir,
         csv_path=csv_path,
@@ -1465,7 +1480,7 @@ def run_lead_search(
         councils_total=len(targets),
         councils_completed=completed,
         leads_found=len(rows),
-        total_applications=len(total_application_references),
+        total_applications=total_applications,
         captured_documents=captured_documents,
         failed_councils=failed_councils,
         no_application_councils=no_application_councils,

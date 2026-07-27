@@ -1371,6 +1371,227 @@ class LeadSearchTest(unittest.TestCase):
         self.assertEqual(failures[0]["council"], "Broken Council")
         self.assertIn("PlanIt unavailable", failures[0]["reason"])
 
+    def test_run_lead_search_source_classification_matrix(self) -> None:
+        cases = [
+            {
+                "name": "primary_success_secondary_failure_zero_records",
+                "primary_error": None,
+                "primary_records": [],
+                "secondary_error": "reconciliation unavailable",
+                "secondary_records": [],
+                "failed": [],
+                "no_applications": ["Test Council"],
+                "completion": "Completed",
+            },
+            {
+                "name": "primary_failure_secondary_success_zero_records",
+                "primary_error": "primary unavailable",
+                "primary_records": [],
+                "secondary_error": None,
+                "secondary_records": [],
+                "failed": [],
+                "no_applications": ["Test Council"],
+                "completion": "Completed",
+            },
+            {
+                "name": "primary_failure_secondary_success_records",
+                "primary_error": "primary unavailable",
+                "primary_records": [],
+                "secondary_error": None,
+                "secondary_records": ["SECONDARY/1"],
+                "failed": [],
+                "no_applications": [],
+                "completion": "Completed",
+            },
+            {
+                "name": "primary_failure_secondary_failure",
+                "primary_error": "primary unavailable",
+                "primary_records": [],
+                "secondary_error": "reconciliation unavailable",
+                "secondary_records": [],
+                "failed": ["Test Council"],
+                "no_applications": [],
+                "completion": "Failed",
+            },
+            {
+                "name": "primary_success_secondary_success_records",
+                "primary_error": None,
+                "primary_records": ["PRIMARY/1"],
+                "secondary_error": None,
+                "secondary_records": ["SECONDARY/1"],
+                "failed": [],
+                "no_applications": [],
+                "completion": "Completed",
+            },
+        ]
+
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    user_geojson, catalogue = write_search_fixture(root, ["Test Council"])
+                    config = LeadSearchConfig(
+                        geojson_path=user_geojson,
+                        output_root=root,
+                        start_date=date(2026, 7, 20),
+                        end_date=date(2026, 7, 26),
+                        keywords=["gates"],
+                        catalogue_path=catalogue,
+                        download_application_files=False,
+                        worker_count=1,
+                    )
+
+                    def application(reference: str) -> PlanningApplication:
+                        return PlanningApplication(
+                            authority="Test Council",
+                            uid=reference,
+                            url=f"https://planning.example.test/{quote(reference, safe='')}",
+                            reference=reference,
+                            description="Install driveway gates",
+                            date_received="2026-07-22",
+                        )
+
+                    def fake_primary(target, start_date, end_date, *, should_cancel=None):
+                        if case["primary_error"]:
+                            raise RuntimeError(case["primary_error"])
+                        return [application(reference) for reference in case["primary_records"]]
+
+                    def fake_reconciliation(
+                        target,
+                        start_date,
+                        end_date,
+                        *,
+                        should_cancel=None,
+                    ):
+                        if case["secondary_error"]:
+                            raise RuntimeError(case["secondary_error"])
+                        return [
+                            application(reference)
+                            for reference in case["secondary_records"]
+                        ]
+
+                    with (
+                        patch(
+                            "lead_generator.planning.leads.discover_portal_applications",
+                            side_effect=fake_primary,
+                        ),
+                        patch(
+                            "lead_generator.planning.leads.discover_planit_reconciliation_applications",
+                            side_effect=fake_reconciliation,
+                        ),
+                    ):
+                        result = run_lead_search(config)
+
+                    with result.failure_csv_path.open(
+                        newline="",
+                        encoding="utf-8",
+                    ) as handle:
+                        failures = list(csv.DictReader(handle))
+
+                self.assertEqual(result.failed_councils, case["failed"])
+                self.assertEqual(
+                    result.no_application_councils,
+                    case["no_applications"],
+                )
+                self.assertEqual(result.completion, case["completion"])
+                if case["name"] == "primary_failure_secondary_failure":
+                    self.assertEqual(len(failures), 1)
+                    combined_reasons = [
+                        row["reason"]
+                        for row in failures
+                        if "primary unavailable" in row["reason"]
+                        and "reconciliation unavailable" in row["reason"]
+                    ]
+                    self.assertEqual(len(combined_reasons), 1)
+
+    def test_run_lead_search_archive_reconciliation_document_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_geojson, catalogue = write_search_fixture(root, ["Test Council"])
+            history_path = root / "archive" / "search_history.csv"
+            config = LeadSearchConfig(
+                geojson_path=user_geojson,
+                output_root=root,
+                start_date=date(2026, 7, 20),
+                end_date=date(2026, 7, 26),
+                keywords=["gates"],
+                catalogue_path=catalogue,
+                history_csv_path=history_path,
+                worker_count=1,
+            )
+
+            def application(reference: str, received: str | None) -> PlanningApplication:
+                return PlanningApplication(
+                    authority="Test Council",
+                    uid=reference,
+                    url=f"https://planning.example.test/{quote(reference, safe='')}",
+                    reference=reference,
+                    description="Install driveway gates",
+                    date_received=received,
+                    applicant_name=reference,
+                )
+
+            primary = application("PRIMARY/1", "2026-07-22")
+            duplicate = application("PRIMARY/1", "2026-07-22")
+            undated = application("UNDATED/1", None)
+            secondary_only = application("SECONDARY/1", "2026-07-23")
+            document_references: list[str] = []
+            enrichment_references: list[str] = []
+
+            def fake_document_discovery(
+                discovered_application,
+                *,
+                should_cancel=None,
+                defer_rate_limit=False,
+            ):
+                document_references.append(discovered_application.reference)
+                return DocumentDiscoveryResult(
+                    successful_sources={discovered_application.url},
+                )
+
+            def fake_enrichment(
+                folder,
+                *,
+                applicant_name=None,
+                agent_name=None,
+                site_address=None,
+                log=None,
+            ):
+                enrichment_references.append(applicant_name)
+                return ContactEnrichment()
+
+            with (
+                patch(
+                    "lead_generator.planning.leads.discover_portal_applications",
+                    return_value=[primary, undated],
+                ),
+                patch(
+                    "lead_generator.planning.leads.discover_planit_reconciliation_applications",
+                    return_value=[duplicate, secondary_only],
+                ),
+                patch(
+                    "lead_generator.planning.leads.discover_application_documents",
+                    side_effect=fake_document_discovery,
+                ),
+                patch(
+                    "lead_generator.planning.leads.enrich_application_folder",
+                    side_effect=fake_enrichment,
+                ),
+            ):
+                result = run_lead_search(config)
+
+            with history_path.open(newline="", encoding="utf-8") as handle:
+                history_row = next(csv.DictReader(handle))
+
+        self.assertEqual(history_row["Total Applications"], "2")
+        self.assertEqual(history_row["Relevant Captured Applications"], "2")
+        self.assertEqual(history_row["% Relevant"], "100.00%")
+        self.assertEqual(document_references, ["PRIMARY/1", "SECONDARY/1"])
+        self.assertEqual(enrichment_references, ["PRIMARY/1", "SECONDARY/1"])
+        self.assertEqual(result.total_applications, 2)
+        self.assertEqual(result.leads_found, 2)
+        self.assertEqual(result.no_application_councils, [])
+
     def test_shared_pipeline_cross_source_counts_secondary_and_keeps_primary_record(
         self,
     ) -> None:
@@ -2315,7 +2536,10 @@ class LeadSearchTest(unittest.TestCase):
                 result = run_lead_search(config)
 
             self.assertEqual(result.failed_councils, [])
-            self.assertEqual(result.no_application_councils, [])
+            self.assertEqual(
+                result.no_application_councils,
+                ["Responsive Council"],
+            )
             self.assertEqual(result.completion, "Completed")
             with result.failure_csv_path.open(newline="", encoding="utf-8") as handle:
                 failures = list(csv.DictReader(handle))
@@ -2423,8 +2647,24 @@ class LeadSearchTest(unittest.TestCase):
                 ])
 
             captured_counts: list[int] = []
+
+            def fake_reconciliation(
+                target,
+                start_date,
+                end_date,
+                *,
+                should_cancel=None,
+            ):
+                if target.authority == "Broken Council":
+                    raise RuntimeError("PlanIt unavailable")
+                return []
+
             with (
                 patch("lead_generator.planning.leads.discover_portal_applications", side_effect=fake_discover),
+                patch(
+                    "lead_generator.planning.leads.discover_planit_reconciliation_applications",
+                    side_effect=fake_reconciliation,
+                ),
                 patch(
                     "lead_generator.planning.leads.discover_application_documents",
                     side_effect=fake_document_discovery,
@@ -2677,6 +2917,17 @@ class LeadSearchTest(unittest.TestCase):
                     release_stuck_searches.wait(timeout=2)
                 return []
 
+            def fake_reconciliation(
+                target,
+                start_date,
+                end_date,
+                *,
+                should_cancel=None,
+            ):
+                if target.authority == "Stuck Council":
+                    raise RuntimeError("PlanIt unavailable")
+                return []
+
             try:
                 with (
                     patch("lead_generator.planning.leads.COUNCIL_SEARCH_INACTIVITY_TIMEOUT_SECONDS", 0.08),
@@ -2685,6 +2936,10 @@ class LeadSearchTest(unittest.TestCase):
                     patch(
                         "lead_generator.planning.leads.discover_portal_applications",
                         side_effect=fake_discover,
+                    ),
+                    patch(
+                        "lead_generator.planning.leads.discover_planit_reconciliation_applications",
+                        side_effect=fake_reconciliation,
                     ),
                 ):
                     result = run_lead_search(config, log=logs.append)
