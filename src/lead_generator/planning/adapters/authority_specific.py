@@ -698,7 +698,7 @@ class ElmbridgePlanningScraper(AstunPlanningScraper):
             if value.isdigit()
         }
         if page_sizes:
-            data["pagerecs"] = str(50 if 50 in page_sizes else min(page_sizes))
+            data["pagerecs"] = str(max(page_sizes))
         parts = urlsplit(response.url)
         action = parts._replace(query="", fragment="").geturl()
         applications: list[PlanningApplication] = []

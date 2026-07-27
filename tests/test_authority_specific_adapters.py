@@ -451,7 +451,7 @@ class AuthoritySpecificAdapterTest(unittest.TestCase):
         self.assertEqual(application.date_received, "2026-07-06")
         self.assertEqual(application.postcode, "SO50 1AA")
 
-    def test_elmbridge_retries_empty_busy_results_with_bounded_page_size(self) -> None:
+    def test_elmbridge_retries_empty_busy_results_with_complete_page_size(self) -> None:
         class FakeElmbridgeHttp:
             def __init__(self) -> None:
                 self.result_requests: list[dict[str, str]] = []
@@ -502,7 +502,7 @@ class AuthoritySpecificAdapterTest(unittest.TestCase):
         )
 
         self.assertEqual(len(http.result_requests), 3)
-        self.assertEqual(http.result_requests[0]["pagerecs"], "50")
+        self.assertEqual(http.result_requests[0]["pagerecs"], "500")
         self.assertEqual(http.result_requests[0]["daterec_from:PARAM"], "2026-07-06")
         self.assertEqual(discovery.applications[0].reference, "2026/1234")
 

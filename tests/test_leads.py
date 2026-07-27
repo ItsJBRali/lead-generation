@@ -71,7 +71,7 @@ from lead_generator.planning.leads import (
     select_overlapping_authorities,
     source_document_candidates,
 )
-from lead_generator.planning.models import PlanningApplication, PlanningDocument
+from lead_generator.planning.models import DiscoveryResult, PlanningApplication, PlanningDocument
 from lead_generator.planning.http import CouncilFetchError, CouncilHttpClient
 
 
@@ -596,6 +596,73 @@ class LeadSearchTest(unittest.TestCase):
         planit.assert_called_once_with("Surrey", date(2026, 6, 8), date(2026, 6, 14))
         self.assertEqual([application.reference for application in applications], ["PLAN/2026/0498"])
         self.assertEqual(applications[0].raw["source"], "planit_fallback")
+
+    def test_discover_portal_applications_supplements_incomplete_elmbridge_results(self) -> None:
+        class ElmbridgeScraper:
+            def fetch_application(self, *args, **kwargs):
+                raise AssertionError("Complete listing rows should not fetch details")
+
+            def close(self) -> None:
+                pass
+
+        target = CouncilTarget(
+            authority="Elmbridge",
+            portal_family="astun",
+            scraper_type="Astun",
+            base_url="https://emaps.elmbridge.gov.uk/",
+            listing_url="https://emaps.elmbridge.gov.uk/ebc_planning.aspx",
+            geometry={},
+        )
+        direct = PlanningApplication(
+            authority="Elmbridge",
+            uid="2026/1682",
+            url="https://emaps.elmbridge.gov.uk/application/2026/1682",
+            reference="2026/1682",
+            description="New boundary wall",
+            date_received="2026-07-08",
+            raw={"detail_complete": True, "date_range_filtered": True},
+        )
+        missing = PlanningApplication(
+            authority="Elmbridge",
+            uid="2026/1681",
+            url="https://emaps.elmbridge.gov.uk/application/2026/1681",
+            reference="2026/1681",
+            description="New entrance gates",
+            date_received="2026-07-08",
+            raw={"source": "planit_fallback", "date_range_filtered": True},
+        )
+        discovery = DiscoveryResult(
+            authority="Elmbridge",
+            source_url=target.listing_url,
+            applications=[direct],
+        )
+
+        with (
+            patch(
+                "lead_generator.planning.leads._discover_portal_listing",
+                return_value=(discovery, ElmbridgeScraper()),
+            ),
+            patch(
+                "lead_generator.planning.leads.discover_planit_fallback_applications",
+                return_value=[missing],
+            ) as planit,
+        ):
+            applications = discover_portal_applications(
+                target,
+                date(2026, 7, 6),
+                date(2026, 7, 12),
+            )
+
+        planit.assert_called_once_with(
+            target,
+            date(2026, 7, 6),
+            date(2026, 7, 12),
+            should_cancel=None,
+        )
+        self.assertEqual(
+            [application.reference for application in applications],
+            ["2026/1682", "2026/1681"],
+        )
 
     def test_discover_portal_applications_marks_blocked_but_responsive_portal_as_degraded(self) -> None:
         class BlockedScraper:

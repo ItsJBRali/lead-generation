@@ -253,6 +253,10 @@ PLANIT_FIRST_AUTHORITIES = {
     "Surrey",
 }
 
+PLANIT_SUPPLEMENT_AUTHORITIES = {
+    "Elmbridge",
+}
+
 CURRENT_PORTAL_OVERRIDES = {
     "East Hampshire": {
         "portal_family": "tascomi",
@@ -1417,7 +1421,11 @@ def discover_portal_applications(
                 if received is not None and (received < start_date or received > end_date):
                     continue
             applications.append(application)
-        if not applications or detail_fetch_failed:
+        if (
+            not applications
+            or detail_fetch_failed
+            or target.authority in PLANIT_SUPPLEMENT_AUTHORITIES
+        ):
             planit_applications = discover_planit_fallback_applications(
                 target,
                 start_date,
