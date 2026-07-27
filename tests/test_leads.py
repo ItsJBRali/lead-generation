@@ -2755,6 +2755,30 @@ class LeadSearchTest(unittest.TestCase):
             self.assertFalse((destination / "Existing survey report.pdf").exists())
             self.assertFalse((destination / "Viewer.exe").exists())
 
+    def test_exeter_direct_pdf_route_is_downloadable(self) -> None:
+        document = PlanningDocument(
+            title="14/07/2026_Proposed elevations",
+            url=(
+                "https://planningdocs.exeter.gov.uk/servlets/direct/"
+                "Kexample/2/976562/1/1/AS_PDF_FILE"
+            ),
+            source_url=(
+                "https://exeter.gov.uk/planning-services/"
+                "permissions-and-applications/related-documents/"
+                "?appref=26%2F1050%2FLBC"
+            ),
+        )
+
+        self.assertTrue(leads_module._looks_like_downloadable_document(document))
+
+    def test_executable_title_with_size_is_not_downloadable(self) -> None:
+        document = PlanningDocument(
+            title="Viewer.exe (123 KB)",
+            url="https://planning.example.gov.uk/download?id=123",
+        )
+
+        self.assertFalse(leads_module._looks_like_downloadable_document(document))
+
     def test_download_pdf_documents_retries_temporary_404_once(self) -> None:
         document = PlanningDocument(
             title="Removed plan.pdf",

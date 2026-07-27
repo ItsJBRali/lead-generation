@@ -3737,6 +3737,7 @@ def _is_document_href(href: str | None) -> bool:
             "showdocuments",
             "viewdocument",
             "displaysearchdocument",
+            "as_pdf_file",
             "wphappdocs",
             "wchdisplaymedia",
             "displaymedia",
@@ -4427,11 +4428,29 @@ def _looks_like_downloadable_document(document: PlanningDocument) -> bool:
 
 def _is_excluded_document(document: PlanningDocument) -> bool:
     text = _document_filter_text(document)
-    if ".exe" in text or _path_suffix(document.url) == ".exe":
+    if (
+        _path_suffix(document.url) == ".exe"
+        or any(
+            _mentions_executable_filename(value)
+            for value in (document.title, document.description)
+        )
+        or (document.document_type or "").casefold()
+        in {"exe", "executable", "application/x-msdownload"}
+    ):
         return True
     if "existing" in text and "proposed" not in text:
         return not is_existing_only_drawing_metadata(text)
     return False
+
+
+def _mentions_executable_filename(value: str | None) -> bool:
+    return bool(
+        value
+        and re.search(
+            r"(?i)(?:^|[\s/\\])[^/\\?#&]*\.exe(?=$|[\s?#&(),;])",
+            value,
+        )
+    )
 
 
 def _document_filter_text(document: PlanningDocument) -> str:
