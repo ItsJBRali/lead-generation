@@ -142,6 +142,50 @@ class LeadSearchTest(unittest.TestCase):
             ["gates", "electric gates"],
         )
 
+    def test_application_reference_key_is_the_exact_stripped_reference(self) -> None:
+        application = PlanningApplication(
+            authority="A",
+            uid="uid",
+            url="u",
+            reference="  ABC/1  ",
+        )
+
+        self.assertEqual(leads_module.application_reference_key(application), "ABC/1")
+
+    def test_application_outside_or_without_received_date_is_not_in_range(self) -> None:
+        for value in [None, "", "not-a-date", "2026-07-19", "2026-07-27"]:
+            with self.subTest(value=value):
+                application = PlanningApplication(
+                    authority="A",
+                    uid="uid",
+                    url="u",
+                    date_received=value,
+                )
+
+                self.assertFalse(
+                    leads_module.application_is_in_date_range(
+                        application,
+                        date(2026, 7, 20),
+                        date(2026, 7, 26),
+                    )
+                )
+
+    def test_application_received_date_in_range_is_in_range(self) -> None:
+        application = PlanningApplication(
+            authority="A",
+            uid="uid",
+            url="u",
+            date_received="2026-07-20",
+        )
+
+        self.assertTrue(
+            leads_module.application_is_in_date_range(
+                application,
+                date(2026, 7, 20),
+                date(2026, 7, 26),
+            )
+        )
+
     def test_select_overlapping_authorities_uses_app_catalogue_not_user_properties(self) -> None:
         user_geojson = {
             "type": "FeatureCollection",
@@ -791,6 +835,118 @@ class LeadSearchTest(unittest.TestCase):
             applications = discover_portal_applications(target, date(2026, 7, 13), date(2026, 7, 19))
 
         self.assertEqual([application.reference for application in applications], ["26/00001/FUL"])
+
+    def test_run_lead_search_excludes_thousands_of_undated_records_from_total(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_geojson, catalogue = write_search_fixture(root, ["Example Council"])
+            config = LeadSearchConfig(
+                geojson_path=user_geojson,
+                output_root=root,
+                start_date=date(2026, 7, 20),
+                end_date=date(2026, 7, 26),
+                keywords=["gates"],
+                catalogue_path=catalogue,
+                download_application_files=False,
+                worker_count=1,
+            )
+            applications = [
+                PlanningApplication(
+                    authority="Example Council",
+                    uid=f"VALID-{index}",
+                    url=f"https://planning.example.gov.uk/valid/{index}",
+                    reference=f"VALID-{index}",
+                    date_received="2026-07-22",
+                )
+                for index in range(2)
+            ]
+            applications.extend(
+                PlanningApplication(
+                    authority="Example Council",
+                    uid=f"UNDATED-{index}",
+                    url=f"https://planning.example.gov.uk/undated/{index}",
+                    reference=f"UNDATED-{index}",
+                )
+                for index in range(2_000)
+            )
+
+            with patch(
+                "lead_generator.planning.leads.discover_portal_applications",
+                return_value=applications,
+            ):
+                result = run_lead_search(config)
+
+        self.assertEqual(result.total_applications, 2)
+
+    def test_run_lead_search_shared_pipeline_keeps_primary_record_for_duplicate_reference(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_geojson, catalogue = write_search_fixture(root, ["Example Council"])
+            config = LeadSearchConfig(
+                geojson_path=user_geojson,
+                output_root=root,
+                start_date=date(2026, 7, 20),
+                end_date=date(2026, 7, 26),
+                keywords=["gates"],
+                catalogue_path=catalogue,
+                worker_count=1,
+            )
+            primary = PlanningApplication(
+                authority="Example Council",
+                uid="PRIMARY-1",
+                url="https://planning.example.gov.uk/primary/ABC-1",
+                reference="ABC/1",
+                address="1 Primary Street",
+                description="Install driveway gates",
+                date_received="2026-07-22",
+                raw={"location": {"type": "Point", "coordinates": [0.5, 0.5]}},
+            )
+            secondary = PlanningApplication(
+                authority="Example Council",
+                uid="SECONDARY-1",
+                url="https://planit.example.test/secondary/ABC-1",
+                reference="ABC/1",
+                address="1 Secondary Street",
+                description="Install driveway gates",
+                date_received="2026-07-22",
+                raw={
+                    "source": "planit_reconciliation",
+                    "location": {"type": "Point", "coordinates": [0.5, 0.5]},
+                },
+            )
+            captured_counts: list[int] = []
+
+            with (
+                patch(
+                    "lead_generator.planning.leads.discover_portal_applications",
+                    return_value=[primary, secondary],
+                ),
+                patch(
+                    "lead_generator.planning.leads.discover_application_documents",
+                    return_value=DocumentDiscoveryResult(),
+                ) as discover_documents,
+                patch(
+                    "lead_generator.planning.leads.enrich_application_folder",
+                    return_value=ContactEnrichment(),
+                ) as enrich_application,
+            ):
+                result = run_lead_search(config, captured=captured_counts.append)
+
+            with result.csv_path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertEqual(result.total_applications, 1)
+        self.assertEqual(result.leads_found, 1)
+        self.assertEqual(captured_counts, [1])
+        self.assertEqual(discover_documents.call_count, 1)
+        self.assertEqual(enrich_application.call_count, 1)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            rows[0]["application link"],
+            "https://planning.example.gov.uk/primary/ABC-1",
+        )
 
     def test_run_lead_search_writes_only_location_matched_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

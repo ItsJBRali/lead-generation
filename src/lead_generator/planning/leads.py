@@ -326,6 +326,33 @@ class CouncilTarget:
     link_test_ok: bool = False
 
 
+@dataclass(slots=True)
+class CouncilDiscoveryState:
+    target: CouncilTarget
+    primary_succeeded: bool = False
+    primary_error: str | None = None
+    reconciliation_succeeded: bool = False
+    reconciliation_error: str | None = None
+    primary_date_valid_count: int = 0
+    secondary_date_valid_count: int = 0
+    undated_count: int = 0
+    date_valid_references: set[str] = field(default_factory=set)
+
+
+def application_reference_key(application: PlanningApplication) -> str:
+    reference = (application.reference or "").strip()
+    return reference or application.uid.strip()
+
+
+def application_is_in_date_range(
+    application: PlanningApplication,
+    start_date: date,
+    end_date: date,
+) -> bool:
+    received = _parse_iso_date(application.date_received)
+    return received is not None and start_date <= received <= end_date
+
+
 def council_platform_key(target: CouncilTarget) -> str:
     authority = target.authority.casefold()
     portal = f"{target.scraper_type} {target.portal_family}".casefold()
@@ -670,7 +697,6 @@ def run_lead_search(
     document_jobs: list[DocumentDownloadJob] = []
     enrichment_jobs: list[EnrichmentJob] = []
     saved_references: set[str] = set()
-    total_applications = 0
     captured_documents = 0
     failed_councils: list[str] = []
     no_application_councils: list[str] = []
@@ -687,8 +713,12 @@ def run_lead_search(
     _progress(progress, completed, len(targets))
 
     lock = threading.Lock()
+    council_states = {
+        target.authority: CouncilDiscoveryState(target=target)
+        for target in targets
+    }
     completed_authorities: set[str] = set()
-    counted_authorities: set[str] = set()
+    total_application_references: set[str] = set()
     captured_document_references: set[str] = set()
     completed_document_references: set[str] = set()
     deferred_tasks: list[ScheduledTask[CouncilTarget]] = []
@@ -743,13 +773,116 @@ def run_lead_search(
             current = len(rows)
         _captured(captured, current)
 
-    def add_total_applications(target: CouncilTarget, count: int) -> None:
-        nonlocal total_applications
-        with lock:
-            if target.authority in counted_authorities:
-                return
-            counted_authorities.add(target.authority)
-            total_applications += count
+    def process_discovered_applications(
+        target: CouncilTarget,
+        applications: list[PlanningApplication],
+        source: str,
+    ) -> int:
+        state = council_states[target.authority]
+        source_date_valid_references: set[str] = set()
+        excluded_without_usable_date = 0
+        matched_count = 0
+
+        for application in applications:
+            if cancellation_requested():
+                break
+            if not application_is_in_date_range(
+                application,
+                config.start_date,
+                config.end_date,
+            ):
+                if _parse_iso_date(application.date_received) is None:
+                    excluded_without_usable_date += 1
+                continue
+
+            reference = application_reference_key(application)
+            if reference not in source_date_valid_references:
+                source_date_valid_references.add(reference)
+                with lock:
+                    if source == "primary":
+                        state.primary_date_valid_count += 1
+                    else:
+                        state.secondary_date_valid_count += 1
+                    state.date_valid_references.add(reference)
+                    total_application_references.add(reference)
+
+            if not application_matches(
+                application,
+                config.start_date,
+                config.end_date,
+                config.keywords,
+            ):
+                continue
+            if not application_matches_search_area(application, user_geojson):
+                continue
+            if not reserve_reference(reference):
+                _log(log, f"{target.authority}: skipped duplicate reference {reference}")
+                continue
+
+            matched_count += 1
+            if config.download_application_files:
+                lead_folder = create_lead_folder(output_dir, target.authority, application)
+            else:
+                lead_folder = None
+            row = {
+                "Reference": reference,
+                "address": application.address or "",
+                "application link": application_link(application),
+                "proposal": application.description or "",
+                "date received": application.date_received or application.date_validated or "",
+                "council": target.authority,
+                **empty_enrichment_row(requested=config.download_application_files),
+            }
+            enrichment_job = None
+            if lead_folder is not None:
+                enrichment_job = EnrichmentJob(
+                    reference=reference,
+                    folder=lead_folder,
+                    row=row,
+                    applicant_name=application.applicant_name,
+                    agent_name=application.agent_name,
+                    site_address=application.address,
+                )
+            document_job = None
+            if lead_folder is not None:
+                document_job = DocumentDownloadJob(
+                    reference=reference,
+                    council=target.authority,
+                    application=application,
+                    folder=lead_folder,
+                    row=row,
+                )
+            save_row(row, enrichment_job, document_job)
+            if config.download_application_files:
+                _log(
+                    log,
+                    f"{target.authority}: saved {reference} (documents queued)",
+                )
+            else:
+                _log(
+                    log,
+                    f"{target.authority}: saved {reference} "
+                    "(file downloads not requested)",
+                )
+
+        if excluded_without_usable_date:
+            with lock:
+                state.undated_count += excluded_without_usable_date
+            _log(
+                log,
+                f"{target.authority}: excluded {excluded_without_usable_date} application(s) "
+                "without a usable in-range received date",
+            )
+        date_valid_count = len(source_date_valid_references)
+        _log(
+            log,
+            f"{target.authority}: found {date_valid_count} applications in the date range",
+        )
+        _log(
+            log,
+            f"{target.authority}: {matched_count} applications matched keywords and location",
+        )
+        return date_valid_count
 
     def add_captured_document_application(reference: str) -> None:
         nonlocal captured_documents
@@ -851,67 +984,17 @@ def run_lead_search(
                     log=log,
                     should_cancel=cancellation_requested,
                 )
-                add_total_applications(target, len(applications))
                 if not applications:
                     add_no_application_council(target)
-                _log(log, f"{target.authority}: found {len(applications)} applications in the date range")
-                matched_count = 0
-                for application in applications:
-                    if cancellation_requested():
-                        break
-                    if not application_matches(application, config.start_date, config.end_date, config.keywords):
-                        continue
-                    if not application_matches_search_area(application, user_geojson):
-                        continue
-                    reference = application.reference or application.uid
-                    if not reserve_reference(reference):
-                        _log(log, f"{target.authority}: skipped duplicate reference {reference}")
-                        continue
-                    matched_count += 1
-                    if config.download_application_files:
-                        lead_folder = create_lead_folder(output_dir, target.authority, application)
-                    else:
-                        lead_folder = None
-                    row = {
-                        "Reference": reference,
-                        "address": application.address or "",
-                        "application link": application_link(application),
-                        "proposal": application.description or "",
-                        "date received": application.date_received or application.date_validated or "",
-                        "council": target.authority,
-                        **empty_enrichment_row(requested=config.download_application_files),
-                    }
-                    enrichment_job = None
-                    if lead_folder is not None:
-                        enrichment_job = EnrichmentJob(
-                            reference=reference,
-                            folder=lead_folder,
-                            row=row,
-                            applicant_name=application.applicant_name,
-                            agent_name=application.agent_name,
-                            site_address=application.address,
-                        )
-                    document_job = None
-                    if lead_folder is not None:
-                        document_job = DocumentDownloadJob(
-                            reference=reference,
-                            council=target.authority,
-                            application=application,
-                            folder=lead_folder,
-                            row=row,
-                        )
-                    save_row(row, enrichment_job, document_job)
-                    if config.download_application_files:
-                        _log(
-                            log,
-                            f"{target.authority}: saved {application.reference or application.uid} "
-                            "(documents queued)",
-                        )
-                    else:
-                        _log(log, f"{target.authority}: saved {application.reference or application.uid} (file downloads not requested)")
-                _log(log, f"{target.authority}: {matched_count} applications matched keywords and location")
+                process_discovered_applications(target, applications, source="primary")
+                with lock:
+                    state = council_states[target.authority]
+                    state.primary_succeeded = True
+                    state.primary_error = None
             except Exception as exc:  # pragma: no cover - live-site resilience
                 attempt_error = exc
+                with lock:
+                    council_states[target.authority].primary_error = str(exc)
 
             signal = search_failure_signal(attempt_error) if attempt_error else "success"
             affected_platform = (
@@ -1241,7 +1324,7 @@ def run_lead_search(
         councils_total=len(targets),
         councils_completed=completed,
         leads_found=len(rows),
-        total_applications=total_applications,
+        total_applications=len(total_application_references),
         captured_documents=captured_documents,
         failed_councils=failed_councils,
         no_application_councils=no_application_councils,
