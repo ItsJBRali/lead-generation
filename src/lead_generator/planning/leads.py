@@ -695,11 +695,14 @@ def discover_portal_applications_with_deadline(
         with activity_lock:
             last_activity_at = monotonic()
 
+    def attempt_cancellation_requested() -> bool:
+        return attempt_cancelled.is_set() or bool(should_cancel and should_cancel())
+
     def discover() -> None:
         try:
             with monitor_council_requests(
                 record_activity,
-                should_cancel=attempt_cancelled.is_set,
+                should_cancel=attempt_cancellation_requested,
             ):
                 outcome.put(
                     (
@@ -707,7 +710,7 @@ def discover_portal_applications_with_deadline(
                             target,
                             start_date,
                             end_date,
-                            should_cancel=attempt_cancelled.is_set,
+                            should_cancel=attempt_cancellation_requested,
                         ),
                         None,
                     )

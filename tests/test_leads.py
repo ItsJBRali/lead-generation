@@ -7,6 +7,7 @@ import threading
 import tempfile
 import unittest
 from datetime import date
+from time import monotonic
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request
@@ -1309,6 +1310,122 @@ class LeadSearchTest(unittest.TestCase):
             [row["Reference"] for row in rows],
             ["PRIMARY", "SECONDARY-1"],
         )
+
+    def test_run_lead_search_primary_pagination_cancel_preserves_rows_and_stops_followup_work(
+        self,
+    ) -> None:
+        class PagingHeaders:
+            def get_content_charset(self) -> str:
+                return "utf-8"
+
+        class PagingResponse:
+            headers = PagingHeaders()
+            status = 200
+
+            def __init__(self, url: str) -> None:
+                self.url = url
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def geturl(self) -> str:
+                return self.url
+
+            def read(self) -> bytes:
+                return b"<html>page</html>"
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_geojson, catalogue = write_search_fixture(
+                root,
+                ["Saved Council", "Paging Council"],
+            )
+            config = LeadSearchConfig(
+                geojson_path=user_geojson,
+                output_root=root,
+                start_date=date(2026, 7, 20),
+                end_date=date(2026, 7, 26),
+                keywords=["gates"],
+                catalogue_path=catalogue,
+                worker_count=1,
+            )
+            saved = PlanningApplication(
+                authority="Saved Council",
+                uid="SAVED-1",
+                url="https://saved.example.test/SAVED-1",
+                reference="SAVED/1",
+                description="Install driveway gates",
+                date_received="2026-07-22",
+            )
+            cancel_requested = threading.Event()
+            pagination_stopped = threading.Event()
+            fetched_pages: list[int] = []
+
+            class PagingOpener:
+                def open(self, request, timeout):
+                    page = int(request.full_url.rsplit("/", 1)[-1])
+                    fetched_pages.append(page)
+                    if page == 2:
+                        cancel_requested.set()
+                    return PagingResponse(request.full_url)
+
+            class PagingClient(CouncilHttpClient):
+                def _opener(self):
+                    return PagingOpener()
+
+            def fake_primary(
+                target,
+                start_date,
+                end_date,
+                *,
+                should_cancel=None,
+            ):
+                if target.authority == "Saved Council":
+                    return [saved]
+                client = PagingClient(min_delay_seconds=0, retries=0)
+                try:
+                    for page in range(1, 11):
+                        client.get(f"https://paging.example.test/pages/{page}")
+                finally:
+                    pagination_stopped.set()
+                return []
+
+            started = monotonic()
+            with (
+                patch(
+                    "lead_generator.planning.leads.discover_portal_applications",
+                    side_effect=fake_primary,
+                ),
+                patch(
+                    "lead_generator.planning.leads.discover_planit_reconciliation_applications",
+                    side_effect=AssertionError(
+                        "reconciliation started after primary cancellation"
+                    ),
+                ),
+                patch(
+                    "lead_generator.planning.leads.discover_application_documents",
+                    side_effect=AssertionError(
+                        "document discovery started after primary cancellation"
+                    ),
+                ),
+            ):
+                result = run_lead_search(
+                    config,
+                    should_cancel=cancel_requested.is_set,
+                )
+            elapsed = monotonic() - started
+            self.assertTrue(pagination_stopped.wait(1.0))
+
+            with result.csv_path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertEqual(result.completion, "Cancelled")
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(fetched_pages, [1, 2])
+        self.assertEqual([row["Reference"] for row in rows], ["SAVED/1"])
 
     def test_run_lead_search_reconciliation_cancel_finalizes_completed_councils(
         self,

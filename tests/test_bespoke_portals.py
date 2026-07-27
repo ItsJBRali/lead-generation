@@ -266,6 +266,14 @@ class KensingtonAngleBracketCountHttp(KensingtonHttp):
         return BinaryFetchResponse(url, 200, body)
 
 
+class KensingtonFixedBodyHttp(KensingtonHttp):
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+
+    def get_bytes(self, url: str, params=None, headers=None) -> BinaryFetchResponse:
+        return BinaryFetchResponse(url, 200, self.body)
+
+
 class BespokePortalTests(unittest.TestCase):
     def test_bath_merges_validated_and_publication_searches(self) -> None:
         http = BathHttp()
@@ -363,6 +371,55 @@ class BespokePortalTests(unittest.TestCase):
         self.assertEqual(len(result.applications), 60)
         self.assertEqual(result.applications[0].reference, "PP/26/00000")
         self.assertEqual(result.applications[-1].reference, "PP/26/00059")
+
+    def test_kensington_decodes_valid_binary_when_record_count_starts_with_json_signature(self) -> None:
+        fixture = KensingtonHttp()
+        record = fixture._record(
+            False,
+            "PP/26/08827",
+            "Planning application",
+            "2026-07-10",
+        )
+        body = struct.pack("<I", 8_827) + (record * 8_827)
+        self.assertEqual(body[:4], b'{"\x00\x00')
+        scraper = KensingtonPlanningScraper(
+            LegacyFormsCouncilConfig("Kensington", "https://www.rbkc.gov.uk"),
+            http_client=KensingtonFixedBodyHttp(body),
+        )
+
+        result = scraper.discover_ids(
+            listing_url="https://www.rbkc.gov.uk/planningsearch",
+            start_date=date(2026, 7, 6),
+            end_date=date(2026, 7, 12),
+        )
+
+        self.assertEqual(len(result.applications), 8_827)
+        self.assertEqual(result.applications[0].reference, "PP/26/08827")
+        self.assertEqual(result.applications[-1].reference, "PP/26/08827")
+
+    def test_kensington_binary_api_fails_closed_for_textual_responses(self) -> None:
+        responses = {
+            "html": b"<!DOCTYPE html><html><body>Unavailable</body></html>",
+            "xml": b"<?xml version='1.0'?><error>Unavailable</error>",
+            "json": b'{"error":"Unavailable"}',
+            "text": b"Service unavailable",
+        }
+
+        for response_type, body in responses.items():
+            with self.subTest(response_type=response_type):
+                scraper = KensingtonPlanningScraper(
+                    LegacyFormsCouncilConfig("Kensington", "https://www.rbkc.gov.uk"),
+                    http_client=KensingtonFixedBodyHttp(body),
+                )
+
+                with self.assertRaises(CouncilFetchError) as captured:
+                    scraper.discover_ids(
+                        listing_url="https://www.rbkc.gov.uk/planningsearch",
+                        start_date=date(2026, 7, 6),
+                        end_date=date(2026, 7, 12),
+                    )
+
+                self.assertIsInstance(captured.exception.__cause__, ValueError)
 
     def test_kensington_reports_the_council_side_outage(self) -> None:
         class OutageHttp:
