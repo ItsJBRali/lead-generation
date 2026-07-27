@@ -372,6 +372,36 @@ class BespokePortalTests(unittest.TestCase):
         self.assertEqual(result.applications[0].reference, "PP/26/00000")
         self.assertEqual(result.applications[-1].reference, "PP/26/00059")
 
+    def test_kensington_decodes_valid_binary_when_record_count_starts_with_open_brace(self) -> None:
+        fixture = KensingtonHttp()
+        references = [f"PP/26/{index:05d}" for index in range(123)]
+        records = b"".join(
+            fixture._record(
+                False,
+                reference,
+                "Planning application",
+                "2026-07-10",
+            )
+            for reference in references
+        )
+        body = struct.pack("<I", 123) + records
+        self.assertEqual(body[:4], b"{\x00\x00\x00")
+        scraper = KensingtonPlanningScraper(
+            LegacyFormsCouncilConfig("Kensington", "https://www.rbkc.gov.uk"),
+            http_client=KensingtonFixedBodyHttp(body),
+        )
+
+        result = scraper.discover_ids(
+            listing_url="https://www.rbkc.gov.uk/planningsearch",
+            start_date=date(2026, 7, 6),
+            end_date=date(2026, 7, 12),
+        )
+
+        self.assertEqual(
+            [application.reference for application in result.applications],
+            references,
+        )
+
     def test_kensington_decodes_valid_binary_when_record_count_starts_with_json_signature(self) -> None:
         fixture = KensingtonHttp()
         record = fixture._record(
