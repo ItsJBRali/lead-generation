@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from datetime import date
+import json
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from lead_generator.planning.adapters.base import PortalSearchCompletenessError
 from lead_generator.planning.http import FetchResponse
 from lead_generator.planning.adapters.achieveforms import AchieveFormsCouncilConfig, AchieveFormsPlanningScraper
 from lead_generator.planning.adapters.agile import AgileCouncilConfig, AgilePlanningScraper
@@ -34,6 +36,28 @@ from lead_generator.planning.adapters.northgate import (
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
+
+
+class PaginatedStatMapHttp:
+    def __init__(self, pages: dict[int, dict[str, object]]) -> None:
+        self.pages = pages
+        self.posts: list[tuple[str, dict[str, object]]] = []
+
+    def post_json(self, url: str, data: dict[str, object]) -> FetchResponse:
+        self.posts.append((url, data))
+        payload = self.pages[data["offset"]]
+        return FetchResponse(url=url, status_code=200, text=json.dumps(payload))
+
+
+def statmap_record(reference: str, received_date: str) -> dict[str, str]:
+    return {
+        "id": reference,
+        "name": reference,
+        "address": "25 Cleardene RH4 2BY",
+        "proposal": "Rear extension",
+        "receivedDate": received_date,
+        "status": "Live",
+    }
 
 
 class FakeJsonHttpClient:
@@ -845,19 +869,107 @@ class NonIdoxScraperTest(unittest.TestCase):
         self.assertEqual(http.gets[1][1]["DATEAPRECV:FROM:DATE"], "08/06/2026")
         self.assertEqual(discovery.applications[0].reference, "26/00456/FUL")
 
-    def test_statmap_posts_page_request(self) -> None:
-        http = FakeLegacyFormsHttpClient({"post": '{"records":[{"id":"130473","name":"MO/2026/00790","address":"25 Cleardene RH4 2BY","proposal":"Rear extension","receivedDate":"2026-06-11T05:55:13","status":"Live"}]}'})
-        scraper = StatMapPlanningScraper(LegacyFormsCouncilConfig("Mole Valley", "https://molevalley.example"), http_client=http)
-
-        discovery = scraper.discover_ids(
-            listing_url="https://molevalley.example/horizoNext/",
-            start_date=date(2026, 6, 8),
-            end_date=date(2026, 6, 14),
+    def test_statmap_uses_current_date_filter_and_fetches_every_offset(self) -> None:
+        http = PaginatedStatMapHttp(
+            {
+                0: {"total": 3, "records": [statmap_record("MO/1", "2026-07-21"), statmap_record("MO/2", "2026-07-22")]},
+                2: {"total": 3, "records": [statmap_record("MO/3", "2026-07-23")]},
+            }
+        )
+        scraper = StatMapPlanningScraper(
+            LegacyFormsCouncilConfig("Mole Valley", "https://molevalley.example"),
+            http_client=http,
         )
 
-        self.assertIn("/api/publicportal/planningApplications/pageRequest", http.posts[0][0])
-        self.assertEqual(discovery.applications[0].reference, "MO/2026/00790")
-        self.assertEqual(discovery.applications[0].date_received, "2026-06-11")
+        applications = scraper.search(
+            "https://molevalley.example/horizoNext/",
+            start_date=date(2026, 7, 20),
+            end_date=date(2026, 7, 26),
+            limit=None,
+        )
+
+        self.assertEqual([app.reference for app in applications], ["MO/1", "MO/2", "MO/3"])
+        self.assertEqual([post[1]["offset"] for post in http.posts], [0, 2])
+        self.assertEqual(
+            http.posts[0][1]["filter"],
+            {
+                "parts": [
+                    {
+                        "filterItems": [
+                            {"columnName": "receivedDateFrom", "value": "2026-07-20", "operator": "="},
+                            {"columnName": "receivedDateTo", "value": "2026-07-26", "operator": "="},
+                        ]
+                    }
+                ]
+            },
+        )
+
+    def test_statmap_raises_when_response_date_is_outside_requested_range(self) -> None:
+        http = PaginatedStatMapHttp({0: {"total": 1, "records": [statmap_record("MO/1", "2026-07-19")]}})
+        scraper = StatMapPlanningScraper(
+            LegacyFormsCouncilConfig("Mole Valley", "https://molevalley.example"),
+            http_client=http,
+        )
+
+        with self.assertRaises(PortalSearchCompletenessError):
+            scraper.search(
+                "https://molevalley.example/horizoNext/",
+                start_date=date(2026, 7, 20),
+                end_date=date(2026, 7, 26),
+                limit=None,
+            )
+
+    def test_statmap_raises_when_page_is_repeated(self) -> None:
+        records = [statmap_record("MO/1", "2026-07-21"), statmap_record("MO/2", "2026-07-22")]
+        http = PaginatedStatMapHttp({0: {"total": 4, "records": records}, 2: {"total": 4, "records": records}})
+        scraper = StatMapPlanningScraper(
+            LegacyFormsCouncilConfig("Mole Valley", "https://molevalley.example"),
+            http_client=http,
+        )
+
+        with self.assertRaises(PortalSearchCompletenessError):
+            scraper.search(
+                "https://molevalley.example/horizoNext/",
+                start_date=date(2026, 7, 20),
+                end_date=date(2026, 7, 26),
+                limit=None,
+            )
+
+    def test_statmap_raises_when_final_count_is_below_portal_total(self) -> None:
+        http = PaginatedStatMapHttp(
+            {
+                0: {"total": 3, "records": [statmap_record("MO/1", "2026-07-21"), statmap_record("MO/2", "2026-07-22")]},
+                2: {"total": 3, "records": []},
+            }
+        )
+        scraper = StatMapPlanningScraper(
+            LegacyFormsCouncilConfig("Mole Valley", "https://molevalley.example"),
+            http_client=http,
+        )
+
+        with self.assertRaises(PortalSearchCompletenessError):
+            scraper.search(
+                "https://molevalley.example/horizoNext/",
+                start_date=date(2026, 7, 20),
+                end_date=date(2026, 7, 26),
+                limit=None,
+            )
+
+    def test_statmap_raises_for_invalid_page_metadata(self) -> None:
+        for page in ({"total": "one", "records": []}, {"total": 0, "records": {}}):
+            with self.subTest(page=page):
+                scraper = StatMapPlanningScraper(
+                    LegacyFormsCouncilConfig("Mole Valley", "https://molevalley.example"),
+                    http_client=PaginatedStatMapHttp({0: page}),
+                )
+
+                with self.assertRaises(PortalSearchCompletenessError):
+                    scraper.search(
+                        "https://molevalley.example/horizoNext/",
+                        start_date=date(2026, 7, 20),
+                        end_date=date(2026, 7, 26),
+                        limit=None,
+                    )
 
     def test_socrata_uses_dataset_api(self) -> None:
         http = FakeLegacyFormsHttpClient(

@@ -8,7 +8,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 
 from lxml import html
 
-from lead_generator.planning.adapters.base import PlanningScraper
+from lead_generator.planning.adapters.base import PlanningScraper, PortalSearchCompletenessError
 from lead_generator.planning.http import (
     CouncilBrowserClient,
     CouncilFetchError,
@@ -757,17 +757,81 @@ class StatMapPlanningScraper(NativeListingScraper):
     ) -> list[PlanningApplication]:
         base = self._spa_base_url(listing_url)
         api_url = urljoin(base + "/", "api/publicportal/planningApplications/pageRequest")
-        payload = {
-            "pagination": {"page": 0, "pageSize": limit or 50},
-            "filter": {
-                "receivedDateFrom": start_date.isoformat() if start_date else "",
-                "receivedDateTo": end_date.isoformat() if end_date else "",
-            },
-        }
-        response = self.http.post_json(api_url, payload)
-        records = json.loads(response.text).get("records") or []
-        applications = [self._from_record(record, base) for record in records[: limit or len(records)]]
-        return filter_by_date(applications, start_date, end_date)
+        page_size = min(limit, 100) if limit and limit < 100 else 100
+        offset = 0
+        expected_total: int | None = None
+        seen_page_signatures: set[tuple[str, ...]] = set()
+        seen_references: set[str] = set()
+        applications: list[PlanningApplication] = []
+
+        while True:
+            payload = {
+                "pageSize": page_size,
+                "offset": offset,
+                "filter": {
+                    "parts": [
+                        {
+                            "filterItems": [
+                                {"columnName": "receivedDateFrom", "value": start_date.isoformat() if start_date else "", "operator": "="},
+                                {"columnName": "receivedDateTo", "value": end_date.isoformat() if end_date else "", "operator": "="},
+                            ]
+                        }
+                    ]
+                },
+                "order": {"receivedDate": "desc"},
+                "advancedFilter": {},
+            }
+            try:
+                response_data = json.loads(self.http.post_json(api_url, payload).text)
+            except json.JSONDecodeError as error:
+                raise PortalSearchCompletenessError("StatMap returned invalid JSON") from error
+            if not isinstance(response_data, dict):
+                raise PortalSearchCompletenessError("StatMap returned an invalid page payload")
+
+            records = response_data.get("records")
+            total = response_data.get("total")
+            if not isinstance(records, list) or not all(isinstance(record, dict) for record in records):
+                raise PortalSearchCompletenessError("StatMap returned invalid records")
+            if not isinstance(total, int) or isinstance(total, bool) or total < 0:
+                raise PortalSearchCompletenessError("StatMap returned an invalid total")
+            if expected_total is None:
+                expected_total = total
+            elif total != expected_total:
+                raise PortalSearchCompletenessError("StatMap changed the result total during pagination")
+
+            page_signature = tuple(
+                string_value(record.get("name") or record.get("reference") or record.get("appRef") or record.get("id")) or ""
+                for record in records
+            )
+            if page_signature in seen_page_signatures:
+                raise PortalSearchCompletenessError("StatMap returned a repeated page")
+            seen_page_signatures.add(page_signature)
+
+            for record, reference in zip(records, page_signature):
+                if reference in seen_references:
+                    continue
+                seen_references.add(reference)
+                application = self._from_record(record, base)
+                received_date = application.date_received
+                if not received_date:
+                    continue
+                try:
+                    parsed_received_date = date.fromisoformat(received_date)
+                except ValueError:
+                    continue
+                if start_date and parsed_received_date < start_date:
+                    raise PortalSearchCompletenessError("StatMap returned a record before the requested start date")
+                if end_date and parsed_received_date > end_date:
+                    raise PortalSearchCompletenessError("StatMap returned a record after the requested end date")
+                applications.append(application)
+
+            if len(seen_references) == expected_total:
+                break
+            if not records:
+                raise PortalSearchCompletenessError("StatMap returned an empty page before the reported total")
+            offset += len(records)
+
+        return applications[:limit] if limit is not None else applications
 
     def _spa_base_url(self, listing_url: str) -> str:
         parts = urlsplit(listing_url)
