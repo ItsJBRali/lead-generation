@@ -143,16 +143,14 @@ def test_enrichment_uses_only_proposed_or_existing_drawings() -> None:
             )
 
     row = result.to_csv_row()
-    assert row["Architect / Company Name"] == (
-        "Existing Studio Architects Ltd; Proposed Design Architects Ltd"
-    )
+    assert row["Architect / Company Name"] == "Proposed Design Architects Ltd"
     assert row["Phone Number"] == "020 7123 4567"
     assert row["Email Address"] == "studio@proposed-design.co.uk"
     assert row["Company Address"] == "12 Design Road, London, SW1A 1AA"
     assert "Portal Agent" not in " ".join(row.values())
     assert "Studio Arc Architects Ltd" not in " ".join(row.values())
     assert result.field_sources == {
-        "Architect / Company Name": ["Existing Elevations.pdf", "Proposed Plan.pdf"],
+        "Architect / Company Name": ["Proposed Plan.pdf"],
         "Phone Number": ["Proposed Plan.pdf"],
         "Email Address": ["Proposed Plan.pdf"],
         "Company Address": ["Proposed Plan.pdf"],
@@ -468,6 +466,45 @@ def test_application_form_applicant_is_used_only_as_an_exclusion() -> None:
     }
 
 
+def test_application_form_excludes_applicant_phone_and_email_from_drawing() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        folder = Path(directory)
+        form_path = folder / "APPLICATION_FORM.pdf"
+        drawing_path = folder / "Proposed Site Plan.pdf"
+        form_path.touch()
+        drawing_path.touch()
+        form = _fake_pdf(form_path, APPLICATION_FORM_TEXT, application_form=True)
+        drawing = _fake_pdf(
+            drawing_path,
+            "PROPOSED SITE PLAN\nDRAWING NUMBER P01\nSCALE 1:100\n"
+            "ARCHITECT\nAcme Homes Ltd\n07700 900111\n"
+            "adam.client@example.com\n1 Application Site Road\nLondon\nN1 1AA",
+            application_form=False,
+        )
+
+        with (
+            patch.object(
+                enrichment,
+                "extract_pdf_application_form_text",
+                return_value=form,
+            ),
+            patch.object(
+                enrichment,
+                "extract_pdf_first_page_text",
+                return_value=drawing,
+            ),
+            patch.object(enrichment, "extract_pdf_text", return_value=drawing),
+        ):
+            result = enrichment.enrich_application_folder(folder)
+
+    assert result.to_csv_row() == {
+        "Architect / Company Name": "Failed",
+        "Phone Number": "Failed",
+        "Email Address": "Failed",
+        "Company Address": "Failed",
+    }
+
+
 def test_misnamed_application_form_cannot_contribute_contact_details() -> None:
     with tempfile.TemporaryDirectory() as directory:
         folder = Path(directory)
@@ -529,6 +566,37 @@ def test_encountered_misnamed_form_removes_applicant_values_from_prior_drawing()
         "Company Address": "Failed",
     }
     assert result.field_sources == {}
+
+
+def test_ocr_discovered_application_form_adds_applicant_exclusions() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        folder = Path(directory)
+        path = folder / "A-101.pdf"
+        path.touch()
+        sparse = _fake_pdf(path, "", application_form=False)
+        form = _fake_pdf(path, APPLICATION_FORM_TEXT, application_form=True)
+
+        with (
+            patch.object(
+                enrichment,
+                "extract_pdf_first_page_text",
+                return_value=sparse,
+            ),
+            patch.object(
+                enrichment,
+                "extract_pdf_first_page_with_ocr",
+                return_value=form,
+            ),
+            patch.object(
+                enrichment,
+                "extract_pdf_application_form_text",
+                return_value=form,
+            ) as form_reader,
+        ):
+            result = enrichment.enrich_application_folder(folder)
+
+    form_reader.assert_called_once_with(path, first_page=form)
+    assert result.rejected_documents == {"A-101.pdf": "application form"}
 
 
 def test_partial_drawing_contact_keeps_only_available_fields() -> None:
@@ -723,6 +791,161 @@ def test_partial_contacts_from_different_firms_do_not_trigger_early_stop() -> No
     assert first_page_reader.call_count == 3
 
 
+def test_complete_document_replaces_prior_partial_contact() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        folder = Path(directory)
+        paths = [
+            folder / "A Proposed Plan.pdf",
+            folder / "B Proposed Plan.pdf",
+            folder / "C Proposed Plan.pdf",
+        ]
+        for path in paths:
+            path.touch()
+        documents = {
+            paths[0].name: _fake_pdf(
+                paths[0],
+                "PROPOSED PLAN\nDRAWING NUMBER P01\nSCALE 1:100\n"
+                "ARCHITECT\nAlpha Architects Ltd\n"
+                "020 7123 4567\nalpha@example.com",
+                application_form=False,
+            ),
+            paths[1].name: _fake_pdf(
+                paths[1],
+                "PROPOSED PLAN\nDRAWING NUMBER P02\nSCALE 1:100\n"
+                "ARCHITECT\nGamma Architects Ltd\n"
+                "020 7987 6543\ngamma@example.com\n"
+                "3 Gamma Road\nLondon\nEC1A 1BB",
+                application_form=False,
+            ),
+            paths[2].name: _fake_pdf(
+                paths[2],
+                "PROPOSED PLAN\nDRAWING NUMBER P03\nSCALE 1:100\n"
+                "ARCHITECT\nLater Architects Ltd\n"
+                "020 7000 0000\nlater@example.com\n"
+                "4 Later Road\nLondon\nN1 1AA",
+                application_form=False,
+            ),
+        }
+
+        with (
+            patch.object(
+                enrichment,
+                "extract_pdf_first_page_text",
+                side_effect=lambda path: documents[path.name],
+            ) as first_page_reader,
+            patch.object(
+                enrichment,
+                "extract_pdf_text",
+                side_effect=lambda path, **_kwargs: documents[path.name],
+            ),
+        ):
+            result = enrichment.enrich_application_folder(folder)
+
+    assert first_page_reader.call_count == 2
+    assert result.to_csv_row() == {
+        "Architect / Company Name": "Gamma Architects Ltd",
+        "Phone Number": "020 7987 6543",
+        "Email Address": "gamma@example.com",
+        "Company Address": "3 Gamma Road, London, EC1A 1BB",
+    }
+    assert result.field_sources == {
+        "Architect / Company Name": ["B Proposed Plan.pdf"],
+        "Phone Number": ["B Proposed Plan.pdf"],
+        "Email Address": ["B Proposed Plan.pdf"],
+        "Company Address": ["B Proposed Plan.pdf"],
+    }
+
+
+def test_person_and_company_in_one_document_trigger_early_stop() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        folder = Path(directory)
+        first_path = folder / "A Proposed Plan.pdf"
+        second_path = folder / "B Proposed Plan.pdf"
+        first_path.touch()
+        second_path.touch()
+        documents = {
+            first_path.name: _fake_pdf(
+                first_path,
+                "PROPOSED PLAN\nDRAWING NUMBER P01\nSCALE 1:100\n"
+                "ARCHITECT\nJane Smith\nARB\n"
+                "Studio Arc Architects Ltd\n020 7987 6543\n"
+                "jane@studioarc.co.uk\n3 Gamma Road\nLondon\nEC1A 1BB",
+                application_form=False,
+            ),
+            second_path.name: _fake_pdf(
+                second_path,
+                "PROPOSED PLAN\nDRAWING NUMBER P02\nSCALE 1:100",
+                application_form=False,
+            ),
+        }
+
+        with (
+            patch.object(
+                enrichment,
+                "extract_pdf_first_page_text",
+                side_effect=lambda path: documents[path.name],
+            ) as first_page_reader,
+            patch.object(
+                enrichment,
+                "extract_pdf_text",
+                side_effect=lambda path, **_kwargs: documents[path.name],
+            ),
+        ):
+            result = enrichment.enrich_application_folder(folder)
+
+    assert first_page_reader.call_count == 1
+    assert result.to_csv_row() == {
+        "Architect / Company Name": "Jane Smith; Studio Arc Architects Ltd",
+        "Phone Number": "020 7987 6543",
+        "Email Address": "jane@studioarc.co.uk",
+        "Company Address": "3 Gamma Road, London, EC1A 1BB",
+    }
+
+
+def test_two_firms_in_one_pdf_do_not_trigger_early_stop() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        folder = Path(directory)
+        first_path = folder / "A Proposed Plan.pdf"
+        second_path = folder / "B Proposed Plan.pdf"
+        first_path.touch()
+        second_path.touch()
+        documents = {
+            first_path.name: _fake_pdf(
+                first_path,
+                "PROPOSED PLAN\nDRAWING NUMBER P01\nSCALE 1:100\n"
+                "ARCHITECT\nAlpha Architects Ltd\n"
+                "020 7123 4567\nalpha@example.com\n"
+                "ARCHITECT\nBeta Architects Ltd\n"
+                "2 Beta Road\nLondon\nSW1A 1AA",
+                application_form=False,
+            ),
+            second_path.name: _fake_pdf(
+                second_path,
+                "PROPOSED PLAN\nDRAWING NUMBER P02\nSCALE 1:100\n"
+                "ARCHITECT\nGamma Architects Ltd\n"
+                "020 7987 6543\ngamma@example.com\n"
+                "3 Gamma Road\nLondon\nEC1A 1BB",
+                application_form=False,
+            ),
+        }
+
+        with (
+            patch.object(
+                enrichment,
+                "extract_pdf_first_page_text",
+                side_effect=lambda path: documents[path.name],
+            ) as first_page_reader,
+            patch.object(
+                enrichment,
+                "extract_pdf_text",
+                side_effect=lambda path, **_kwargs: documents[path.name],
+            ),
+        ):
+            enrichment.enrich_application_folder(folder)
+
+    assert first_page_reader.call_count == 2
+
+
 def test_decimal_coordinates_are_not_phone_numbers() -> None:
     assert enrichment._normalise_phone("064646.00001") == ""
     assert enrichment._normalise_phone("0.0306 0.557 0") == ""
@@ -801,7 +1024,19 @@ def test_common_fax_labels_are_not_added_as_phone_numbers(fax_line: str) -> None
 
 @pytest.mark.parametrize(
     "label",
-    ["F", "Fax", "Fax No:", "Facsimile", "Drawing No:", "Job No:", "Project No:"],
+    [
+        "F",
+        "Fax",
+        "Fax No:",
+        "Facsimile",
+        "Facsimile No.",
+        "Drawing No:",
+        "Drawing No.",
+        "Job No:",
+        "Job No.",
+        "Project No:",
+        "Project No.",
+    ],
 )
 def test_noncontact_number_label_on_preceding_line_is_rejected(label: str) -> None:
     accumulator = enrichment._Accumulator(enrichment._Exclusions())
@@ -951,6 +1186,23 @@ def test_one_character_ocr_email_variants_are_deduplicated_per_domain() -> None:
     assert accumulator.result.email_addresses == ["michael@neoarchitects.co.uk"]
 
 
+def test_reversed_ocr_email_variant_keeps_likely_correct_address() -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+
+    accumulator.add_email("nichael@neoarchitects.co.uk")
+    accumulator.add_email("michael@neoarchitects.co.uk")
+
+    assert accumulator.result.email_addresses == ["michael@neoarchitects.co.uk"]
+
+
+def test_single_common_ocr_email_variant_is_corrected() -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+
+    accumulator.add_email("nichael@neoarchitects.co.uk")
+
+    assert accumulator.result.email_addresses == ["michael@neoarchitects.co.uk"]
+
+
 @pytest.mark.parametrize(
     "values",
     [
@@ -990,6 +1242,18 @@ def test_legitimate_leading_letter_same_domain_emails_remain_distinct() -> None:
     assert accumulator.result.email_addresses == [
         "smith@example.com",
         "lsmith@example.com",
+    ]
+
+
+def test_short_legitimate_first_letter_emails_remain_distinct() -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+
+    accumulator.add_email("ian@example.com")
+    accumulator.add_email("lan@example.com")
+
+    assert accumulator.result.email_addresses == [
+        "ian@example.com",
+        "lan@example.com",
     ]
 
 
@@ -1050,6 +1314,215 @@ def test_mixed_consultant_drawing_returns_only_architect_contact() -> None:
     }
 
 
+def test_compact_consultant_blocks_do_not_share_architect_context() -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+
+    enrichment.extract_professional_details(
+        "ARCHITECT\nStudio Arc Architects Ltd\n"
+        "020 7123 4567\nhello@studioarc.co.uk\n"
+        "12 Design Road\nLondon\nEC1A 1BB\n"
+        "STRUCTURAL ENGINEER\nFrame Engineers Ltd\n"
+        "020 7000 0001\nframe@example.com\n"
+        "10 Structure Road\nLondon\nSW1A 1AA",
+        "Proposed General Arrangement Plan.pdf",
+        accumulator,
+    )
+
+    assert accumulator.result.to_csv_row() == {
+        "Architect / Company Name": "Studio Arc Architects Ltd",
+        "Phone Number": "020 7123 4567",
+        "Email Address": "hello@studioarc.co.uk",
+        "Company Address": "12 Design Road, London, EC1A 1BB",
+    }
+
+
+def test_drawing_instruction_does_not_start_an_architect_contact_block() -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+
+    enrichment.extract_professional_details(
+        "STRUCTURAL ENGINEER\nFrame Engineers Ltd\n"
+        "REPORT ANY DISCREPANCIES TO ARCHITECT\n"
+        "020 7000 0001\nframe@example.com\n"
+        "10 Structure Road\nLondon\nSW1A 1AA",
+        "Proposed Structural Plan.pdf",
+        accumulator,
+    )
+
+    assert accumulator.result.to_csv_row() == {
+        "Architect / Company Name": "Failed",
+        "Phone Number": "Failed",
+        "Email Address": "Failed",
+        "Company Address": "Failed",
+    }
+
+
+@pytest.mark.parametrize(
+    "heading",
+    [
+        "ACOUSTICS",
+        "CDM",
+        "DESIGN",
+        "FIRE CONSULTANT",
+        "INTERIOR DESIGN",
+        "MEP CONSULTANT",
+        "QUANTITY SURVEYING",
+        "SUSTAINABILITY",
+    ],
+)
+def test_other_discipline_heading_ends_architect_context(heading: str) -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+
+    enrichment.extract_professional_details(
+        "ARCHITECT\nStudio Arc Architects Ltd\n020 7123 4567\n"
+        f"{heading}\nquiet@example.com\n"
+        "10 Acoustic Road\nLondon\nSW1A 1AA",
+        "Proposed General Arrangement Plan.pdf",
+        accumulator,
+    )
+
+    assert accumulator.result.to_csv_row() == {
+        "Architect / Company Name": "Studio Arc Architects Ltd",
+        "Phone Number": "020 7123 4567",
+        "Email Address": "Failed",
+        "Company Address": "Failed",
+    }
+
+
+def test_generic_design_consultant_is_not_treated_as_an_architect() -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+
+    enrichment.extract_professional_details(
+        "DESIGN\nRidge and Partners LLP\n020 7000 0001\n"
+        "design@example.com\n10 Design Road\nLondon\nSW1A 1AA",
+        "Proposed General Arrangement Plan.pdf",
+        accumulator,
+    )
+
+    assert accumulator.result.to_csv_row() == {
+        "Architect / Company Name": "Failed",
+        "Phone Number": "Failed",
+        "Email Address": "Failed",
+        "Company Address": "Failed",
+    }
+
+
+@pytest.mark.parametrize(
+    ("role_heading", "company_name"),
+    [
+        ("ARCHITECT", "Design Architects Ltd"),
+        ("ARCHITECT", "Design Practice Ltd"),
+        ("ARCHITECT", "Design Studio Ltd"),
+        ("DESIGN ARCHITECT", "Penchard Ltd"),
+    ],
+)
+def test_explicit_architect_wording_overrides_generic_design_boundary(
+    role_heading: str,
+    company_name: str,
+) -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+
+    enrichment.extract_professional_details(
+        f"{role_heading}\n{company_name}\n020 7123 4567\n"
+        "studio@example.com\n12 Design Road\nLondon\nEC1A 1BB",
+        "Proposed General Arrangement Plan.pdf",
+        accumulator,
+    )
+
+    assert accumulator.result.to_csv_row() == {
+        "Architect / Company Name": company_name,
+        "Phone Number": "020 7123 4567",
+        "Email Address": "studio@example.com",
+        "Company Address": "12 Design Road, London, EC1A 1BB",
+    }
+
+
+@pytest.mark.parametrize(
+    "instruction",
+    [
+        "ALL DISCREPANCIES MUST BE REPORTED TO THE ARCHITECT",
+        "REPORT DISCREPANCIES TO THE ARCHITECTS",
+    ],
+)
+def test_drawing_instruction_variants_do_not_start_architect_context(
+    instruction: str,
+) -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+
+    enrichment.extract_professional_details(
+        "STRUCTURAL ENGINEER\nFrame Engineers Ltd\n"
+        f"{instruction}\n020 7000 0001\nframe@example.com\n"
+        "10 Structure Road\nLondon\nSW1A 1AA",
+        "Proposed Structural Plan.pdf",
+        accumulator,
+    )
+
+    assert accumulator.result.to_csv_row() == {
+        "Architect / Company Name": "Failed",
+        "Phone Number": "Failed",
+        "Email Address": "Failed",
+        "Company Address": "Failed",
+    }
+
+
+def test_credential_heading_is_not_a_company_name() -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+
+    enrichment.extract_professional_details(
+        "RIBA Chartered Practice\n020 7123 4567",
+        "Proposed Site Plan.pdf",
+        accumulator,
+    )
+
+    assert accumulator.result.architect_company_names == []
+
+
+def test_role_context_is_classified_once_per_text_line() -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+    text = (
+        "CLIENT\n"
+        + "\n".join(f"Client note {index}" for index in range(20))
+        + "\nARCHITECT\nStudio Arc Architects Ltd\n"
+        "020 7123 4567\nhello@studioarc.co.uk\n"
+        "12 Design Road\nLondon\nEC1A 1BB"
+    )
+
+    with patch.object(
+        enrichment,
+        "_role_for_line",
+        wraps=enrichment._role_for_line,
+    ) as role_parser:
+        enrichment.extract_professional_details(
+            text,
+            "Proposed General Arrangement Plan.pdf",
+            accumulator,
+        )
+
+    assert role_parser.call_count == len(enrichment._text_lines(text))
+
+
+def test_client_context_persists_until_architect_role_transition() -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+
+    enrichment.extract_professional_details(
+        "CLIENT\n"
+        + "\n".join(f"Client note {index}" for index in range(6))
+        + "\nAtlas HIVE Weston Ltd\n020 7000 0001\nclient@example.com\n"
+        "1 Client Road\nLondon\nSW1A 1AA\n"
+        "ARCHITECT\nStudio Arc Architects Ltd\n"
+        "020 7123 4567\nhello@studioarc.co.uk\n"
+        "12 Design Road\nLondon\nEC1A 1BB",
+        "Proposed General Arrangement Plan.pdf",
+        accumulator,
+    )
+
+    assert accumulator.result.to_csv_row() == {
+        "Architect / Company Name": "Studio Arc Architects Ltd",
+        "Phone Number": "020 7123 4567",
+        "Email Address": "hello@studioarc.co.uk",
+        "Company Address": "12 Design Road, London, EC1A 1BB",
+    }
+
+
 def test_design_label_starts_a_professional_block_after_client_context() -> None:
     accumulator = enrichment._Accumulator(enrichment._Exclusions())
     enrichment.extract_professional_details(
@@ -1081,6 +1554,18 @@ def test_abbreviated_site_address_is_rejected() -> None:
     accumulator.add_address(
         "WSM RFC, Sunnyside Road, Weston-super-Mare, BS23 3PA"
     )
+
+    assert accumulator.result.company_addresses == []
+
+
+def test_strongly_abbreviated_site_address_is_rejected() -> None:
+    exclusions = enrichment._Exclusions()
+    exclusions.add_address(
+        "Land At Weston Rugby Club Sunnyside Road North Weston-super-Mare"
+    )
+    accumulator = enrichment._Accumulator(exclusions)
+
+    accumulator.add_address("WSM RFC, Sunnyside Rd, WSM, BS23 3PA")
 
     assert accumulator.result.company_addresses == []
 
@@ -1267,6 +1752,61 @@ def test_drawing_report_instruction_does_not_trigger_narrative_rejection() -> No
 
 
 @pytest.mark.parametrize(
+    "instruction",
+    [
+        "REPORT ANY DISCREPANCIES TO ARCHITECT",
+        "Report discrepancies to architect",
+    ],
+)
+def test_short_report_instruction_does_not_trigger_narrative_rejection(
+    instruction: str,
+) -> None:
+    text = "\n".join(
+        [
+            "PROPOSED SITE PLAN",
+            "DRAWING NUMBER P-101",
+            "SCALE 1:100",
+            instruction,
+        ]
+    )
+
+    assert classify_drawing_source("Proposed Site Plan.pdf", text).eligible is True
+
+
+def test_architect_discrepancy_report_title_is_rejected() -> None:
+    text = "\n".join(
+        [
+            "ARCHITECT DISCREPANCY REPORT",
+            "PROPOSED SITE PLAN",
+            "DRAWING NUMBER P-101",
+            "SCALE 1:100",
+        ]
+    )
+
+    assert classify_drawing_source("Proposed Site Plan.pdf", text).eligible is False
+
+
+@pytest.mark.parametrize(
+    "heading",
+    [
+        "REPORT ON ARCHITECT DISCREPANCIES",
+        "REPORT: ARCHITECT DISCREPANCY",
+    ],
+)
+def test_report_leading_discrepancy_titles_are_rejected(heading: str) -> None:
+    text = "\n".join(
+        [
+            heading,
+            "PROPOSED SITE PLAN",
+            "DRAWING NUMBER P-101",
+            "SCALE 1:100",
+        ]
+    )
+
+    assert classify_drawing_source("Proposed Site Plan.pdf", text).eligible is False
+
+
+@pytest.mark.parametrize(
     "heading",
     [
         "ANNUAL REPORT 2026",
@@ -1365,6 +1905,8 @@ def test_live_narrative_filename_families_are_rejected_before_reading(
         "Brochure-123.pdf",
         "Meeting-2026.pdf",
         "Budget-2026.pdf",
+        "Meeting2-2026.pdf",
+        "Budget2-2026.pdf",
     ],
 )
 def test_arbitrary_numbered_documents_are_not_drawing_code_candidates(
@@ -1686,6 +2228,41 @@ def test_scanned_application_form_uses_bounded_ocr_for_exclusions() -> None:
         page.extract_text.assert_called_once_with()
     for page in pages[enrichment.APPLICATION_FORM_EXCLUSION_PAGE_LIMIT:]:
         page.extract_text.assert_not_called()
+
+
+def test_ocr_discovered_application_form_reuses_page_cache() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        folder = Path(directory)
+        path = folder / "A-101.pdf"
+        path.touch()
+        pages = []
+        for _index in range(enrichment.APPLICATION_FORM_EXCLUSION_PAGE_LIMIT):
+            page = Mock()
+            page.extract_text.return_value = ""
+            pages.append(page)
+        reader = Mock()
+        reader.is_encrypted = False
+        reader.pages = pages
+
+        def ocr_result(_path: Path, page_indexes: list[int]) -> dict[int, str]:
+            return {0: APPLICATION_FORM_TEXT} if page_indexes == [0] else {}
+
+        with (
+            patch.object(enrichment, "PdfReader", return_value=reader) as pdf_reader,
+            patch.object(
+                enrichment,
+                "_ocr_pdf_pages",
+                side_effect=ocr_result,
+            ) as ocr_pdf_pages,
+        ):
+            result = enrichment.enrich_application_folder(folder)
+
+    pdf_reader.assert_called_once_with(path, strict=False)
+    assert [call.args[1] for call in ocr_pdf_pages.call_args_list] == [
+        [0],
+        [1, 2, 3],
+    ]
+    assert result.rejected_documents == {"A-101.pdf": "application form"}
 
 
 def test_reader_close_error_does_not_escape_or_leave_reader_owned() -> None:

@@ -54,24 +54,6 @@ DRAWING_EVIDENCE_PATTERNS = (
     re.compile(r"(?i)\bdrawn\s+by\b"),
     re.compile(r"(?i)\bchecked\s+by\b"),
 )
-DRAWING_CODE_RE = re.compile(
-    r"(?ix)"
-    r"^(?=.{3,48}$)"
-    r"(?=.*[a-z])"
-    r"(?=.*\d)"
-    r"(?=.*[-_.][a-z0-9]*\d[a-z0-9]*$)"
-    r"(?!.*(?:^|[-_.])(?:document|report|statement)(?:[-_.]|$))"
-    r"(?:"
-    r"(?:[a-z]{1,3}|[0-9]{1,8}|"
-    r"(?=[a-z0-9]{2,8}[-_.])(?=[a-z0-9]*[a-z])(?=[a-z0-9]*\d)"
-    r"[a-z0-9]{2,8})(?:[-_.][a-z0-9]{1,8}){1,3}"
-    r"|"
-    r"(?:[a-z]{1,3}|[0-9]{1,8}|"
-    r"(?=[a-z0-9]{2,8}[-_.])(?=[a-z0-9]*[a-z])(?=[a-z0-9]*\d)"
-    r"[a-z0-9]{2,8})(?:[-_.][a-z0-9]{1,8}){3,9}"
-    r"[-_.](?=[a-z0-9]*[a-z])(?=[a-z0-9]*\d)[a-z0-9]{2,8}"
-    r")$"
-)
 TITLE_PAGE_START_LINE_LIMIT = 30
 TITLE_PAGE_END_LINE_LIMIT = 80
 TITLE_HEADING_LINE_LIMIT = 12
@@ -122,6 +104,8 @@ def _title_page_lines(text: str) -> list[str]:
 def _has_title_narrative_marker(text: str) -> bool:
     for line in text.splitlines():
         normalized_line = _phrase_text(line)
+        if _is_discrepancy_instruction(normalized_line):
+            continue
         line_words = normalized_line.split()
         compact_line = normalized_line.replace(" ", "")
         for phrase in TITLE_NARRATIVE_PHRASES:
@@ -144,13 +128,66 @@ def _has_title_narrative_marker(text: str) -> bool:
     return False
 
 
+def _is_discrepancy_instruction(value: str) -> bool:
+    normalized = _phrase_text(value)
+    return bool(
+        re.search(
+            r"^report (?:any |all )?discrepanc(?:y|ies)\b"
+            r".*\b(?:to|with) (?:the )?architects?\b",
+            normalized,
+        )
+        or re.search(
+            r"\bdiscrepanc(?:y|ies)\b.*"
+            r"\b(?:must|shall|should|are to) be reported\b.*"
+            r"\barchitects?\b",
+            normalized,
+        )
+    )
+
+
+def _is_drawing_code(value: str) -> bool:
+    value = value.casefold().strip()
+    if not 3 <= len(value) <= 48:
+        return False
+    parts = re.split(r"[-_.]", value)
+    separator_count = len(parts) - 1
+    if not 1 <= separator_count <= 9:
+        return False
+    if any(not re.fullmatch(r"[a-z0-9]{1,8}", part) for part in parts):
+        return False
+    if not any(character.isalpha() for character in value):
+        return False
+    if not any(character.isdigit() for character in value):
+        return False
+    if not any(character.isdigit() for character in parts[-1]):
+        return False
+    if {"document", "report", "statement"} & set(parts):
+        return False
+
+    first = parts[0]
+    simple_prefix = (
+        (first.isalpha() and len(first) <= 3)
+        or (first.isdigit() and len(first) <= 8)
+    )
+    mixed_prefix = (
+        len(first) >= 2
+        and any(character.isalpha() for character in first)
+        and any(character.isdigit() for character in first)
+    )
+    if separator_count <= 3:
+        return simple_prefix or (mixed_prefix and separator_count >= 2)
+    final_is_mixed = (
+        any(character.isalpha() for character in parts[-1])
+        and any(character.isdigit() for character in parts[-1])
+    )
+    return (simple_prefix or mixed_prefix) and final_is_mixed
+
+
 def _has_ambiguous_drawing_evidence(filename: str, title_lines: list[str]) -> bool:
     filename_tokens = _tokens(Path(filename).stem)
     filename_has_status = bool(filename_tokens & STATUS_TOKENS)
     filename_has_drawing_type = bool(filename_tokens & DRAWING_TOKENS)
-    filename_has_drawing_code = bool(
-        DRAWING_CODE_RE.fullmatch(Path(filename).stem.strip())
-    )
+    filename_has_drawing_code = _is_drawing_code(Path(filename).stem)
     if not (
         filename_has_status
         or filename_has_drawing_type
@@ -187,7 +224,7 @@ def preclassify_drawing_source(filename: str) -> DrawingSourceDecision:
     has_drawing_type = bool(tokens & DRAWING_TOKENS)
     if has_status and has_drawing_type:
         return DrawingSourceDecision(True, False, "drawing status and type in title")
-    if has_status or has_drawing_type or DRAWING_CODE_RE.fullmatch(name.strip()):
+    if has_status or has_drawing_type or _is_drawing_code(name):
         return DrawingSourceDecision(False, True, "PDF title-block confirmation required")
     return DrawingSourceDecision(False, False, "not a proposed or existing drawing")
 

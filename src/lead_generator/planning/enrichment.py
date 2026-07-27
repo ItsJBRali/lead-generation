@@ -86,6 +86,39 @@ AUTHOR_ROLE_MARKERS = (
     "designer",
     "design",
 )
+NON_ARCHITECT_ROLE_MARKERS = (
+    "acoustics",
+    "acoustic consultant",
+    "arboricultural consultant",
+    "building services engineer",
+    "cdm",
+    "civil engineer",
+    "cost consultant",
+    "design and build",
+    "design consultant",
+    "design consultancy",
+    "ecologist",
+    "electrical engineer",
+    "engineer",
+    "fire consultant",
+    "fire engineer",
+    "interior design",
+    "interior designer",
+    "landscape consultant",
+    "m&e consultant",
+    "mechanical engineer",
+    "mep consultant",
+    "planning consultant",
+    "principal designer",
+    "project manager",
+    "quantity surveying",
+    "quantity surveyor",
+    "structural engineer",
+    "sustainability",
+    "sustainability consultant",
+    "surveyor",
+    "transport consultant",
+)
 NAME_NOISE_MARKERS = (
     "copyright",
     "all rights reserved",
@@ -144,6 +177,11 @@ BLOCKED_EMAIL_DOMAINS = (
 OCR_PREFIX_DEDUPE_LOCAL_PARTS = frozenset(
     {"admin", "contact", "hello", "home", "info", "mail", "office", "studio"}
 )
+ADDRESS_TOKEN_EXPANSIONS = {
+    "rd": {"road"},
+    "rfc": {"rugby", "club"},
+    "wsm": {"weston", "super", "mare"},
+}
 FREE_EMAIL_DOMAINS = {
     "aol.com",
     "gmail.com",
@@ -168,10 +206,14 @@ GENERIC_COMPANY_HEADINGS = {
     "architecture",
     "architectural",
     "design and access statement",
+    "design architect",
+    "design architects",
     "planning application",
     "planning statement",
     "proposed design",
     "architectural design",
+    "chartered practice",
+    "riba chartered practice",
     "planning portal",
     "local planning authority",
 }
@@ -249,6 +291,8 @@ class _Party:
     person_name: str = ""
     company_name: str = ""
     address: str = ""
+    phone: str = ""
+    email: str = ""
 
     @property
     def display_name(self) -> str:
@@ -283,6 +327,8 @@ class _PdfReadCache:
 class _Exclusions:
     parties: list[str] = field(default_factory=list)
     addresses: list[str] = field(default_factory=list)
+    phones: list[str] = field(default_factory=list)
+    emails: list[str] = field(default_factory=list)
 
     def add_party(self, value: str | None) -> None:
         value = _clean_candidate(value)
@@ -293,6 +339,18 @@ class _Exclusions:
         value = _clean_candidate(value)
         if value:
             _append_unique(self.addresses, value)
+
+    def add_phone(self, value: str | None) -> None:
+        value = _normalise_phone(value or "")
+        if value:
+            digits = re.sub(r"\D", "", value)
+            if digits not in self.phones:
+                self.phones.append(digits)
+
+    def add_email(self, value: str | None) -> None:
+        value = (value or "").strip(" <>.,;:").casefold()
+        if value and value not in self.emails:
+            self.emails.append(value)
 
     def matches_party(self, value: str) -> bool:
         return any(_same_value(value, excluded) for excluded in self.parties)
@@ -305,6 +363,12 @@ class _Exclusions:
             or _similar_site_address(value, excluded)
             for excluded in self.addresses
         )
+
+    def matches_phone(self, value: str) -> bool:
+        return re.sub(r"\D", "", value) in self.phones
+
+    def matches_email(self, value: str) -> bool:
+        return value.casefold() in self.emails
 
 
 class _Accumulator:
@@ -341,7 +405,7 @@ class _Accumulator:
 
     def add_phone(self, value: str | None) -> None:
         value = _normalise_phone(value or "")
-        if value and not any(
+        if value and not self.exclusions.matches_phone(value) and not any(
             re.sub(r"\D", "", value) == re.sub(r"\D", "", existing)
             for existing in self.result.phone_numbers
         ):
@@ -352,11 +416,12 @@ class _Accumulator:
         value = (value or "").strip(" <>.,;:").casefold()
         if value.startswith("email-"):
             value = value.removeprefix("email-")
-        if value and not _blocked_email(value):
+        value = _correct_common_ocr_email(value)
+        if value and not self.exclusions.matches_email(value) and not _blocked_email(value):
             for index, existing in enumerate(self.result.email_addresses):
                 if not _similar_ocr_email(value, existing):
                     continue
-                if _prefer_shorter_ocr_email(value, existing):
+                if _prefer_ocr_email(value, existing):
                     self.result.email_addresses[index] = value
                     self._record_source("Email Address")
                 return
@@ -388,10 +453,24 @@ class _Accumulator:
             for value in self.result.company_addresses
             if not self.exclusions.matches_address(value)
         ]
+        self.result.phone_numbers = [
+            value
+            for value in self.result.phone_numbers
+            if not self.exclusions.matches_phone(value)
+        ]
+        self.result.email_addresses = [
+            value
+            for value in self.result.email_addresses
+            if not self.exclusions.matches_email(value)
+        ]
         if not self.result.architect_company_names:
             self.result.field_sources.pop("Architect / Company Name", None)
         if not self.result.company_addresses:
             self.result.field_sources.pop("Company Address", None)
+        if not self.result.phone_numbers:
+            self.result.field_sources.pop("Phone Number", None)
+        if not self.result.email_addresses:
+            self.result.field_sources.pop("Email Address", None)
 
 
 def empty_enrichment_row(*, requested: bool) -> dict[str, str]:
@@ -442,6 +521,7 @@ def enrich_application_folder(
                     exclusions,
                     accumulator,
                     log,
+                    existing_document=first_page,
                 )
                 accumulator.result.rejected_documents[path.name] = "application form"
                 continue
@@ -457,6 +537,13 @@ def enrich_application_folder(
                 if first_page.ocr_pages and log:
                     log(f"OCR read the first page of {path.name}")
                 if first_page.application_form:
+                    _add_application_form_path_exclusions(
+                        path,
+                        exclusions,
+                        accumulator,
+                        log,
+                        existing_document=first_page,
+                    )
                     accumulator.result.rejected_documents[path.name] = "application form"
                     continue
                 decision = classify_drawing_source(path.name, first_page.text)
@@ -470,6 +557,13 @@ def enrich_application_folder(
             if document.ocr_pages and log:
                 log(f"OCR read {document.ocr_pages} page(s) from {path.name}")
             if document.application_form:
+                _add_application_form_path_exclusions(
+                    path,
+                    exclusions,
+                    accumulator,
+                    log,
+                    existing_document=document,
+                )
                 accumulator.result.rejected_documents[path.name] = "application form"
                 continue
 
@@ -485,16 +579,28 @@ def enrich_application_folder(
             if not _meaningful_text(document.text):
                 accumulator.result.unreadable_documents.append(path.name)
                 continue
-            accumulator.source_document = path.name
+            document_accumulator = _Accumulator(exclusions)
+            document_accumulator.source_document = path.name
             try:
-                extract_professional_details(document.text, path.name, accumulator)
+                extract_professional_details(
+                    document.text,
+                    path.name,
+                    document_accumulator,
+                )
             finally:
-                accumulator.source_document = None
-            if all(
-                path.name in accumulator.result.field_sources.get(field_name, ())
-                for field_name in ENRICHMENT_CSV_FIELDS
-            ):
+                document_accumulator.source_document = None
+            if _has_complete_single_architect_contact(document_accumulator.result):
+                _replace_with_complete_document(
+                    accumulator,
+                    document_accumulator.result,
+                    path.name,
+                )
                 break
+            _merge_document_enrichment(
+                accumulator,
+                document_accumulator.result,
+                path.name,
+            )
         except Exception as exc:  # pragma: no cover - malformed live documents vary widely
             accumulator.result.rejected_documents[path.name] = f"read failed: {exc}"
             if log:
@@ -503,6 +609,55 @@ def enrich_application_folder(
             _close_pdf_cache(first_page)
 
     return accumulator.result
+
+
+def _merge_document_enrichment(
+    accumulator: _Accumulator,
+    document: ContactEnrichment,
+    source_document: str,
+) -> None:
+    accumulator.source_document = source_document
+    try:
+        for value in document.architect_company_names:
+            accumulator.add_name(value)
+        for value in document.phone_numbers:
+            accumulator.add_phone(value)
+        for value in document.email_addresses:
+            accumulator.add_email(value)
+        for value in document.company_addresses:
+            accumulator.add_address(value)
+    finally:
+        accumulator.source_document = None
+
+
+def _replace_with_complete_document(
+    accumulator: _Accumulator,
+    document: ContactEnrichment,
+    source_document: str,
+) -> None:
+    result = accumulator.result
+    result.architect_company_names = list(document.architect_company_names)
+    result.phone_numbers = list(document.phone_numbers)
+    result.email_addresses = list(document.email_addresses)
+    result.company_addresses = list(document.company_addresses)
+    result.field_sources = {
+        field_name: [source_document]
+        for field_name in ENRICHMENT_CSV_FIELDS
+    }
+
+
+def _has_complete_single_architect_contact(document: ContactEnrichment) -> bool:
+    names = document.architect_company_names
+    coherent_names = len(names) == 1 or (
+        len(names) == 2
+        and sum(_looks_like_company(name) for name in names) == 1
+    )
+    return (
+        coherent_names
+        and bool(document.phone_numbers)
+        and bool(document.email_addresses)
+        and bool(document.company_addresses)
+    )
 
 
 def extract_pdf_first_page_text(path: Path) -> _PdfText:
@@ -515,8 +670,16 @@ def extract_pdf_first_page_text(path: Path) -> _PdfText:
         raise
 
 
-def extract_pdf_application_form_text(path: Path) -> _PdfText:
-    cache = _open_pdf_cache(path)
+def extract_pdf_application_form_text(
+    path: Path,
+    *,
+    first_page: _PdfText | None = None,
+) -> _PdfText:
+    cache = (
+        first_page.cache
+        if first_page and first_page.cache
+        else _open_pdf_cache(path)
+    )
     page_indexes = list(
         range(min(cache.page_count, APPLICATION_FORM_EXCLUSION_PAGE_LIMIT))
     )
@@ -713,14 +876,19 @@ def extract_professional_details(text: str, filename: str, accumulator: _Accumul
     lines = _text_lines(text)
     if not lines:
         return
+    role_contexts = _role_contexts(lines)
 
     for index, line in enumerate(lines):
         has_contact_evidence = _title_block_contact_evidence(lines, index)
-        architect_context = _architect_context(lines, index)
-        excluded_context = _client_context(lines, index) or _authority_context(lines, index)
+        role_context = role_contexts[index]
+        architect_context = role_context == "architect"
+        excluded_context = (
+            role_context == "client"
+            or _authority_context(lines, index)
+        )
         if PROFESSIONAL_CREDENTIAL_RE.search(line):
             credentialled_name = _name_before_credentials(lines, index)
-            if credentialled_name and not excluded_context:
+            if credentialled_name and architect_context and not excluded_context:
                 accumulator.add_name(credentialled_name)
         labelled = PROFESSIONAL_LABEL_RE.match(line)
         if (
@@ -741,7 +909,7 @@ def extract_professional_details(text: str, filename: str, accumulator: _Accumul
         for email in EMAIL_RE.findall(line):
             if has_contact_evidence and architect_context and not excluded_context:
                 accumulator.add_email(email)
-                company = _nearest_company(lines, index)
+                company = _nearest_company(lines, index, role_contexts)
                 if company:
                     accumulator.add_name(company)
 
@@ -757,7 +925,7 @@ def extract_professional_details(text: str, filename: str, accumulator: _Accumul
                 )
             ):
                 accumulator.add_phone(phone_match.group(0))
-                company = _nearest_company(lines, index)
+                company = _nearest_company(lines, index, role_contexts)
                 if company:
                     accumulator.add_name(company)
 
@@ -794,16 +962,23 @@ def _add_application_form_path_exclusions(
     exclusions: _Exclusions,
     accumulator: _Accumulator,
     log: Callable[[str], None] | None,
+    *,
+    existing_document: _PdfText | None = None,
 ) -> None:
     document: _PdfText | None = None
     try:
-        document = extract_pdf_application_form_text(path)
+        document = extract_pdf_application_form_text(
+            path,
+            first_page=existing_document,
+        )
         applicant, _agent = extract_application_form_parties(document.text)
         if not applicant:
             return
         exclusions.add_party(applicant.person_name)
         exclusions.add_party(applicant.company_name)
         exclusions.add_address(applicant.address)
+        exclusions.add_phone(applicant.phone)
+        exclusions.add_email(applicant.email)
         accumulator.discard_excluded_values()
     except Exception as exc:
         if log:
@@ -834,14 +1009,22 @@ def _noncontact_number_context(
     labels = [lines[index][:phone_start]]
     if index:
         labels.append(lines[index - 1])
-    return any(
-        re.fullmatch(
-            r"(?i)\s*(?:f|fax(?:\s+(?:no|number))?|facsimile|"
-            r"(?:drawing|job|project)\s+(?:no|number))\s*:?\s*",
-            label,
-        )
-        for label in labels
-    )
+    blocked_labels = {
+        "f",
+        "fax",
+        "fax no",
+        "fax number",
+        "facsimile",
+        "facsimile no",
+        "facsimile number",
+        "drawing no",
+        "drawing number",
+        "job no",
+        "job number",
+        "project no",
+        "project number",
+    }
+    return any(_normalise_label(label) in blocked_labels for label in labels)
 
 
 def _parse_form_party(lines: list[str]) -> _Party:
@@ -867,6 +1050,10 @@ def _parse_form_party(lines: list[str]) -> _Party:
         person_name=_clean_candidate(person_name),
         company_name=_clean_candidate(company_name),
         address=_clean_candidate(address),
+        phone=_clean_candidate(
+            _form_field(lines, "primary number", "telephone", "phone")
+        ),
+        email=_clean_candidate(_form_field(lines, "email address", "email")),
     )
 
 
@@ -900,26 +1087,6 @@ def _form_field(lines: list[str], *aliases: str) -> str:
     return ""
 
 
-def _client_context(lines: list[str], index: int) -> bool:
-    window, start = _contact_window(lines, index)
-    role_labels: list[tuple[int, bool]] = []
-    for offset, line in enumerate(window[: index - start + 1]):
-        folded = line.casefold().strip()
-        if _is_role_label(folded, CLIENT_ROLE_MARKERS):
-            role_labels.append((start + offset, True))
-        elif _is_role_label(folded, AUTHOR_ROLE_MARKERS):
-            role_labels.append((start + offset, False))
-    if role_labels:
-        return role_labels[-1][1]
-
-    window_text = " ".join(window).casefold()
-    if "consultant" in window_text and any(
-        marker in window_text for marker in ("project", "key notes", "keynote")
-    ):
-        return not any(marker in window_text for marker in AUTHOR_ROLE_MARKERS)
-    return False
-
-
 def _contact_window(lines: list[str], index: int) -> tuple[list[str], int]:
     start = max(0, index - 4)
     return lines[start:min(len(lines), index + 5)], start
@@ -938,10 +1105,48 @@ def _has_professional_contact_evidence(lines: list[str], index: int) -> bool:
     return has_role or (has_company and has_contact)
 
 
-def _architect_context(lines: list[str], index: int) -> bool:
-    window = lines[max(0, index - 6):min(len(lines), index + 7)]
-    text = f" {' '.join(window).casefold()} "
-    return any(marker in text for marker in PROFESSIONAL_ROLE_MARKERS)
+def _role_contexts(lines: list[str]) -> list[str | None]:
+    contexts: list[str | None] = []
+    current_role: str | None = None
+    for line in lines:
+        role = _role_for_line(line)
+        if role:
+            current_role = role
+        contexts.append(current_role)
+    return contexts
+
+
+def _role_for_line(line: str) -> str | None:
+    normalized = _normalise_label(line)
+    if _is_discrepancy_instruction(normalized):
+        return None
+    if _is_role_label(normalized, CLIENT_ROLE_MARKERS):
+        return "client"
+    if _is_role_label(
+        normalized,
+        ("landscape architect", "project architect", "architect", "architecture"),
+    ):
+        return "architect"
+    if normalized in {"design architect", "design architects"}:
+        return "architect"
+    if (
+        re.search(r"(?i)\barchitect(?:s|ure|ural)?\b", line)
+        and _looks_like_company(line)
+    ):
+        return "architect"
+    if normalized in {"design", "designer"}:
+        return "other"
+    if _is_role_label(normalized, NON_ARCHITECT_ROLE_MARKERS):
+        return "other"
+    if re.search(
+        r"(?i)\b(?:engineers?|surveyors?|ecologists?|"
+        r"planning consultants?|transport consultants?)\b",
+        line,
+    ):
+        return "other"
+    if PROFESSIONAL_CREDENTIAL_RE.search(line):
+        return "architect"
+    return None
 
 
 def _title_block_contact_evidence(lines: list[str], index: int) -> bool:
@@ -975,15 +1180,35 @@ def _is_role_label(value: str, markers: tuple[str, ...]) -> bool:
     )
 
 
-def _nearest_company(lines: list[str], index: int) -> str:
+def _is_discrepancy_instruction(value: str) -> bool:
+    normalized = _normalise_label(value)
+    return bool(
+        re.search(
+            r"^report (?:any |all )?discrepanc(?:y|ies)\b"
+            r".*\b(?:to|with) (?:the )?architects?\b",
+            normalized,
+        )
+        or re.search(
+            r"\bdiscrepanc(?:y|ies)\b.*"
+            r"\b(?:must|shall|should|are to) be reported\b.*"
+            r"\barchitects?\b",
+            normalized,
+        )
+    )
+
+
+def _nearest_company(
+    lines: list[str],
+    index: int,
+    role_contexts: list[str | None],
+) -> str:
     candidates: list[tuple[int, str]] = []
     for candidate_index in range(max(0, index - 6), min(len(lines), index + 7)):
         candidate = lines[candidate_index]
         if (
             _looks_like_company(candidate)
             and _has_professional_contact_evidence(lines, candidate_index)
-            and _architect_context(lines, candidate_index)
-            and not _client_context(lines, candidate_index)
+            and role_contexts[candidate_index] == "architect"
             and not _authority_context(lines, candidate_index)
         ):
             candidates.append((abs(candidate_index - index), candidate))
@@ -1085,7 +1310,11 @@ def _valid_labelled_name(value: str) -> bool:
 
 def _is_name_noise(value: str) -> bool:
     folded = _clean_candidate(value).casefold()
-    if not folded or any(marker in folded for marker in NAME_NOISE_MARKERS):
+    if (
+        not folded
+        or _is_discrepancy_instruction(folded)
+        or any(marker in folded for marker in NAME_NOISE_MARKERS)
+    ):
         return True
     if len(re.sub(r"[^a-z0-9]", "", folded)) <= 2:
         return True
@@ -1336,7 +1565,7 @@ def _similar_ocr_email(left: str, right: str) -> bool:
             and longer[0] in {"e", "i", "l", "o", "0"}
             and longer[1:] == shorter
         )
-    if len(left_local) != len(right_local):
+    if len(left_local) != len(right_local) or len(left_local) < 6:
         return False
     differences = [
         index
@@ -1354,15 +1583,33 @@ def _similar_ocr_email(left: str, right: str) -> bool:
     }
 
 
-def _prefer_shorter_ocr_email(candidate: str, existing: str) -> bool:
+def _correct_common_ocr_email(value: str) -> str:
+    if "@" not in value:
+        return value
+    local, domain = value.rsplit("@", 1)
+    local = re.sub(r"^nichael(?=$|[._-])", "michael", local)
+    return f"{local}@{domain}"
+
+
+def _prefer_ocr_email(candidate: str, existing: str) -> bool:
     candidate_local, candidate_domain = candidate.rsplit("@", 1)
     existing_local, existing_domain = existing.rsplit("@", 1)
-    return (
+    if candidate_domain != existing_domain:
+        return False
+    if (
         candidate_domain == existing_domain
         and len(candidate_local) + 1 == len(existing_local)
         and candidate_local in OCR_PREFIX_DEDUPE_LOCAL_PARTS
         and existing_local[0] in {"e", "i", "l", "o", "0"}
         and existing_local[1:] == candidate_local
+    ):
+        return True
+    preferred_first_characters = {"n": "m", "l": "i", "0": "o"}
+    return (
+        len(candidate_local) == len(existing_local)
+        and len(candidate_local) >= 6
+        and candidate_local[1:] == existing_local[1:]
+        and preferred_first_characters.get(existing_local[0]) == candidate_local[0]
     )
 
 
@@ -1391,11 +1638,12 @@ def _postcodes(value: str) -> list[str]:
 
 
 def _meaningful_address_tokens(value: str) -> set[str]:
-    return {
-        token
-        for token in re.findall(r"[a-z0-9]+", value.casefold())
-        if len(token) > 1 and token not in ADDRESS_STOP_TOKENS
-    }
+    meaningful: set[str] = set()
+    for token in re.findall(r"[a-z0-9]+", value.casefold()):
+        for expanded in ADDRESS_TOKEN_EXPANSIONS.get(token, {token}):
+            if len(expanded) > 1 and expanded not in ADDRESS_STOP_TOKENS:
+                meaningful.add(expanded)
+    return meaningful
 
 
 def _similar_site_address(candidate: str, excluded: str) -> bool:
