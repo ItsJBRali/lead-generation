@@ -1302,6 +1302,24 @@ def test_email_suffix_repair_does_not_scan_local_part() -> None:
     ]
 
 
+def test_architectural_design_prefix_fused_to_email_is_removed() -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+
+    accumulator.add_email("Designmlaytondesign@gmail.com")
+
+    assert accumulator.result.email_addresses == [
+        "mlaytondesign@gmail.com"
+    ]
+
+
+def test_lowercase_design_email_is_not_treated_as_fused_ocr() -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+
+    accumulator.add_email("designbydesign@gmail.com")
+
+    assert accumulator.result.email_addresses == ["designbydesign@gmail.com"]
+
+
 @pytest.mark.parametrize(
     "values",
     [
@@ -1463,6 +1481,20 @@ def test_ocr_fused_architect_company_and_contact_line_is_read() -> None:
 
     assert accumulator.result.phone_numbers == ["028 9022 0500"]
     assert accumulator.result.email_addresses == ["home@desewing.com"]
+
+
+def test_ocr_email_with_space_before_domain_dot_is_read() -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+
+    enrichment.extract_professional_details(
+        "ASCOT DESIGN Timeless architecture "
+        "Tel: 01344 299330 Email: "
+        "info@ascotdesign .comZZZ.ascotdesign.com",
+        "Proposed Elevations.pdf",
+        accumulator,
+    )
+
+    assert accumulator.result.email_addresses == ["info@ascotdesign.com"]
 
 
 def test_fused_architect_instruction_does_not_override_engineer_role() -> None:

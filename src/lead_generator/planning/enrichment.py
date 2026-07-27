@@ -31,6 +31,12 @@ APPLICATION_FORM_EXCLUSION_PAGE_LIMIT = 4
 EMAIL_RE = re.compile(
     r"(?i)(?<![\w.+-])([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})(?![\w.-])"
 )
+SPACED_EMAIL_RE = re.compile(
+    r"(?i)(?<![\w.+-])([A-Z0-9._%+-]+)\s*@\s*"
+    r"([A-Z0-9.-]+)\s+\.\s*"
+    r"(co\.uk|org\.uk|ac\.uk|gov\.uk|com|net|org|me|io)"
+    r"(?:(?=(?-i:[A-Z]))|(?![\w.-]))"
+)
 PHONE_RE = re.compile(
     r"(?<![\w])(?:\+44\s*(?:\(0\)\s*)?|0044\s*|0)(?:[\s().-]*\d){9,11}(?!\d)"
 )
@@ -919,6 +925,13 @@ def extract_professional_details(text: str, filename: str, accumulator: _Accumul
                 if company:
                     accumulator.add_name(company)
 
+        for local, domain, suffix in SPACED_EMAIL_RE.findall(line):
+            if has_contact_evidence and architect_context and not excluded_context:
+                accumulator.add_email(f"{local}@{domain}.{suffix}")
+                company = _nearest_company(lines, index, role_contexts)
+                if company:
+                    accumulator.add_name(company)
+
         for phone_match in PHONE_RE.finditer(line):
             if (
                 has_contact_evidence
@@ -1640,6 +1653,13 @@ def _correct_common_ocr_email(value: str) -> str:
     if "@" not in value:
         return value
     local, domain = value.rsplit("@", 1)
+    folded_local = local.casefold()
+    if (
+        local.startswith("Design")
+        and folded_local[len("design"):].endswith("design")
+        and len(local) > len("designdesign")
+    ):
+        local = local[len("design"):]
     for suffix in (
         ".co.uk",
         ".org.uk",
