@@ -251,6 +251,21 @@ class KensingtonHttp:
         return struct.pack("<I", len(encoded)) + encoded
 
 
+class KensingtonAngleBracketCountHttp(KensingtonHttp):
+    def get_bytes(self, url: str, params=None, headers=None) -> BinaryFetchResponse:
+        records = [
+            self._record(
+                False,
+                f"PP/26/{index:05d}",
+                "Planning application",
+                "2026-07-10",
+            )
+            for index in range(60)
+        ]
+        body = struct.pack("<I", 60) + b"".join(records)
+        return BinaryFetchResponse(url, 200, body)
+
+
 class BespokePortalTests(unittest.TestCase):
     def test_bath_merges_validated_and_publication_searches(self) -> None:
         http = BathHttp()
@@ -332,6 +347,22 @@ class BespokePortalTests(unittest.TestCase):
         self.assertEqual([application.reference for application in result.applications], ["PP/26/01234"])
         self.assertEqual(result.applications[0].date_received, "2026-07-10")
         self.assertIn("identifier=Planning", result.applications[0].raw["docs_url"])
+
+    def test_kensington_decodes_valid_binary_when_record_count_starts_with_angle_bracket(self) -> None:
+        scraper = KensingtonPlanningScraper(
+            LegacyFormsCouncilConfig("Kensington", "https://www.rbkc.gov.uk"),
+            http_client=KensingtonAngleBracketCountHttp(),
+        )
+
+        result = scraper.discover_ids(
+            listing_url="https://www.rbkc.gov.uk/planningsearch",
+            start_date=date(2026, 7, 6),
+            end_date=date(2026, 7, 12),
+        )
+
+        self.assertEqual(len(result.applications), 60)
+        self.assertEqual(result.applications[0].reference, "PP/26/00000")
+        self.assertEqual(result.applications[-1].reference, "PP/26/00059")
 
     def test_kensington_reports_the_council_side_outage(self) -> None:
         class OutageHttp:
