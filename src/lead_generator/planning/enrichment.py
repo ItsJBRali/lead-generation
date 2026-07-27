@@ -343,9 +343,9 @@ class _Exclusions:
     def add_phone(self, value: str | None) -> None:
         value = _normalise_phone(value or "")
         if value:
-            digits = re.sub(r"\D", "", value)
-            if digits not in self.phones:
-                self.phones.append(digits)
+            identity = _phone_identity_key(value)
+            if identity not in self.phones:
+                self.phones.append(identity)
 
     def add_email(self, value: str | None) -> None:
         value = (value or "").strip(" <>.,;:").casefold()
@@ -365,7 +365,7 @@ class _Exclusions:
         )
 
     def matches_phone(self, value: str) -> bool:
-        return re.sub(r"\D", "", value) in self.phones
+        return _phone_identity_key(value) in self.phones
 
     def matches_email(self, value: str) -> bool:
         return value.casefold() in self.emails
@@ -406,17 +406,17 @@ class _Accumulator:
     def add_phone(self, value: str | None) -> None:
         value = _normalise_phone(value or "")
         if value and not self.exclusions.matches_phone(value) and not any(
-            re.sub(r"\D", "", value) == re.sub(r"\D", "", existing)
+            _phone_identity_key(value) == _phone_identity_key(existing)
             for existing in self.result.phone_numbers
         ):
             self.result.phone_numbers.append(value)
             self._record_source("Phone Number")
 
     def add_email(self, value: str | None) -> None:
-        value = (value or "").strip(" <>.,;:").casefold()
-        if value.startswith("email-"):
-            value = value.removeprefix("email-")
-        value = _correct_common_ocr_email(value)
+        value = (value or "").strip(" <>.,;:")
+        if value.casefold().startswith("email-"):
+            value = value[len("email-"):]
+        value = _correct_common_ocr_email(value).casefold()
         if value and not self.exclusions.matches_email(value) and not _blocked_email(value):
             for index, existing in enumerate(self.result.email_addresses):
                 if not _similar_ocr_email(value, existing):
@@ -616,6 +616,7 @@ def _merge_document_enrichment(
     document: ContactEnrichment,
     source_document: str,
 ) -> None:
+    accumulator.discard_excluded_values()
     accumulator.source_document = source_document
     try:
         for value in document.architect_company_names:
@@ -876,6 +877,11 @@ def extract_professional_details(text: str, filename: str, accumulator: _Accumul
     lines = _text_lines(text)
     if not lines:
         return
+    for index, line in enumerate(lines):
+        for phone_match in PHONE_RE.finditer(line):
+            if _fax_number_context(lines, index, phone_match.start()):
+                accumulator.exclusions.add_phone(phone_match.group(0))
+    accumulator.discard_excluded_values()
     role_contexts = _role_contexts(lines)
 
     for index, line in enumerate(lines):
@@ -999,12 +1005,34 @@ def _fax_context(line: str, phone_start: int) -> bool:
     )
 
 
-def _noncontact_number_context(
+def _fax_number_context(
     lines: list[str],
     index: int,
     phone_start: int,
 ) -> bool:
     if _fax_context(lines[index], phone_start):
+        return True
+    labels = [lines[index][:phone_start]]
+    if index:
+        labels.append(lines[index - 1])
+    fax_labels = {
+        "f",
+        "fax",
+        "fax no",
+        "fax number",
+        "facsimile",
+        "facsimile no",
+        "facsimile number",
+    }
+    return any(_normalise_label(label) in fax_labels for label in labels)
+
+
+def _noncontact_number_context(
+    lines: list[str],
+    index: int,
+    phone_start: int,
+) -> bool:
+    if _fax_number_context(lines, index, phone_start):
         return True
     labels = [lines[index][:phone_start]]
     if index:
@@ -1129,11 +1157,6 @@ def _role_for_line(line: str) -> str | None:
         return "architect"
     if normalized in {"design architect", "design architects"}:
         return "architect"
-    if (
-        re.search(r"(?i)\barchitect(?:s|ure|ural)?\b", line)
-        and _looks_like_company(line)
-    ):
-        return "architect"
     if normalized in {"design", "designer"}:
         return "other"
     if _is_role_label(normalized, NON_ARCHITECT_ROLE_MARKERS):
@@ -1144,6 +1167,25 @@ def _role_for_line(line: str) -> str | None:
         line,
     ):
         return "other"
+    if (
+        re.search(
+            r"(?i:\barchitect(?:s|ure|ural)?)(?:\b|(?=[A-Z]))",
+            line,
+        )
+        and _looks_like_company(line)
+    ):
+        return "architect"
+    if (
+        re.search(
+            r"(?i:\barchitect(?:s|ure|ural)?)(?:\b|(?=[A-Z]))",
+            line,
+        )
+        and (
+            EMAIL_RE.search(line)
+            or any(_normalise_phone(match.group(0)) for match in PHONE_RE.finditer(line))
+        )
+    ):
+        return "architect"
     if PROFESSIONAL_CREDENTIAL_RE.search(line):
         return "architect"
     return None
@@ -1511,6 +1553,17 @@ def _normalise_phone(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip(" .,;:-")
 
 
+def _phone_identity_key(value: str) -> str:
+    digits = re.sub(r"\D", "", value)
+    if digits.startswith("0044"):
+        domestic = digits[4:]
+        return domestic if domestic.startswith("0") else f"0{domestic}"
+    if digits.startswith("44"):
+        domestic = digits[2:]
+        return domestic if domestic.startswith("0") else f"0{domestic}"
+    return digits
+
+
 def _clean_professional_address(value: str | None) -> str:
     value = _clean_candidate(value)
     value = re.sub(r"(?i)\bstudi0\b", "Studio", value)
@@ -1587,7 +1640,27 @@ def _correct_common_ocr_email(value: str) -> str:
     if "@" not in value:
         return value
     local, domain = value.rsplit("@", 1)
-    local = re.sub(r"^nichael(?=$|[._-])", "michael", local)
+    for suffix in (
+        ".co.uk",
+        ".org.uk",
+        ".ac.uk",
+        ".gov.uk",
+        ".com",
+        ".net",
+        ".org",
+        ".me",
+        ".io",
+    ):
+        match = re.search(re.escape(suffix) + r"(?=[A-Z])", domain)
+        if match:
+            domain = domain[:match.end()]
+            break
+    local = re.sub(
+        r"^nichael(?=$|[._-])",
+        "michael",
+        local,
+        flags=re.IGNORECASE,
+    )
     return f"{local}@{domain}"
 
 
@@ -1674,14 +1747,38 @@ def _similar_company_name(left: str, right: str) -> bool:
     for left_value in left_values:
         if not _looks_like_company(left_value):
             continue
+        left_core = _company_identity_core(left_value)
         left_key = re.sub(r"[^a-z0-9]", "", left_value.casefold())
         for right_value in right_values:
             if not _looks_like_company(right_value):
                 continue
+            right_core = _company_identity_core(right_value)
+            if left_core and left_core == right_core:
+                return True
             right_key = re.sub(r"[^a-z0-9]", "", right_value.casefold())
             if min(len(left_key), len(right_key)) >= 10 and SequenceMatcher(None, left_key, right_key).ratio() >= 0.82:
                 return True
     return False
+
+
+def _company_identity_core(value: str) -> str:
+    ignored = {
+        "architect",
+        "architects",
+        "architectural",
+        "architecture",
+        "limited",
+        "llp",
+        "ltd",
+        "plc",
+        "the",
+    }
+    core = "".join(
+        token
+        for token in re.findall(r"[a-z0-9]+", value.casefold())
+        if token not in ignored
+    )
+    return core if len(core) >= 4 else ""
 
 
 def _append_unique(values: list[str], value: str) -> None:

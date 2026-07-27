@@ -1022,6 +1022,66 @@ def test_common_fax_labels_are_not_added_as_phone_numbers(fax_line: str) -> None
     assert accumulator.result.phone_numbers == []
 
 
+def test_fax_number_from_one_drawing_is_excluded_from_later_drawing() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        folder = Path(directory)
+        first_path = folder / "A Proposed Plan.pdf"
+        second_path = folder / "B Proposed Plan.pdf"
+        first_path.touch()
+        second_path.touch()
+        documents = {
+            first_path.name: _fake_pdf(
+                first_path,
+                "PROPOSED PLAN\nDRAWING NUMBER P01\nSCALE 1:100\n"
+                "ARCHITECT\nAros Architects\nTelephone\n"
+                "+44(0)20 7928 2444\nFacsimile\n+44(0)20 7928 2450",
+                application_form=False,
+            ),
+            second_path.name: _fake_pdf(
+                second_path,
+                "PROPOSED PLAN\nDRAWING NUMBER P02\nSCALE 1:100\n"
+                "ARCHITECT\nAros Architects\n020 7928 2450\n"
+                "info@arosarchitects.com\n"
+                "Jerwood Space\n171 Union Street\nLondon\nSE1 0LN",
+                application_form=False,
+            ),
+        }
+
+        with (
+            patch.object(
+                enrichment,
+                "extract_pdf_first_page_text",
+                side_effect=lambda path: documents[path.name],
+            ),
+            patch.object(
+                enrichment,
+                "extract_pdf_text",
+                side_effect=lambda path, **_kwargs: documents[path.name],
+            ),
+        ):
+            result = enrichment.enrich_application_folder(folder)
+
+    assert result.to_csv_row() == {
+        "Architect / Company Name": "Aros Architects",
+        "Phone Number": "+44(0)20 7928 2444",
+        "Email Address": "info@arosarchitects.com",
+        "Company Address": "Jerwood Space, 171 Union Street, London, SE1 0LN",
+    }
+
+
+@pytest.mark.parametrize(
+    "equivalent",
+    ["020 7928 2450", "0044 20 7928 2450"],
+)
+def test_fax_exclusion_matches_equivalent_uk_phone_formats(
+    equivalent: str,
+) -> None:
+    exclusions = enrichment._Exclusions()
+    exclusions.add_phone("+44(0)20 7928 2450")
+
+    assert exclusions.matches_phone(equivalent) is True
+
+
 @pytest.mark.parametrize(
     "label",
     [
@@ -1091,6 +1151,27 @@ def test_valid_company_name_remains_accepted_after_noise_filtering() -> None:
     accumulator.add_name("NEO Architects")
 
     assert accumulator.result.architect_company_names == ["NEO Architects"]
+
+
+def test_same_firm_architect_and_company_aliases_are_deduplicated() -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+
+    accumulator.add_name("Aros Architects")
+    accumulator.add_name("Aros Ltd.")
+
+    assert accumulator.result.architect_company_names == ["Aros Architects"]
+
+
+def test_distinct_architect_and_associate_firms_are_not_deduplicated() -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+
+    accumulator.add_name("Smith Architects Ltd")
+    accumulator.add_name("Smith Associates Ltd")
+
+    assert accumulator.result.architect_company_names == [
+        "Smith Architects Ltd",
+        "Smith Associates Ltd",
+    ]
 
 
 def test_company_name_corrects_studio_ocr_zero() -> None:
@@ -1201,6 +1282,24 @@ def test_single_common_ocr_email_variant_is_corrected() -> None:
     accumulator.add_email("nichael@neoarchitects.co.uk")
 
     assert accumulator.result.email_addresses == ["michael@neoarchitects.co.uk"]
+
+
+def test_email_fused_to_following_drawing_code_is_trimmed() -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+
+    accumulator.add_email("dtyler.riba@gmail.comSPArch")
+
+    assert accumulator.result.email_addresses == ["dtyler.riba@gmail.com"]
+
+
+def test_email_suffix_repair_does_not_scan_local_part() -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+
+    accumulator.add_email("first.comSmith@example.co.uk")
+
+    assert accumulator.result.email_addresses == [
+        "first.comsmith@example.co.uk"
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1333,6 +1432,74 @@ def test_compact_consultant_blocks_do_not_share_architect_context() -> None:
         "Phone Number": "020 7123 4567",
         "Email Address": "hello@studioarc.co.uk",
         "Company Address": "12 Design Road, London, EC1A 1BB",
+    }
+
+
+def test_compressed_architect_contact_line_starts_architect_context() -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+
+    enrichment.extract_professional_details(
+        "Revision Date Notes Space Architects UK Ltd "
+        "13 Hulham Road Exmouth EX8 3HS "
+        "tel: 07876 566481 email: dtyler@spacearchitects.co.uk",
+        "Existing Site Plan.pdf",
+        accumulator,
+    )
+
+    assert accumulator.result.phone_numbers == ["07876 566481"]
+    assert accumulator.result.email_addresses == ["dtyler@spacearchitects.co.uk"]
+
+
+def test_ocr_fused_architect_company_and_contact_line_is_read() -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+
+    enrichment.extract_professional_details(
+        "Des Ewing Residential ArchitectsThe Studio 13 Bangor Road "
+        "Holywood BT18 0NU T 028 9022 0500 F 028 9022 0505 "
+        "E home@desewing.com www.desewing.com",
+        "Existing and Proposed Elevations.pdf",
+        accumulator,
+    )
+
+    assert accumulator.result.phone_numbers == ["028 9022 0500"]
+    assert accumulator.result.email_addresses == ["home@desewing.com"]
+
+
+def test_fused_architect_instruction_does_not_override_engineer_role() -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+
+    enrichment.extract_professional_details(
+        "STRUCTURAL ENGINEER Frame Engineers Ltd "
+        "Report discrepancies to ArchitectsThe contractor "
+        "tel 020 7000 0001 email frame@example.com",
+        "Proposed Structural Plan.pdf",
+        accumulator,
+    )
+
+    assert accumulator.result.to_csv_row() == {
+        "Architect / Company Name": "Failed",
+        "Phone Number": "Failed",
+        "Email Address": "Failed",
+        "Company Address": "Failed",
+    }
+
+
+def test_company_shaped_architect_instruction_does_not_override_engineer_role() -> None:
+    accumulator = enrichment._Accumulator(enrichment._Exclusions())
+
+    enrichment.extract_professional_details(
+        "STRUCTURAL ENGINEER Frame Engineers Ltd Report discrepancies "
+        "to ArchitectsThe Contractor Ltd\n"
+        "020 7000 0001\nframe@example.com",
+        "Proposed Structural Plan.pdf",
+        accumulator,
+    )
+
+    assert accumulator.result.to_csv_row() == {
+        "Architect / Company Name": "Failed",
+        "Phone Number": "Failed",
+        "Email Address": "Failed",
+        "Company Address": "Failed",
     }
 
 
