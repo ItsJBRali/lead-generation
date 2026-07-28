@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from datetime import date
+import json
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from lead_generator.planning.adapters.base import PortalSearchCompletenessError
 from lead_generator.planning.http import FetchResponse
 from lead_generator.planning.adapters.achieveforms import AchieveFormsCouncilConfig, AchieveFormsPlanningScraper
 from lead_generator.planning.adapters.agile import AgileCouncilConfig, AgilePlanningScraper
@@ -34,6 +36,152 @@ from lead_generator.planning.adapters.northgate import (
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
+
+
+class PaginatedStatMapHttp:
+    def __init__(self, pages: dict[int, dict[str, object]]) -> None:
+        self.pages = pages
+        self.posts: list[tuple[str, dict[str, object]]] = []
+
+    def post_json(self, url: str, data: dict[str, object]) -> FetchResponse:
+        self.posts.append((url, data))
+        payload = self.pages[data["offset"]]
+        return FetchResponse(url=url, status_code=200, text=json.dumps(payload))
+
+
+class PaginatedSocrataHttp:
+    def __init__(self, total_rows: int, *, repeated_page: bool = False) -> None:
+        self.total_rows = total_rows
+        self.repeated_page = repeated_page
+        self.gets: list[tuple[str, dict[str, str] | None]] = []
+
+    def get(
+        self,
+        url: str,
+        params: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> FetchResponse:
+        self.gets.append((url, params))
+        offset = int((params or {}).get("$offset", "0"))
+        start = 0 if self.repeated_page else offset
+        rows = [
+            {
+                "pk": str(index),
+                "application_number": f"2026/{index:04d}/P",
+                "development_address": f"{index} Camden Road NW1 1AA",
+                "registered_date": "2026-07-10T00:00:00.000",
+            }
+            for index in range(start, min(start + 100, self.total_rows))
+        ]
+        return FetchResponse(url=url, status_code=200, text=json.dumps(rows))
+
+
+class ScriptedSocrataHttp:
+    def __init__(self, pages: list[list[dict[str, object]]]) -> None:
+        self.pages = pages
+        self.gets: list[tuple[str, dict[str, str] | None]] = []
+
+    def get(
+        self,
+        url: str,
+        params: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> FetchResponse:
+        self.gets.append((url, params))
+        page_index = len(self.gets) - 1
+        if page_index >= len(self.pages):
+            raise AssertionError("Socrata made an unexpected extra page request")
+        return FetchResponse(
+            url=url,
+            status_code=200,
+            text=json.dumps(self.pages[page_index]),
+        )
+
+
+class PaginatedCcedHttp:
+    def __init__(self, result_pages: list[str]) -> None:
+        self.result_pages = result_pages
+        self.posts: list[tuple[str, dict[str, str]]] = []
+        self.gets: list[tuple[str, dict[str, str] | None]] = []
+
+    def get(
+        self,
+        url: str,
+        params: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> FetchResponse:
+        self.gets.append((url, params))
+        return FetchResponse(
+            url=url,
+            status_code=200,
+            text="""
+                <form id="aspnetForm" action="./advsearch.aspx" method="post">
+                  <input name="ctl00$ContentPlaceHolder1$txtDateReceivedFrom">
+                  <input name="ctl00$ContentPlaceHolder1$txtDateReceivedTo">
+                  <input type="submit" name="ctl00$ContentPlaceHolder1$btnSearch3" value="Search">
+                </form>
+            """,
+        )
+
+    def post_form(
+        self,
+        url: str,
+        data: dict[str, str],
+        headers: dict[str, str] | None = None,
+    ) -> FetchResponse:
+        self.posts.append((url, data))
+        page_index = len(self.posts) - 1
+        if page_index >= len(self.result_pages):
+            raise AssertionError("CCED made an unexpected extra page request")
+        return FetchResponse(
+            url=url,
+            status_code=200,
+            text=self.result_pages[page_index],
+        )
+
+
+def cced_page(
+    references: list[str],
+    *,
+    current_page: int,
+    final_page: int,
+) -> str:
+    applications = "\n".join(
+        (
+            f"{reference} Location: {index} High Street DT1 1AA "
+            "Proposal: Erect wall and gates Decision: Pending "
+            "Decision Date: View this application"
+        )
+        for index, reference in enumerate(references, start=1)
+    )
+    next_link = ""
+    if current_page < final_page:
+        next_page = current_page + 1
+        next_link = (
+            f"<a href=\"javascript:__doPostBack('pager${next_page}','')\">"
+            f"{next_page}</a>"
+        )
+    return f"""
+        <html><body>
+          <form id="aspnetForm" action="./advsearch.aspx" method="post">
+            <input name="__VIEWSTATE" value="page-{current_page}">
+            <div>Page {current_page} of {final_page}</div>
+            <div>{applications}</div>
+            {next_link}
+          </form>
+        </body></html>
+    """
+
+
+def statmap_record(reference: str, received_date: str) -> dict[str, str]:
+    return {
+        "id": reference,
+        "name": reference,
+        "address": "25 Cleardene RH4 2BY",
+        "proposal": "Rear extension",
+        "receivedDate": received_date,
+        "status": "Live",
+    }
 
 
 class FakeJsonHttpClient:
@@ -817,6 +965,149 @@ class NonIdoxScraperTest(unittest.TestCase):
         self.assertEqual(http.posts[1][1]["ctl00$ContentPlaceHolder1$txtDateReceivedFrom"], "08/06/2026")
         self.assertEqual(discovery.applications[0].reference, "P/HOU/2026/03140")
 
+    def test_cced_preserves_exact_unique_references_across_pages(self) -> None:
+        http = PaginatedCcedHttp(
+            [
+                cced_page(
+                    ["P/HOU/2026/00001", "P/HOU/2026/00002"],
+                    current_page=1,
+                    final_page=2,
+                ),
+                cced_page(
+                    [
+                        "P/HOU/2026/00002",
+                        "p/hou/2026/00001",
+                        "P/HOU/2026/00003",
+                    ],
+                    current_page=2,
+                    final_page=2,
+                ),
+            ]
+        )
+        scraper = CcedPlanningScraper(
+            LegacyFormsCouncilConfig("Dorset", "https://planning.example.gov.uk"),
+            http_client=http,
+        )
+
+        applications = scraper.search(
+            "https://planning.example.gov.uk/advsearch.aspx",
+            start_date=date(2026, 6, 8),
+            end_date=date(2026, 6, 14),
+            limit=None,
+        )
+
+        self.assertEqual(
+            [application.reference for application in applications],
+            [
+                "P/HOU/2026/00001",
+                "P/HOU/2026/00002",
+                "p/hou/2026/00001",
+                "P/HOU/2026/00003",
+            ],
+        )
+        self.assertEqual(len(http.posts), 2)
+
+    def test_cced_rejects_a_repeated_result_page(self) -> None:
+        repeated_references = ["P/HOU/2026/00001", "P/HOU/2026/00002"]
+        http = PaginatedCcedHttp(
+            [
+                cced_page(
+                    repeated_references,
+                    current_page=1,
+                    final_page=3,
+                ),
+                cced_page(
+                    repeated_references,
+                    current_page=2,
+                    final_page=3,
+                ),
+            ]
+        )
+        scraper = CcedPlanningScraper(
+            LegacyFormsCouncilConfig("Dorset", "https://planning.example.gov.uk"),
+            http_client=http,
+        )
+
+        with self.assertRaisesRegex(
+            PortalSearchCompletenessError,
+            "repeated page",
+        ):
+            scraper.search(
+                "https://planning.example.gov.uk/advsearch.aspx",
+                start_date=date(2026, 6, 8),
+                end_date=date(2026, 6, 14),
+                limit=None,
+            )
+
+        self.assertEqual(len(http.posts), 2)
+
+    def test_cced_rejects_a_reordered_no_progress_page(self) -> None:
+        http = PaginatedCcedHttp(
+            [
+                cced_page(
+                    ["P/HOU/2026/00001", "P/HOU/2026/00002"],
+                    current_page=1,
+                    final_page=3,
+                ),
+                cced_page(
+                    ["P/HOU/2026/00002", "P/HOU/2026/00001"],
+                    current_page=2,
+                    final_page=3,
+                ),
+            ]
+        )
+        scraper = CcedPlanningScraper(
+            LegacyFormsCouncilConfig("Dorset", "https://planning.example.gov.uk"),
+            http_client=http,
+        )
+
+        with self.assertRaisesRegex(
+            PortalSearchCompletenessError,
+            "no unique-reference progress",
+        ):
+            scraper.search(
+                "https://planning.example.gov.uk/advsearch.aspx",
+                start_date=date(2026, 6, 8),
+                end_date=date(2026, 6, 14),
+                limit=None,
+            )
+
+        self.assertEqual(len(http.posts), 2)
+
+    def test_cced_stops_at_the_maximum_result_page_bound(self) -> None:
+        http = PaginatedCcedHttp(
+            [
+                cced_page(
+                    ["P/HOU/2026/00001"],
+                    current_page=1,
+                    final_page=3,
+                ),
+                cced_page(
+                    ["P/HOU/2026/00002"],
+                    current_page=2,
+                    final_page=3,
+                ),
+            ]
+        )
+        scraper = CcedPlanningScraper(
+            LegacyFormsCouncilConfig("Dorset", "https://planning.example.gov.uk"),
+            http_client=http,
+        )
+        scraper.MAX_PAGED_RESULT_PAGES = 2
+
+        with self.assertRaisesRegex(
+            PortalSearchCompletenessError,
+            "maximum page request limit",
+        ):
+            scraper.search(
+                "https://planning.example.gov.uk/advsearch.aspx",
+                start_date=date(2026, 6, 8),
+                end_date=date(2026, 6, 14),
+                limit=None,
+            )
+
+        self.assertEqual(len(http.posts), 2)
+
     def test_astun_submits_get_search_dates(self) -> None:
         http = FakeLegacyFormsHttpClient(
             {
@@ -845,19 +1136,178 @@ class NonIdoxScraperTest(unittest.TestCase):
         self.assertEqual(http.gets[1][1]["DATEAPRECV:FROM:DATE"], "08/06/2026")
         self.assertEqual(discovery.applications[0].reference, "26/00456/FUL")
 
-    def test_statmap_posts_page_request(self) -> None:
-        http = FakeLegacyFormsHttpClient({"post": '{"records":[{"id":"130473","name":"MO/2026/00790","address":"25 Cleardene RH4 2BY","proposal":"Rear extension","receivedDate":"2026-06-11T05:55:13","status":"Live"}]}'})
-        scraper = StatMapPlanningScraper(LegacyFormsCouncilConfig("Mole Valley", "https://molevalley.example"), http_client=http)
-
-        discovery = scraper.discover_ids(
-            listing_url="https://molevalley.example/horizoNext/",
-            start_date=date(2026, 6, 8),
-            end_date=date(2026, 6, 14),
+    def test_statmap_uses_current_date_filter_and_fetches_every_offset(self) -> None:
+        http = PaginatedStatMapHttp(
+            {
+                0: {"total": 3, "records": [statmap_record("MO/1", "2026-07-21"), statmap_record("MO/2", "2026-07-22")]},
+                2: {"total": 3, "records": [statmap_record("MO/3", "2026-07-23")]},
+            }
+        )
+        scraper = StatMapPlanningScraper(
+            LegacyFormsCouncilConfig("Mole Valley", "https://molevalley.example"),
+            http_client=http,
         )
 
-        self.assertIn("/api/publicportal/planningApplications/pageRequest", http.posts[0][0])
-        self.assertEqual(discovery.applications[0].reference, "MO/2026/00790")
-        self.assertEqual(discovery.applications[0].date_received, "2026-06-11")
+        applications = scraper.search(
+            "https://molevalley.example/horizoNext/",
+            start_date=date(2026, 7, 20),
+            end_date=date(2026, 7, 26),
+            limit=None,
+        )
+
+        self.assertEqual([app.reference for app in applications], ["MO/1", "MO/2", "MO/3"])
+        self.assertEqual([post[1]["offset"] for post in http.posts], [0, 2])
+        self.assertEqual(
+            http.posts[0][1]["filter"],
+            {
+                "parts": [
+                    {
+                        "filterItems": [
+                            {"columnName": "receivedDateFrom", "value": "2026-07-20", "operator": "="},
+                            {"columnName": "receivedDateTo", "value": "2026-07-26", "operator": "="},
+                        ]
+                    }
+                ]
+            },
+        )
+
+    def test_statmap_raises_when_response_date_is_outside_requested_range(self) -> None:
+        http = PaginatedStatMapHttp({0: {"total": 1, "records": [statmap_record("MO/1", "2026-07-19")]}})
+        scraper = StatMapPlanningScraper(
+            LegacyFormsCouncilConfig("Mole Valley", "https://molevalley.example"),
+            http_client=http,
+        )
+
+        with self.assertRaises(PortalSearchCompletenessError):
+            scraper.search(
+                "https://molevalley.example/horizoNext/",
+                start_date=date(2026, 7, 20),
+                end_date=date(2026, 7, 26),
+                limit=None,
+            )
+
+    def test_statmap_rejects_a_record_without_any_stable_identifier(self) -> None:
+        record = {
+            "address": "25 Cleardene RH4 2BY",
+            "proposal": "Rear extension",
+            "receivedDate": "2026-07-21",
+        }
+        scraper = StatMapPlanningScraper(
+            LegacyFormsCouncilConfig("Mole Valley", "https://molevalley.example"),
+            http_client=PaginatedStatMapHttp(
+                {0: {"total": 1, "records": [record]}}
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            PortalSearchCompletenessError,
+            "stable identifier",
+        ):
+            scraper.search(
+                "https://molevalley.example/horizoNext/",
+                start_date=date(2026, 7, 20),
+                end_date=date(2026, 7, 26),
+                limit=None,
+            )
+
+    def test_statmap_allows_an_internal_id_for_page_identity_only(self) -> None:
+        record = {
+            "id": "internal-123",
+            "address": "25 Cleardene RH4 2BY",
+            "proposal": "Rear extension",
+            "receivedDate": "2026-07-21",
+        }
+        scraper = StatMapPlanningScraper(
+            LegacyFormsCouncilConfig("Mole Valley", "https://molevalley.example"),
+            http_client=PaginatedStatMapHttp(
+                {0: {"total": 1, "records": [record]}}
+            ),
+        )
+
+        applications = scraper.search(
+            "https://molevalley.example/horizoNext/",
+            start_date=date(2026, 7, 20),
+            end_date=date(2026, 7, 26),
+            limit=None,
+        )
+
+        self.assertEqual(len(applications), 1)
+        self.assertEqual(applications[0].uid, "internal-123")
+        self.assertIsNone(applications[0].reference)
+
+    def test_statmap_raises_when_page_is_repeated(self) -> None:
+        records = [statmap_record("MO/1", "2026-07-21"), statmap_record("MO/2", "2026-07-22")]
+        http = PaginatedStatMapHttp({0: {"total": 4, "records": records}, 2: {"total": 4, "records": records}})
+        scraper = StatMapPlanningScraper(
+            LegacyFormsCouncilConfig("Mole Valley", "https://molevalley.example"),
+            http_client=http,
+        )
+
+        with self.assertRaises(PortalSearchCompletenessError):
+            scraper.search(
+                "https://molevalley.example/horizoNext/",
+                start_date=date(2026, 7, 20),
+                end_date=date(2026, 7, 26),
+                limit=None,
+            )
+
+    def test_statmap_raises_when_final_count_is_below_portal_total(self) -> None:
+        http = PaginatedStatMapHttp(
+            {
+                0: {"total": 3, "records": [statmap_record("MO/1", "2026-07-21"), statmap_record("MO/2", "2026-07-22")]},
+                2: {"total": 3, "records": []},
+            }
+        )
+        scraper = StatMapPlanningScraper(
+            LegacyFormsCouncilConfig("Mole Valley", "https://molevalley.example"),
+            http_client=http,
+        )
+
+        with self.assertRaises(PortalSearchCompletenessError):
+            scraper.search(
+                "https://molevalley.example/horizoNext/",
+                start_date=date(2026, 7, 20),
+                end_date=date(2026, 7, 26),
+                limit=None,
+            )
+
+    def test_statmap_raises_when_more_than_one_hundred_pages_are_required(self) -> None:
+        http = PaginatedStatMapHttp(
+            {
+                offset: {"total": 101, "records": [statmap_record(f"MO/{offset + 1}", "2026-07-21")]}
+                for offset in range(101)
+            }
+        )
+        scraper = StatMapPlanningScraper(
+            LegacyFormsCouncilConfig("Mole Valley", "https://molevalley.example"),
+            http_client=http,
+        )
+
+        with self.assertRaises(PortalSearchCompletenessError):
+            scraper.search(
+                "https://molevalley.example/horizoNext/",
+                start_date=date(2026, 7, 20),
+                end_date=date(2026, 7, 26),
+                limit=1,
+            )
+
+        self.assertEqual(len(http.posts), 100)
+
+    def test_statmap_raises_for_invalid_page_metadata(self) -> None:
+        for page in ({"total": "one", "records": []}, {"total": 0, "records": {}}):
+            with self.subTest(page=page):
+                scraper = StatMapPlanningScraper(
+                    LegacyFormsCouncilConfig("Mole Valley", "https://molevalley.example"),
+                    http_client=PaginatedStatMapHttp({0: page}),
+                )
+
+                with self.assertRaises(PortalSearchCompletenessError):
+                    scraper.search(
+                        "https://molevalley.example/horizoNext/",
+                        start_date=date(2026, 7, 20),
+                        end_date=date(2026, 7, 26),
+                        limit=None,
+                    )
 
     def test_socrata_uses_dataset_api(self) -> None:
         http = FakeLegacyFormsHttpClient(
@@ -874,7 +1324,320 @@ class NonIdoxScraperTest(unittest.TestCase):
         )
 
         self.assertIn("/resource/2eiu-s2cw.json", http.gets[0][0])
+        self.assertEqual(
+            http.gets[0][1]["$order"],
+            "registered_date DESC, pk DESC",
+        )
         self.assertEqual(discovery.applications[0].reference, "2026/1234/P")
+
+    def test_socrata_deduplicates_exact_references_across_pages(self) -> None:
+        http = ScriptedSocrataHttp(
+            [
+                [
+                    {
+                        "pk": "1",
+                        "application_number": "ABC/1",
+                        "registered_date": "2026-07-10T00:00:00.000",
+                    },
+                    {
+                        "pk": "2",
+                        "application_number": "abc/1",
+                        "registered_date": "2026-07-10T00:00:00.000",
+                    },
+                ],
+                [
+                    {
+                        "pk": "3",
+                        "application_number": "  ABC/1  ",
+                        "registered_date": "2026-07-10T00:00:00.000",
+                    },
+                    {
+                        "pk": "4",
+                        "application_number": "ABC/2",
+                        "registered_date": "2026-07-10T00:00:00.000",
+                    },
+                ],
+                [
+                    {
+                        "pk": "5",
+                        "application_number": "ABC/3",
+                        "registered_date": "2026-07-10T00:00:00.000",
+                    },
+                ],
+            ]
+        )
+        scraper = SocrataPlanningScraper(
+            LegacyFormsCouncilConfig("Camden", "https://opendata.camden.gov.uk"),
+            http_client=http,
+        )
+        scraper.PAGE_SIZE = 2
+
+        applications = scraper.search(
+            "https://opendata.camden.gov.uk/Environment/Planning-Applications/2eiu-s2cw/about_data",
+            start_date=date(2026, 7, 1),
+            end_date=date(2026, 7, 31),
+            limit=None,
+        )
+
+        self.assertEqual(
+            [application.reference for application in applications],
+            ["ABC/1", "abc/1", "ABC/2", "ABC/3"],
+        )
+        self.assertEqual(
+            [params["$offset"] for _, params in http.gets],
+            ["0", "2", "4"],
+        )
+
+    def test_socrata_rejects_a_full_reordered_no_progress_page(self) -> None:
+        first_page = [
+            {
+                "pk": "1",
+                "application_number": "ABC/1",
+                "registered_date": "2026-07-10T00:00:00.000",
+            },
+            {
+                "pk": "2",
+                "application_number": "ABC/2",
+                "registered_date": "2026-07-10T00:00:00.000",
+            },
+        ]
+        http = ScriptedSocrataHttp(
+            [
+                first_page,
+                [first_page[1], first_page[0]],
+            ]
+        )
+        scraper = SocrataPlanningScraper(
+            LegacyFormsCouncilConfig("Camden", "https://opendata.camden.gov.uk"),
+            http_client=http,
+        )
+        scraper.PAGE_SIZE = 2
+
+        with self.assertRaisesRegex(
+            PortalSearchCompletenessError,
+            "no unique-reference progress",
+        ):
+            scraper.search(
+                "https://opendata.camden.gov.uk/Environment/Planning-Applications/2eiu-s2cw/about_data",
+                start_date=date(2026, 7, 1),
+                end_date=date(2026, 7, 31),
+                limit=None,
+            )
+
+        self.assertEqual(len(http.gets), 2)
+
+    def test_socrata_stops_at_the_maximum_page_request_bound(self) -> None:
+        http = ScriptedSocrataHttp(
+            [
+                [
+                    {
+                        "pk": "1",
+                        "application_number": "ABC/1",
+                        "registered_date": "2026-07-10T00:00:00.000",
+                    }
+                ],
+                [
+                    {
+                        "pk": "2",
+                        "application_number": "ABC/2",
+                        "registered_date": "2026-07-10T00:00:00.000",
+                    }
+                ],
+            ]
+        )
+        scraper = SocrataPlanningScraper(
+            LegacyFormsCouncilConfig("Camden", "https://opendata.camden.gov.uk"),
+            http_client=http,
+        )
+        scraper.PAGE_SIZE = 1
+        scraper.MAX_PAGED_RESULT_PAGES = 2
+
+        with self.assertRaisesRegex(
+            PortalSearchCompletenessError,
+            "maximum page request limit",
+        ):
+            scraper.search(
+                "https://opendata.camden.gov.uk/Environment/Planning-Applications/2eiu-s2cw/about_data",
+                start_date=date(2026, 7, 1),
+                end_date=date(2026, 7, 31),
+                limit=None,
+            )
+
+        self.assertEqual(len(http.gets), 2)
+
+    def test_socrata_fetches_rows_beyond_the_first_hundred(self) -> None:
+        http = PaginatedSocrataHttp(total_rows=101)
+        scraper = SocrataPlanningScraper(
+            LegacyFormsCouncilConfig("Camden", "https://opendata.camden.gov.uk"),
+            http_client=http,
+        )
+
+        applications = scraper.search(
+            "https://opendata.camden.gov.uk/Environment/Planning-Applications/2eiu-s2cw/about_data",
+            start_date=date(2026, 7, 1),
+            end_date=date(2026, 7, 31),
+            limit=None,
+        )
+
+        self.assertEqual(len(applications), 101)
+        self.assertEqual([params["$offset"] for _, params in http.gets], ["0", "100"])
+
+    def test_socrata_raises_when_a_nonempty_page_repeats(self) -> None:
+        http = PaginatedSocrataHttp(total_rows=100, repeated_page=True)
+        scraper = SocrataPlanningScraper(
+            LegacyFormsCouncilConfig("Camden", "https://opendata.camden.gov.uk"),
+            http_client=http,
+        )
+
+        with self.assertRaises(PortalSearchCompletenessError):
+            scraper.search(
+                "https://opendata.camden.gov.uk/Environment/Planning-Applications/2eiu-s2cw/about_data",
+                start_date=date(2026, 7, 1),
+                end_date=date(2026, 7, 31),
+                limit=None,
+            )
+
+    def test_html_list_merges_a_linked_result_page(self) -> None:
+        http = FakeLegacyFormsHttpClient(
+            {
+                "get": """
+                <article><a href="/planning/application/26-00001">26/00001</a></article>
+                <a rel="next" href="/planning/results?page=2">Next</a>
+                """,
+                "get:https://planning.example.gov.uk/planning/results?page=2": """
+                <article><a href="/planning/application/26-00002">26/00002</a></article>
+                """,
+            }
+        )
+        scraper = HtmlListPlanningScraper(
+            LegacyFormsCouncilConfig("Example", "https://planning.example.gov.uk"),
+            http_client=http,
+        )
+
+        applications = scraper.search("https://planning.example.gov.uk/planning/results", start_date=None, end_date=None, limit=None)
+
+        self.assertEqual([app.reference for app in applications], ["26/00001", "26/00002"])
+
+    def test_query_form_merges_a_linked_result_page(self) -> None:
+        http = FakeLegacyFormsHttpClient(
+            {
+                "get": '<form method="get" action="/results"><input name="regdate1"></form>',
+                "get:results": """
+                <table><tr><th>Reference</th><th>Location</th></tr><tr><td>26/00001</td><td>1 High Street AB1 2CD</td></tr></table>
+                <a rel="next" href="/results?page=2">Next</a>
+                """,
+                "get:https://planning.example.gov.uk/results?page=2": """
+                <table><tr><th>Reference</th><th>Location</th></tr><tr><td>26/00002</td><td>2 High Street AB1 2CE</td></tr></table>
+                """,
+            }
+        )
+        scraper = QueryFormPlanningScraper(
+            LegacyFormsCouncilConfig("Example", "https://planning.example.gov.uk"),
+            http_client=http,
+        )
+
+        applications = scraper.search("https://planning.example.gov.uk/search", start_date=None, end_date=None, limit=None)
+
+        self.assertEqual([app.reference for app in applications], ["26/00001", "26/00002"])
+
+    def test_astun_merges_a_linked_result_page(self) -> None:
+        http = FakeLegacyFormsHttpClient(
+            {
+                "get": """
+                <form method="get" action="/DevelopmentControl.aspx">
+                  <input name="template" value="DevelopmentControlResults.tmplt"><input name="requestType" value="parseTemplate">
+                </form>
+                """,
+                "get:results": """
+                <table><tr><th>Reference</th><th>Location</th></tr><tr><td>26/00001</td><td>1 High Street AB1 2CD</td></tr></table>
+                <a rel="next" href="/DevelopmentControl.aspx?page=2">Next</a>
+                """,
+                "get:https://maps.example.gov.uk/DevelopmentControl.aspx?page=2": """
+                <table><tr><th>Reference</th><th>Location</th></tr><tr><td>26/00002</td><td>2 High Street AB1 2CE</td></tr></table>
+                """,
+            }
+        )
+        scraper = AstunPlanningScraper(LegacyFormsCouncilConfig("Example", "https://maps.example.gov.uk"), http_client=http)
+
+        applications = scraper.search("https://maps.example.gov.uk/DevelopmentControl.aspx", start_date=None, end_date=None, limit=None)
+
+        self.assertEqual([app.reference for app in applications], ["26/00001", "26/00002"])
+
+    def test_astun_selects_the_largest_available_page_size(self) -> None:
+        http = FakeLegacyFormsHttpClient(
+            {
+                "get": """
+                <form method="get" action="/DevelopmentControl.aspx">
+                  <input name="template" value="DevelopmentControlResults.tmplt"><input name="requestType" value="parseTemplate">
+                  <select name="pagerecs"><option value="10">10</option><option value="250">250</option><option value="500">500</option></select>
+                </form>
+                """,
+                "get:results": "<html><body></body></html>",
+            }
+        )
+        scraper = AstunPlanningScraper(LegacyFormsCouncilConfig("Example", "https://maps.example.gov.uk"), http_client=http)
+
+        scraper.search("https://maps.example.gov.uk/DevelopmentControl.aspx", start_date=None, end_date=None, limit=None)
+
+        self.assertEqual(http.gets[1][1]["pagerecs"], "500")
+
+    def test_enterprisestore_merges_a_linked_result_page(self) -> None:
+        http = FakeLegacyFormsHttpClient(
+            {
+                "get": '<form id="frmOnlinePlanningSearch"><input name="SearchFor"></form>',
+                "post": """
+                <a href="/ES/Presentation/Planning/OnlinePlanning/OnlinePlanningOverview?applicationNumber=26%2F00001">26/00001</a>
+                <a rel="next" href="/ES/Presentation/Planning/OnlinePlanning/OnlinePlanningSearchResults?page=2">Next</a>
+                """,
+                "get:https://planning.example.gov.uk/ES/Presentation/Planning/OnlinePlanning/OnlinePlanningSearchResults?page=2": """
+                <a href="/ES/Presentation/Planning/OnlinePlanning/OnlinePlanningOverview?applicationNumber=26%2F00002">26/00002</a>
+                """,
+            }
+        )
+        scraper = EnterpriseStorePlanningScraper(
+            LegacyFormsCouncilConfig("Example", "https://planning.example.gov.uk"),
+            http_client=http,
+        )
+
+        applications = scraper.search("https://planning.example.gov.uk/OnlinePlanningSearch", start_date=None, end_date=None, limit=None)
+
+        self.assertEqual([app.reference for app in applications], ["26/00001", "26/00002"])
+
+    def test_appsearchserv_merges_a_linked_result_page(self) -> None:
+        http = FakeLegacyFormsHttpClient(
+            {
+                "get": '<form name="AppSearchForm" action="/servlets/ApplicationSearchServlet" method="post"><input name="ReceivedDateFrom"></form>',
+                "post": """
+                <table><tr><th>Application number</th><th>Site location</th></tr><tr><td>26/00001</td><td>1 High Street AB1 2CD</td></tr></table>
+                <a rel="next" href="/servlets/ApplicationSearchServlet?page=2">Next</a>
+                """,
+                "get:https://planning.example.gov.uk/servlets/ApplicationSearchServlet?page=2": """
+                <table><tr><th>Application number</th><th>Site location</th></tr><tr><td>26/00002</td><td>2 High Street AB1 2CE</td></tr></table>
+                """,
+            }
+        )
+        scraper = AppSearchServPlanningScraper(
+            LegacyFormsCouncilConfig("Example", "https://planning.example.gov.uk"),
+            http_client=http,
+        )
+
+        applications = scraper.search("https://planning.example.gov.uk/servlets/ApplicationSearchServlet", start_date=None, end_date=None, limit=None)
+
+        self.assertEqual([app.reference for app in applications], ["26/00001", "26/00002"])
+
+    def test_html_list_raises_when_a_reported_total_exceeds_parsed_results(self) -> None:
+        rows = "".join(
+            f'<article><a href="/planning/application/26-{index:05d}">26/{index:05d}</a></article>'
+            for index in range(1, 51)
+        )
+        http = FakeLegacyFormsHttpClient({"get": f"<p>Showing 1-50 of 75</p>{rows}"})
+        scraper = HtmlListPlanningScraper(
+            LegacyFormsCouncilConfig("Example", "https://planning.example.gov.uk"),
+            http_client=http,
+        )
+
+        with self.assertRaises(PortalSearchCompletenessError):
+            scraper.search("https://planning.example.gov.uk/planning/results", start_date=None, end_date=None, limit=None)
 
     def test_html_list_parses_application_links(self) -> None:
         http = FakeLegacyFormsHttpClient(

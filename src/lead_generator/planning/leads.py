@@ -10,6 +10,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from email.utils import parsedate_to_datetime
+from hashlib import sha256
 from http.cookiejar import CookieJar
 from email.message import Message
 from importlib import resources
@@ -66,8 +67,13 @@ from lead_generator.planning.enrichment import (
     empty_enrichment_row,
     enrich_application_folder,
 )
+from lead_generator.planning.drawing_sources import is_existing_only_drawing_metadata
 from lead_generator.planning.models import PlanningApplication, PlanningDocument
-from lead_generator.planning.http import CouncilBrowserClient, monitor_council_requests
+from lead_generator.planning.http import (
+    CouncilBrowserClient,
+    CouncilFetchError,
+    monitor_council_requests,
+)
 from lead_generator.planning.parsing import clean_text
 from lead_generator.planning.scheduler import (
     PlatformAwareScheduler,
@@ -170,6 +176,7 @@ USER_AGENT = (
 PLANIT_PAGE_SIZE = 100
 PLANIT_MAX_PAGES = 100
 PLANIT_GATE_WAIT_TIMEOUT_SECONDS = 30.0
+PLANIT_GATE_WAIT_INTERVAL_SECONDS = 0.25
 DEFAULT_SEARCH_WORKER_COUNT = 4
 MAX_SEARCH_WORKER_COUNT = 8
 DEFAULT_PLATFORM_CONCURRENCY_LIMIT = 2
@@ -195,9 +202,11 @@ DOCUMENT_DOWNLOAD_DELAY_SECONDS = 0.0
 DOCUMENT_DOWNLOAD_RETRY_DELAY_SECONDS = 10.0
 DOCUMENT_DOWNLOAD_ATTEMPTS = 2
 DOCUMENT_DOWNLOAD_MAX_RETRY_DELAY_SECONDS = 15.0
+RATE_LIMIT_DEFAULT_RETRY_DELAY_SECONDS = 60.0
+MAX_ASSOCIATED_DOCUMENT_SOURCE_DEPTH = 2
 MAX_CONCURRENT_DOCUMENT_BATCHES = 2
 RATE_LIMIT_HTTP_CODES = {429, 503}
-MAX_RETRY_AFTER_SECONDS = 60.0
+MAX_RETRY_AFTER_SECONDS = 120.0
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 20.0
 REQUEST_THROTTLE_SECONDS = 0.25
 PLANIT_REQUEST_THROTTLE_SECONDS = 1.5
@@ -237,12 +246,6 @@ PLANIT_AUTHORITY_ALIASES = {
     "West Somerset": ("Somerset",),
     "Windsor and Maidenhead": ("Windsor",),
     "Wycombe": ("Buckinghamshire",),
-}
-
-PLANIT_FIRST_AUTHORITIES = {
-    "Birmingham",
-    "South Cambridgeshire",
-    "Surrey",
 }
 
 CURRENT_PORTAL_OVERRIDES = {
@@ -324,9 +327,146 @@ class CouncilTarget:
     link_test_ok: bool = False
 
 
+@dataclass(slots=True)
+class CouncilDiscoveryState:
+    target: CouncilTarget
+    primary_succeeded: bool = False
+    primary_error: str | None = None
+    reconciliation_succeeded: bool = False
+    reconciliation_error: str | None = None
+    primary_date_valid_count: int = 0
+    secondary_date_valid_count: int = 0
+    undated_count: int = 0
+    date_valid_references: set[str] = field(default_factory=set)
+
+
+def application_reference_key(application: PlanningApplication) -> str:
+    return (application.reference or "").strip()
+
+
+def application_is_in_date_range(
+    application: PlanningApplication,
+    start_date: date,
+    end_date: date,
+) -> bool:
+    received = _parse_iso_date(application.date_received)
+    return received is not None and start_date <= received <= end_date
+
+
+def _process_discovered_applications(
+    target: CouncilTarget,
+    applications: list[PlanningApplication],
+    source: str,
+    *,
+    state: CouncilDiscoveryState,
+    start_date: date,
+    end_date: date,
+    keywords: list[str],
+    user_geojson: dict[str, object],
+    total_application_references: set[str],
+    reserve_reference: Callable[[str], bool],
+    release_reference: Callable[[str], None],
+    prepare_output: Callable[[PlanningApplication, str], Callable[[], int]],
+    notify_output_saved: Callable[[PlanningApplication, str, int], None],
+    state_lock: threading.Lock | None = None,
+    log: LogCallback | None = None,
+    should_cancel: CancelCallback | None = None,
+) -> int:
+    source_date_valid_references: set[str] = set()
+    excluded_without_usable_reference = 0
+    excluded_without_usable_date = 0
+    matched_count = 0
+
+    def update_state(action: Callable[[], None]) -> None:
+        if state_lock is None:
+            action()
+            return
+        with state_lock:
+            action()
+
+    def reset_source_count() -> None:
+        if source == "primary":
+            state.primary_date_valid_count = 0
+        else:
+            state.secondary_date_valid_count = 0
+
+    update_state(reset_source_count)
+
+    for application in applications:
+        if should_cancel and should_cancel():
+            break
+        reference = application_reference_key(application)
+        if not reference:
+            excluded_without_usable_reference += 1
+            continue
+        if not application_is_in_date_range(application, start_date, end_date):
+            if _parse_iso_date(application.date_received) is None:
+                excluded_without_usable_date += 1
+            continue
+
+        if reference not in source_date_valid_references:
+            source_date_valid_references.add(reference)
+
+            def add_date_valid_reference() -> None:
+                if source == "primary":
+                    state.primary_date_valid_count += 1
+                else:
+                    state.secondary_date_valid_count += 1
+                state.date_valid_references.add(reference)
+                total_application_references.add(reference)
+
+            update_state(add_date_valid_reference)
+
+        if not application_matches(application, start_date, end_date, keywords):
+            continue
+        if not application_matches_search_area(application, user_geojson):
+            continue
+        if not reserve_reference(reference):
+            _log(log, f"{target.authority}: skipped duplicate reference {reference}")
+            continue
+
+        try:
+            commit_output = prepare_output(application, reference)
+            current = commit_output()
+        except Exception:
+            release_reference(reference)
+            raise
+
+        matched_count += 1
+        notify_output_saved(application, reference, current)
+
+    if excluded_without_usable_reference:
+        _log(
+            log,
+            f"{target.authority}: excluded {excluded_without_usable_reference} application(s) "
+            "without a usable application reference",
+        )
+    if excluded_without_usable_date:
+        update_state(
+            lambda: setattr(
+                state,
+                "undated_count",
+                state.undated_count + excluded_without_usable_date,
+            )
+        )
+        _log(
+            log,
+            f"{target.authority}: excluded {excluded_without_usable_date} application(s) "
+            "without a usable in-range received date",
+        )
+    date_valid_count = len(source_date_valid_references)
+    _log(
+        log,
+        f"{target.authority}: found {date_valid_count} applications in the date range",
+    )
+    _log(
+        log,
+        f"{target.authority}: {matched_count} applications matched keywords and location",
+    )
+    return date_valid_count
+
+
 def council_platform_key(target: CouncilTarget) -> str:
-    if target.authority in PLANIT_AUTHORITY_ALIASES or target.authority in PLANIT_FIRST_AUTHORITIES:
-        return "planit"
     authority = target.authority.casefold()
     portal = f"{target.scraper_type} {target.portal_family}".casefold()
     if authority in {"eastleigh", "wiltshire"}:
@@ -446,6 +586,43 @@ class DownloadedFile:
 class DocumentDownloadBatchResult:
     downloaded_count: int = 0
     transient_documents: list[PlanningDocument] = field(default_factory=list)
+    failures: list[DocumentDownloadFailure] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentDownloadFailure:
+    document: PlanningDocument
+    reason: str
+
+
+class DocumentDiscoveryTransientError(RuntimeError):
+    """A published document source could not be checked reliably."""
+
+    def __init__(self, source_url: str, reason: str) -> None:
+        self.source_url = source_url
+        self.reason = reason
+        super().__init__(f"{source_url}: {reason}")
+
+
+class _HostRateLimitDeferredError(RuntimeError):
+    """A first-pass request was deferred behind an active host cooldown."""
+
+    def __init__(self, url: str) -> None:
+        self.url = url
+        super().__init__(f"{url}: host rate-limit cooldown is active")
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentSourceFailure:
+    source_url: str
+    reason: str
+
+
+@dataclass(slots=True)
+class DocumentDiscoveryResult:
+    documents: list[PlanningDocument] = field(default_factory=list)
+    successful_sources: list[str] = field(default_factory=list)
+    failed_sources: list[DocumentSourceFailure] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -456,6 +633,10 @@ class DocumentDownloadJob:
     folder: Path
     row: dict[str, str]
     pending_documents: list[PlanningDocument] = field(default_factory=list)
+    processed_document_urls: set[str] = field(default_factory=set)
+    successful_document_sources: set[str] = field(default_factory=set)
+    document_source_failures: list[DocumentSourceFailure] = field(default_factory=list)
+    rediscovery_required: bool = True
     downloaded_count: int = 0
 
 
@@ -524,15 +705,23 @@ def discover_portal_applications_with_deadline(
         with activity_lock:
             last_activity_at = monotonic()
 
+    def attempt_cancellation_requested() -> bool:
+        return attempt_cancelled.is_set() or bool(should_cancel and should_cancel())
+
     def discover() -> None:
         try:
             with monitor_council_requests(
                 record_activity,
-                should_cancel=attempt_cancelled.is_set,
+                should_cancel=attempt_cancellation_requested,
             ):
                 outcome.put(
                     (
-                        discover_portal_applications(target, start_date, end_date),
+                        discover_portal_applications(
+                            target,
+                            start_date,
+                            end_date,
+                            should_cancel=attempt_cancellation_requested,
+                        ),
                         None,
                     )
                 )
@@ -624,7 +813,6 @@ def run_lead_search(
     document_jobs: list[DocumentDownloadJob] = []
     enrichment_jobs: list[EnrichmentJob] = []
     saved_references: set[str] = set()
-    total_applications = 0
     captured_documents = 0
     failed_councils: list[str] = []
     no_application_councils: list[str] = []
@@ -641,8 +829,12 @@ def run_lead_search(
     _progress(progress, completed, len(targets))
 
     lock = threading.Lock()
+    council_states = {
+        target.authority: CouncilDiscoveryState(target=target)
+        for target in targets
+    }
     completed_authorities: set[str] = set()
-    counted_authorities: set[str] = set()
+    total_application_references: set[str] = set()
     captured_document_references: set[str] = set()
     completed_document_references: set[str] = set()
     deferred_tasks: list[ScheduledTask[CouncilTarget]] = []
@@ -681,29 +873,119 @@ def run_lead_search(
             saved_references.add(reference)
         return True
 
+    def release_reference(reference: str) -> None:
+        with lock:
+            saved_references.discard(reference)
+
     def save_row(
         row: dict[str, str],
         enrichment_job: EnrichmentJob | None = None,
         document_job: DocumentDownloadJob | None = None,
-    ) -> None:
-        current = 0
+    ) -> int:
         with lock:
+            append_csv_row(csv_path, APPLICATION_CSV_FIELDS, row)
             rows.append(row)
             if document_job:
                 document_jobs.append(document_job)
             if enrichment_job:
                 enrichment_jobs.append(enrichment_job)
-            append_csv_row(csv_path, APPLICATION_CSV_FIELDS, row)
             current = len(rows)
-        _captured(captured, current)
+        return current
 
-    def add_total_applications(target: CouncilTarget, count: int) -> None:
-        nonlocal total_applications
-        with lock:
-            if target.authority in counted_authorities:
-                return
-            counted_authorities.add(target.authority)
-            total_applications += count
+    def prepare_discovered_application_output(
+        target: CouncilTarget,
+        application: PlanningApplication,
+        reference: str,
+    ) -> Callable[[], int]:
+        if config.download_application_files:
+            lead_folder = create_lead_folder(output_dir, target.authority, application)
+        else:
+            lead_folder = None
+        row = {
+            "Reference": reference,
+            "address": application.address or "",
+            "application link": application_link(application),
+            "proposal": application.description or "",
+            "date received": application.date_received or application.date_validated or "",
+            "council": target.authority,
+            **empty_enrichment_row(requested=config.download_application_files),
+        }
+        enrichment_job = None
+        if lead_folder is not None:
+            enrichment_job = EnrichmentJob(
+                reference=reference,
+                folder=lead_folder,
+                row=row,
+                applicant_name=application.applicant_name,
+                agent_name=application.agent_name,
+                site_address=application.address,
+            )
+        document_job = None
+        if lead_folder is not None:
+            document_job = DocumentDownloadJob(
+                reference=reference,
+                council=target.authority,
+                application=application,
+                folder=lead_folder,
+                row=row,
+            )
+
+        def commit_output() -> int:
+            return save_row(row, enrichment_job, document_job)
+
+        return commit_output
+
+    def notify_discovered_application_saved(
+        target: CouncilTarget,
+        application: PlanningApplication,
+        reference: str,
+        current: int,
+    ) -> None:
+        _captured(captured, current)
+        if config.download_application_files:
+            _log(
+                log,
+                f"{target.authority}: saved {reference} (documents queued)",
+            )
+        else:
+            _log(
+                log,
+                f"{target.authority}: saved {reference} "
+                "(file downloads not requested)",
+            )
+
+    def process_discovered_applications(
+        target: CouncilTarget,
+        applications: list[PlanningApplication],
+        source: str,
+    ) -> int:
+        return _process_discovered_applications(
+            target,
+            applications,
+            source,
+            state=council_states[target.authority],
+            start_date=config.start_date,
+            end_date=config.end_date,
+            keywords=config.keywords,
+            user_geojson=user_geojson,
+            total_application_references=total_application_references,
+            reserve_reference=reserve_reference,
+            release_reference=release_reference,
+            prepare_output=lambda application, reference: (
+                prepare_discovered_application_output(target, application, reference)
+            ),
+            notify_output_saved=lambda application, reference, current: (
+                notify_discovered_application_saved(
+                    target,
+                    application,
+                    reference,
+                    current,
+                )
+            ),
+            state_lock=lock,
+            log=log,
+            should_cancel=cancellation_requested,
+        )
 
     def add_captured_document_application(reference: str) -> None:
         nonlocal captured_documents
@@ -723,24 +1005,11 @@ def run_lead_search(
             current = documents_completed
         _document_progress(document_progress, current, total)
 
-    def add_no_application_council(target: CouncilTarget) -> None:
-        with lock:
-            if target.authority not in no_application_councils:
-                no_application_councils.append(target.authority)
-
     def save_failure(
         target: CouncilTarget,
         reason: str,
-        *,
-        no_applications_returned: bool = True,
-        fatal: bool = True,
     ) -> None:
-        nonlocal had_error
         with lock:
-            if fatal:
-                had_error = True
-            if fatal and no_applications_returned and target.authority not in failed_councils:
-                failed_councils.append(target.authority)
             append_csv_row(
                 failure_csv_path,
                 FAILURE_CSV_FIELDS,
@@ -805,67 +1074,15 @@ def run_lead_search(
                     log=log,
                     should_cancel=cancellation_requested,
                 )
-                add_total_applications(target, len(applications))
-                if not applications:
-                    add_no_application_council(target)
-                _log(log, f"{target.authority}: found {len(applications)} applications in the date range")
-                matched_count = 0
-                for application in applications:
-                    if cancellation_requested():
-                        break
-                    if not application_matches(application, config.start_date, config.end_date, config.keywords):
-                        continue
-                    if not application_matches_search_area(application, user_geojson):
-                        continue
-                    reference = application.reference or application.uid
-                    if not reserve_reference(reference):
-                        _log(log, f"{target.authority}: skipped duplicate reference {reference}")
-                        continue
-                    matched_count += 1
-                    if config.download_application_files:
-                        lead_folder = create_lead_folder(output_dir, target.authority, application)
-                    else:
-                        lead_folder = None
-                    row = {
-                        "Reference": reference,
-                        "address": application.address or "",
-                        "application link": application_link(application),
-                        "proposal": application.description or "",
-                        "date received": application.date_received or application.date_validated or "",
-                        "council": target.authority,
-                        **empty_enrichment_row(requested=config.download_application_files),
-                    }
-                    enrichment_job = None
-                    if lead_folder is not None:
-                        enrichment_job = EnrichmentJob(
-                            reference=reference,
-                            folder=lead_folder,
-                            row=row,
-                            applicant_name=application.applicant_name,
-                            agent_name=application.agent_name,
-                            site_address=application.address,
-                        )
-                    document_job = None
-                    if lead_folder is not None:
-                        document_job = DocumentDownloadJob(
-                            reference=reference,
-                            council=target.authority,
-                            application=application,
-                            folder=lead_folder,
-                            row=row,
-                        )
-                    save_row(row, enrichment_job, document_job)
-                    if config.download_application_files:
-                        _log(
-                            log,
-                            f"{target.authority}: saved {application.reference or application.uid} "
-                            "(documents queued)",
-                        )
-                    else:
-                        _log(log, f"{target.authority}: saved {application.reference or application.uid} (file downloads not requested)")
-                _log(log, f"{target.authority}: {matched_count} applications matched keywords and location")
+                process_discovered_applications(target, applications, source="primary")
+                with lock:
+                    state = council_states[target.authority]
+                    state.primary_succeeded = True
+                    state.primary_error = None
             except Exception as exc:  # pragma: no cover - live-site resilience
                 attempt_error = exc
+                with lock:
+                    council_states[target.authority].primary_error = str(exc)
 
             signal = search_failure_signal(attempt_error) if attempt_error else "success"
             affected_platform = (
@@ -900,24 +1117,19 @@ def run_lead_search(
                 continue
 
             if isinstance(attempt_error, CouncilSearchDegradedError):
+                reason = (
+                    "Responsive portal search issue after final retry: "
+                    f"{attempt_error}"
+                )
+                with lock:
+                    council_states[target.authority].primary_error = reason
                 _log(
                     log,
                     f"{target.authority}: portal responded but the final retry was unavailable: "
                     f"{attempt_error}",
                 )
-                save_failure(
-                    target,
-                    f"Responsive portal search issue after final retry: {attempt_error}",
-                    no_applications_returned=False,
-                    fatal=False,
-                )
             else:
                 _log(log, f"{target.authority}: final retry failed: {attempt_error}")
-                save_failure(
-                    target,
-                    str(attempt_error),
-                    no_applications_returned=not applications,
-                )
             mark_complete(target)
 
     def process_document_job(
@@ -929,36 +1141,88 @@ def run_lead_search(
         if cancellation_requested():
             return
         try:
-            if not job.pending_documents:
-                job.application = enrich_application_documents(job.application)
-                job.pending_documents = list(job.application.documents)
-            if not job.pending_documents:
-                _log(log, f"{job.reference}: no downloadable documents were listed")
-                mark_document_complete(job, total)
-                return
+            if job.rediscovery_required:
+                discovery = discover_application_documents(
+                    job.application,
+                    should_cancel=cancellation_requested,
+                    defer_rate_limit=not final_attempt,
+                )
+                job.successful_document_sources.update(discovery.successful_sources)
+                job.document_source_failures = list(discovery.failed_sources)
+                job.rediscovery_required = bool(job.document_source_failures)
 
-            result = _download_pdf_documents_once(
-                job.pending_documents,
-                job.folder,
-                log=lambda message: _log(log, f"{job.reference}: {message}"),
-                should_cancel=cancellation_requested,
-                defer_transient=not final_attempt,
-            )
-            job.downloaded_count += result.downloaded_count
-            if job.downloaded_count:
-                add_captured_document_application(job.reference)
-            if cancellation_requested():
-                return
-            job.pending_documents = result.transient_documents
-            if job.pending_documents and not final_attempt:
+                pending_urls = {
+                    normalize_url(document.url) for document in job.pending_documents
+                }
+                for document in discovery.documents:
+                    normalized_url = normalize_url(document.url)
+                    if (
+                        normalized_url in job.processed_document_urls
+                        or normalized_url in pending_urls
+                    ):
+                        continue
+                    pending_urls.add(normalized_url)
+                    job.pending_documents.append(document)
+
+            if not job.pending_documents and not job.rediscovery_required:
+                if job.successful_document_sources:
+                    _log(
+                        log,
+                        f"{job.reference}: no documents currently published by the council",
+                    )
+                else:
+                    _log(
+                        log,
+                        f"{job.reference}: no public document source was available",
+                    )
+
+            if job.pending_documents:
+                attempted_documents = list(job.pending_documents)
+                result = _download_pdf_documents_once(
+                    attempted_documents,
+                    job.folder,
+                    log=lambda message: _log(log, f"{job.reference}: {message}"),
+                    should_cancel=cancellation_requested,
+                    defer_transient=not final_attempt,
+                )
+                transient_urls = {
+                    normalize_url(document.url)
+                    for document in result.transient_documents
+                }
+                job.processed_document_urls.update(
+                    normalize_url(document.url)
+                    for document in attempted_documents
+                    if normalize_url(document.url) not in transient_urls
+                )
+                job.pending_documents = list(result.transient_documents)
+                job.downloaded_count += result.downloaded_count
+                if job.downloaded_count:
+                    add_captured_document_application(job.reference)
+                if cancellation_requested():
+                    return
+
+            needs_retry = bool(job.pending_documents) or job.rediscovery_required
+            if needs_retry and not final_attempt:
                 with lock:
                     deferred_document_jobs.append(job)
                 _log(
                     log,
-                    f"{job.reference}: deferred {len(job.pending_documents)} temporary "
-                    "document failure(s) until the end of the download queue",
+                    f"{job.reference}: document discovery deferred for final retry",
                 )
                 return
+            if final_attempt and job.rediscovery_required:
+                for failure in job.document_source_failures:
+                    _log(
+                        log,
+                        f"{job.reference}: unresolved document source {failure.source_url}: "
+                        f"{failure.reason}",
+                    )
+                _log(
+                    log,
+                    f"{job.reference}: partial document capture; one or more sources remain unavailable",
+                )
+        except DocumentDownloadCancelledError:
+            return
         except Exception as exc:  # pragma: no cover - live document portals vary
             if not final_attempt and not cancellation_requested():
                 with lock:
@@ -1056,6 +1320,97 @@ def run_lead_search(
         )
         run_search_phase(list(deferred_tasks), final_attempt=True)
 
+    if not cancelled:
+        for index, target in enumerate(targets, start=1):
+            if cancellation_requested():
+                break
+            _log(
+                log,
+                f"Reconciliation {index} of {len(targets)}: checking {target.authority}",
+            )
+            state = council_states[target.authority]
+            try:
+                secondary = discover_planit_reconciliation_applications(
+                    target,
+                    config.start_date,
+                    config.end_date,
+                    should_cancel=cancellation_requested,
+                )
+                before = len(state.date_valid_references)
+                secondary_valid = process_discovered_applications(
+                    target,
+                    secondary,
+                    source="PlanIt",
+                )
+                if cancellation_requested():
+                    _log(log, f"{target.authority}: reconciliation cancelled")
+                    break
+                added = len(state.date_valid_references) - before
+                state.reconciliation_succeeded = True
+                state.reconciliation_error = None
+                _log(
+                    log,
+                    f"{target.authority}: reconciliation primary={state.primary_date_valid_count} "
+                    f"secondary={secondary_valid} added={added}",
+                )
+            except CouncilSearchCancelledError:
+                cancelled = True
+                _log(log, f"{target.authority}: reconciliation cancelled")
+                break
+            except Exception as exc:  # pragma: no cover - live PlanIt failures vary
+                state.reconciliation_succeeded = False
+                state.reconciliation_error = str(exc)
+                reason = f"PlanIt reconciliation warning: {exc}"
+                _log(log, f"{target.authority}: {reason}")
+                if cancellation_requested():
+                    break
+
+    for state in council_states.values():
+        reconciliation_completed = (
+            state.reconciliation_succeeded
+            or state.reconciliation_error is not None
+        )
+        if not reconciliation_completed:
+            continue
+
+        if state.date_valid_references:
+            if state.primary_error:
+                save_failure(state.target, state.primary_error)
+            if state.reconciliation_error:
+                save_failure(
+                    state.target,
+                    f"PlanIt reconciliation warning: "
+                    f"{state.reconciliation_error}",
+                )
+            continue
+
+        any_source_succeeded = (
+            state.primary_succeeded or state.reconciliation_succeeded
+        )
+        if not any_source_succeeded:
+            failed_councils.append(state.target.authority)
+            had_error = True
+            primary_reason = state.primary_error or "Primary search did not complete"
+            reconciliation_reason = (
+                state.reconciliation_error
+                or "PlanIt reconciliation did not complete"
+            )
+            save_failure(
+                state.target,
+                f"Primary search failed: {primary_reason}; "
+                f"PlanIt reconciliation failed: {reconciliation_reason}",
+            )
+            continue
+
+        if state.primary_error:
+            save_failure(state.target, state.primary_error)
+        if state.reconciliation_error:
+            save_failure(
+                state.target,
+                f"PlanIt reconciliation warning: {state.reconciliation_error}",
+            )
+        no_application_councils.append(state.target.authority)
+
     if config.download_application_files:
         total_document_jobs = len(document_jobs)
         _document_progress(document_progress, 0, total_document_jobs)
@@ -1135,6 +1490,7 @@ def run_lead_search(
         completion = "Completed"
     _log(log, f"Finished. Saved {len(rows)} leads to {csv_path}")
     _log(log, f"Saved failed council log to {failure_csv_path}")
+    total_applications = len(total_application_references)
     result = LeadSearchResult(
         output_dir=output_dir,
         csv_path=csv_path,
@@ -1256,24 +1612,21 @@ GENERIC_DETAIL_MARKERS = (
 )
 
 
-def discover_portal_applications(target: CouncilTarget, start_date: date, end_date: date) -> list[PlanningApplication]:
-    if target.authority in PLANIT_AUTHORITY_ALIASES or target.authority in PLANIT_FIRST_AUTHORITIES:
-        planit_applications = discover_planit_fallback_applications(target, start_date, end_date)
-        if planit_applications:
-            return planit_applications
-
+def discover_portal_applications(
+    target: CouncilTarget,
+    start_date: date,
+    end_date: date,
+    *,
+    should_cancel: CancelCallback | None = None,
+) -> list[PlanningApplication]:
     try:
         discovery, scraper = _discover_portal_listing(target, start_date, end_date)
     except Exception as exc:
-        planit_applications = discover_planit_fallback_applications(target, start_date, end_date, portal_error=exc)
-        if planit_applications:
-            return planit_applications
         if _portal_error_proves_service_responded(exc):
             raise CouncilSearchDegradedError(str(exc)) from exc
         raise
     applications: list[PlanningApplication] = []
     seen: set[str] = set()
-    detail_fetch_failed = False
     try:
         for stub in discovery.applications:
             application = stub
@@ -1281,7 +1634,6 @@ def discover_portal_applications(target: CouncilTarget, start_date: date, end_da
                 try:
                     application = scraper.fetch_application(stub.uid, stub.url, include_documents=False)
                 except Exception as exc:
-                    detail_fetch_failed = True
                     stub.raw = {**(stub.raw or {}), "detail_fetch_error": str(exc)}
             application = with_portal_metadata(application, stub, target, discovery.source_url)
             key = application.reference or application.uid or application.url
@@ -1294,52 +1646,11 @@ def discover_portal_applications(target: CouncilTarget, start_date: date, end_da
                 if received is not None and (received < start_date or received > end_date):
                     continue
             applications.append(application)
-        if not applications or detail_fetch_failed:
-            planit_applications = discover_planit_fallback_applications(target, start_date, end_date)
-            if planit_applications:
-                return _merge_portal_and_planit_applications(applications, planit_applications)
         return applications
     finally:
         close = getattr(scraper, "close", None)
         if callable(close):
             close()
-
-
-def _merge_portal_and_planit_applications(
-    portal_applications: list[PlanningApplication],
-    planit_applications: list[PlanningApplication],
-) -> list[PlanningApplication]:
-    by_reference = {
-        (application.reference or application.uid).strip(): application
-        for application in portal_applications
-        if application.reference or application.uid
-    }
-    merged = list(portal_applications)
-    for fallback in planit_applications:
-        reference = (fallback.reference or fallback.uid).strip()
-        existing = by_reference.get(reference)
-        if existing is None:
-            by_reference[reference] = fallback
-            merged.append(fallback)
-            continue
-        for field in (
-            "address",
-            "description",
-            "status",
-            "decision",
-            "date_received",
-            "date_validated",
-            "postcode",
-        ):
-            if not getattr(existing, field) and getattr(fallback, field):
-                setattr(existing, field, getattr(fallback, field))
-        existing.raw = {
-            **(fallback.raw or {}),
-            **(existing.raw or {}),
-            "planit_supplemented": True,
-        }
-    return merged
-
 
 def _discover_portal_listing(target: CouncilTarget, start_date: date, end_date: date):
     last_error: Exception | None = None
@@ -1380,42 +1691,55 @@ def _portal_error_text(exc: Exception) -> str:
     return " | ".join(parts).casefold()
 
 
-def discover_planit_fallback_applications(
+def planit_authority_candidates(authority: str) -> tuple[str, ...]:
+    aliases = PLANIT_AUTHORITY_ALIASES.get(authority, ())
+    return (*aliases, authority)
+
+
+def discover_planit_reconciliation_applications(
     target: CouncilTarget,
     start_date: date,
     end_date: date,
     *,
-    portal_error: Exception | None = None,
+    should_cancel: CancelCallback | None = None,
 ) -> list[PlanningApplication]:
-    last_error: Exception | None = None
+    successful_query = False
+    errors: list[str] = []
     for authority in planit_authority_candidates(target.authority):
         try:
-            applications = discover_planit_applications(authority, start_date, end_date)
+            applications = discover_planit_applications(
+                authority,
+                start_date,
+                end_date,
+                should_cancel=should_cancel,
+            )
+        except CouncilSearchCancelledError:
+            raise
         except Exception as exc:
-            last_error = exc
+            errors.append(f"{authority}: {exc}")
             continue
-        if not applications:
-            continue
-        for application in applications:
-            application.authority = target.authority
-            application.raw = {
-                **(application.raw or {}),
-                "portal_family": target.portal_family,
-                "scraper_type": target.scraper_type,
-                "source": "planit_fallback",
-                "planit_authority": authority,
-            }
-            if portal_error:
-                application.raw["portal_fetch_error"] = str(portal_error)
-        return applications
-    if portal_error and last_error:
-        portal_error.add_note(f"Public planning metadata fallback also failed: {last_error}")
-    return []
+        successful_query = True
+        if applications:
+            return [_tag_planit_application(target, authority, application) for application in applications]
+    if successful_query:
+        return []
+    raise RuntimeError("; ".join(errors) or "PlanIt reconciliation did not complete")
 
 
-def planit_authority_candidates(authority: str) -> tuple[str, ...]:
-    aliases = PLANIT_AUTHORITY_ALIASES.get(authority, ())
-    return (*aliases, authority)
+def _tag_planit_application(
+    target: CouncilTarget,
+    planit_authority: str,
+    application: PlanningApplication,
+) -> PlanningApplication:
+    application.authority = target.authority
+    application.raw = {
+        **(application.raw or {}),
+        "portal_family": target.portal_family,
+        "scraper_type": target.scraper_type,
+        "source": "planit_reconciliation",
+        "planit_authority": planit_authority,
+    }
+    return application
 
 
 def planning_scraper_for_target(target: CouncilTarget) -> PlanningScraper:
@@ -1572,13 +1896,40 @@ def with_portal_metadata(
     return application
 
 
-def discover_planit_applications(authority: str, start_date: date, end_date: date) -> list[PlanningApplication]:
-    if not _PLANIT_CONCURRENCY_GATE.acquire(timeout=PLANIT_GATE_WAIT_TIMEOUT_SECONDS):
-        raise RuntimeError(
-            f"Timed out waiting {PLANIT_GATE_WAIT_TIMEOUT_SECONDS:.0f}s for the PlanIt request slot"
+def discover_planit_applications(
+    authority: str,
+    start_date: date,
+    end_date: date,
+    *,
+    should_cancel: CancelCallback | None = None,
+) -> list[PlanningApplication]:
+    if should_cancel and should_cancel():
+        raise CouncilSearchCancelledError(
+            f"Cancelled while searching public planning metadata for {authority}"
         )
+    gate_deadline = monotonic() + PLANIT_GATE_WAIT_TIMEOUT_SECONDS
+    while True:
+        remaining = gate_deadline - monotonic()
+        if remaining <= 0:
+            raise RuntimeError(
+                f"Timed out waiting {PLANIT_GATE_WAIT_TIMEOUT_SECONDS:.0f}s "
+                "for the PlanIt request slot"
+            )
+        if _PLANIT_CONCURRENCY_GATE.acquire(
+            timeout=min(PLANIT_GATE_WAIT_INTERVAL_SECONDS, remaining)
+        ):
+            break
+        if should_cancel and should_cancel():
+            raise CouncilSearchCancelledError(
+                f"Cancelled while waiting for the PlanIt request slot for {authority}"
+            )
     try:
-        return _discover_planit_applications_serial(authority, start_date, end_date)
+        return _discover_planit_applications_serial(
+            authority,
+            start_date,
+            end_date,
+            should_cancel=should_cancel,
+        )
     finally:
         _PLANIT_CONCURRENCY_GATE.release()
 
@@ -1587,9 +1938,13 @@ def _discover_planit_applications_serial(
     authority: str,
     start_date: date,
     end_date: date,
+    *,
+    should_cancel: CancelCallback | None = None,
 ) -> list[PlanningApplication]:
     records: list[dict[str, object]] = []
-    seen_pages: set[str] = set()
+    seen_pages: set[tuple[str, ...]] = set()
+    seen_references: set[str] = set()
+    expected_total: int | None = None
     page_size = PLANIT_PAGE_SIZE
     page = 1
     while True:
@@ -1601,17 +1956,91 @@ def _discover_planit_applications_serial(
             "page": str(page),
         }
         url = f"https://www.planit.org.uk/api/applics/json?{urlencode(params)}"
-        payload = _fetch_json_with_retry(url)
+        if should_cancel is None:
+            payload = _fetch_json_with_retry(url)
+        else:
+            payload = _fetch_json_with_retry(url, should_cancel=should_cancel)
         batch = payload.get("records", [])
-        if not isinstance(batch, list):
+        if not isinstance(batch, list) or not all(
+            isinstance(record, dict) for record in batch
+        ):
             raise RuntimeError("PlanIt returned an invalid records collection")
-        page_signature = json.dumps(batch, sort_keys=True, default=str)
+
+        advertised_total = "total" in payload and payload.get("total") not in (
+            None,
+            "",
+        )
+        page_total: int | None = None
+        if advertised_total:
+            raw_total = payload["total"]
+            if isinstance(raw_total, bool):
+                raise RuntimeError(f"PlanIt returned an invalid total for {authority}")
+            if isinstance(raw_total, int):
+                page_total = raw_total
+            elif isinstance(raw_total, str) and raw_total.strip().isdigit():
+                page_total = int(raw_total.strip())
+            else:
+                raise RuntimeError(f"PlanIt returned an invalid total for {authority}")
+            if page_total < 0:
+                raise RuntimeError(f"PlanIt returned an invalid total for {authority}")
+
+        if expected_total is None:
+            if page_total is not None:
+                expected_total = page_total
+        elif page_total is None:
+            raise RuntimeError(
+                f"PlanIt omitted the advertised total on page {page} for {authority}"
+            )
+        elif page_total != expected_total:
+            raise RuntimeError(
+                f"PlanIt changed the advertised total from {expected_total} "
+                f"to {page_total} on page {page} for {authority}"
+            )
+
+        page_references: list[str] = []
+        for record in batch:
+            reference = _planit_application_reference(record)
+            if not reference:
+                raise RuntimeError(
+                    f"PlanIt returned a record without a usable application reference "
+                    f"on page {page} for {authority}"
+                )
+            page_references.append(reference)
+
+        page_signature = tuple(page_references)
         if batch and page_signature in seen_pages:
             raise RuntimeError(f"PlanIt repeated pagination page {page} for {authority}")
-        seen_pages.add(page_signature)
-        records.extend(batch)
-        total = int(payload.get("total") or len(records))
-        if not batch or len(records) >= total:
+        if batch:
+            seen_pages.add(page_signature)
+
+        new_reference_count = 0
+        for record, reference in zip(batch, page_references):
+            if reference in seen_references:
+                continue
+            seen_references.add(reference)
+            records.append(record)
+            new_reference_count += 1
+
+        unique_count = len(seen_references)
+        if expected_total is not None and unique_count > expected_total:
+            raise RuntimeError(
+                f"PlanIt returned {unique_count} unique application references above "
+                f"the advertised total of {expected_total} for {authority}"
+            )
+        if expected_total is not None and unique_count == expected_total:
+            break
+        if not batch:
+            if expected_total is not None:
+                raise RuntimeError(
+                    f"PlanIt pagination ended at {unique_count} of "
+                    f"{expected_total} unique application references for {authority}"
+                )
+            break
+        if new_reference_count == 0:
+            raise RuntimeError(
+                f"PlanIt made no unique-reference progress on page {page} for {authority}"
+            )
+        if expected_total is None and len(batch) < page_size:
             break
         if page >= PLANIT_MAX_PAGES:
             raise RuntimeError(
@@ -1625,12 +2054,48 @@ def enrich_planit_application(application: PlanningApplication) -> PlanningAppli
     return enrich_application_documents(application)
 
 
-def enrich_application_documents(application: PlanningApplication) -> PlanningApplication:
-    documents: list[PlanningDocument] = list(application.documents)
-    seen: set[str] = {document.url for document in documents}
+def _record_document_source(
+    result: DocumentDiscoveryResult,
+    source_url: str,
+    fetch: Callable[[], list[PlanningDocument]],
+) -> list[PlanningDocument]:
+    try:
+        documents = fetch()
+    except DocumentDownloadCancelledError:
+        raise
+    except Exception as exc:
+        failed_url = (
+            exc.source_url
+            if isinstance(exc, DocumentDiscoveryTransientError)
+            else source_url
+        )
+        result.failed_sources.append(DocumentSourceFailure(failed_url, str(exc)))
+        return []
+    result.successful_sources.append(source_url)
+    return documents
+
+
+def discover_application_documents(
+    application: PlanningApplication,
+    *,
+    should_cancel: CancelCallback | None = None,
+    defer_rate_limit: bool = False,
+) -> DocumentDiscoveryResult:
+    result = DocumentDiscoveryResult()
+    seen: set[str] = set()
+
+    def merge(documents: Iterable[PlanningDocument]) -> None:
+        for document in documents:
+            normalized_url = normalize_url(document.url)
+            if normalized_url in seen:
+                continue
+            seen.add(normalized_url)
+            result.documents.append(document)
+
+    merge(application.documents)
 
     if (application.raw or {}).get("portal_family") == "agile":
-        try:
+        def fetch_agile_documents() -> list[PlanningDocument]:
             parts = urlsplit(application.url)
             path_parts = [part for part in parts.path.split("/") if part]
             slug = path_parts[0] if path_parts else ""
@@ -1643,50 +2108,79 @@ def enrich_application_documents(application: PlanningApplication) -> PlanningAp
             )
             for document in agile_documents:
                 document.source_url = application.url
-                if document.url not in seen:
-                    seen.add(document.url)
-                    documents.append(document)
-        except Exception:
-            pass
+            return agile_documents
+
+        merge(_record_document_source(result, application.url, fetch_agile_documents))
 
     civica_documents = fetch_civica_documents_from_raw(application.raw or {}, source_url=application.url)
-    for document in civica_documents:
-        if document.url not in seen:
-            seen.add(document.url)
-            documents.append(document)
+    merge(civica_documents)
     for docs_url in application_document_source_urls(application):
-        try:
-            fetched = fetch_planit_documents(docs_url)
-        except Exception:
-            continue
-        expanded: list[PlanningDocument] = []
+        fetched = _record_document_source(
+            result,
+            docs_url,
+            lambda docs_url=docs_url: fetch_planit_documents(
+                docs_url,
+                discovery_result=result,
+                should_cancel=should_cancel,
+                defer_rate_limit=defer_rate_limit,
+            ),
+        )
         for document in fetched:
             if "runthirdpartysearch" in document.url.casefold():
-                try:
-                    nested_documents = fetch_planit_documents(document.url)
-                except Exception:
-                    nested_documents = []
-                expanded.extend(nested_documents or [document])
+                nested_documents = _record_document_source(
+                    result,
+                    document.url,
+                    lambda document_url=document.url: fetch_planit_documents(
+                        document_url,
+                        discovery_result=result,
+                        should_cancel=should_cancel,
+                        defer_rate_limit=defer_rate_limit,
+                    ),
+                )
+                merge(nested_documents)
             else:
-                expanded.append(document)
-        for document in expanded:
-            if document.url in seen:
-                continue
-            seen.add(document.url)
-            documents.append(document)
+                merge([document])
 
-    usable_documents = [document for document in documents if _looks_like_downloadable_document(document)]
+    usable_documents = [
+        document for document in result.documents if _looks_like_downloadable_document(document)
+    ]
     if not usable_documents and (application.raw or {}).get("portal_family") == "tascomi":
-        try:
-            browser_documents = fetch_browser_document_list(application.url)
-        except Exception:
-            browser_documents = []
-        for document in browser_documents:
-            if document.url not in seen:
-                seen.add(document.url)
-                documents.append(document)
+        if (
+            defer_rate_limit
+            and _request_cooldown_remaining_seconds(application.url) > 0
+        ):
+            return result
+        browser_source = normalize_url(application.url)
+        successful_source_count = len(result.successful_sources)
+        browser_documents = _record_document_source(
+            result,
+            application.url,
+            lambda: fetch_browser_document_list(application.url),
+        )
+        browser_succeeded = len(result.successful_sources) > successful_source_count
+        if browser_succeeded:
+            result.failed_sources = [
+                failure
+                for failure in result.failed_sources
+                if normalize_url(failure.source_url) != browser_source
+            ]
+        merge(browser_documents)
 
-    application.documents = documents
+    return result
+
+
+def enrich_application_documents(application: PlanningApplication) -> PlanningApplication:
+    result = discover_application_documents(application)
+    application.documents = result.documents
+    if result.failed_sources and not result.successful_sources and not result.documents:
+        failures = "; ".join(
+            f"{failure.source_url}: {failure.reason}" for failure in result.failed_sources
+        )
+        raise DocumentDiscoveryTransientError(
+            result.failed_sources[0].source_url,
+            failures,
+        )
+
     return application
 
 
@@ -1709,15 +2203,22 @@ def application_document_source_urls(application: PlanningApplication) -> list[s
     raw = application.raw or {}
     portal_family = str(raw.get("portal_family") or "").casefold()
     reference = application.reference or application.uid
+    authority = application.authority.casefold()
+    if authority == "camden" and reference:
+        add(
+            "https://camdocs.camden.gov.uk/CMWebDrawer/PlanRec?"
+            + urlencode({"q": f'recContainer:"{reference}"'}),
+            allow_listing=True,
+        )
+    if authority == "exeter" and reference:
+        add(
+            "https://exeter.gov.uk/planning-services/permissions-and-applications/"
+            "related-documents?" + urlencode({"appref": reference}),
+            allow_listing=True,
+        )
     if portal_family == "bath_planning_api" and reference:
         parts = urlsplit(application.url)
         add(urlunsplit((parts.scheme, parts.netloc, f"/planningdocuments={quote(reference, safe='')}", "", "")), allow_listing=True)
-    if portal_family == "socrata" and application.authority.casefold() == "camden" and application.uid:
-        add(
-            "https://planningrecords.camden.gov.uk/NECSWS/Redirection/redirect.aspx?"
-            + urlencode({"linkid": "EXDC", "PARAM0": application.uid}),
-            allow_listing=True,
-        )
     add(raw.get("docs_url"), allow_listing=True)
     for value in (raw.get("portal_url"), application.url, raw.get("source_url"), application.source_url):
         derived = document_source_url_from_application_url(str(value)) if value else None
@@ -1760,6 +2261,12 @@ def _looks_like_listing_url(url: str) -> bool:
     path = parts.path.casefold().rstrip("/")
     if "applicationdetails.do" in path:
         return False
+    query_items = {
+        name.casefold(): value.casefold()
+        for name, value in parse_qsl(parts.query, keep_blank_values=True)
+    }
+    if path.endswith("/index.html") and query_items.get("fa") == "search":
+        return True
     if any(
         marker in lowered
         for marker in (
@@ -1777,8 +2284,35 @@ def _looks_like_listing_url(url: str) -> bool:
     return path.endswith("/search") or path.endswith("/search/advanced")
 
 
-def fetch_planit_documents(docs_url: str) -> list[PlanningDocument]:
-    text, page_url, opener = _fetch_html_document_page(docs_url, timeout=45)
+def fetch_planit_documents(
+    docs_url: str,
+    *,
+    follow_associated: bool = True,
+    discovery_result: DocumentDiscoveryResult | None = None,
+    should_cancel: CancelCallback | None = None,
+    defer_rate_limit: bool = False,
+    _associated_depth: int = 0,
+    _visited_sources: set[str] | None = None,
+) -> list[PlanningDocument]:
+    visited_sources = _visited_sources if _visited_sources is not None else set()
+    normalized_docs_url = normalize_url(docs_url)
+    if normalized_docs_url in visited_sources:
+        return []
+    visited_sources.add(normalized_docs_url)
+    if should_cancel is None:
+        text, page_url, opener = _fetch_html_document_page(
+            docs_url,
+            timeout=45,
+            defer_rate_limit=defer_rate_limit,
+        )
+    else:
+        text, page_url, opener = _fetch_html_document_page(
+            docs_url,
+            timeout=45,
+            should_cancel=should_cancel,
+            defer_rate_limit=defer_rate_limit,
+        )
+    visited_sources.add(normalize_url(page_url))
     document = html.fromstring(text)
     documents: list[PlanningDocument] = []
     seen: set[str] = set()
@@ -1788,7 +2322,17 @@ def fetch_planit_documents(docs_url: str) -> list[PlanningDocument]:
             continue
         seen.add(absolute_url)
         documents.append(PlanningDocument(title=title, url=normalize_url(absolute_url), source_url=page_url))
-    for publisher_document in fetch_publisher_document_list(text, page_url, opener):
+    publisher_documents = _fetch_optional_document_source(
+        lambda: fetch_publisher_document_list(
+            text,
+            page_url,
+            opener,
+            should_cancel=should_cancel,
+            defer_rate_limit=defer_rate_limit,
+        ),
+        discovery_result,
+    )
+    for publisher_document in publisher_documents:
         if publisher_document.url in seen:
             continue
         seen.add(publisher_document.url)
@@ -1798,27 +2342,143 @@ def fetch_planit_documents(docs_url: str) -> list[PlanningDocument]:
             continue
         seen.add(atrium_document.url)
         documents.append(atrium_document)
-    for enterprise_document in fetch_enterprise_document_list(text, page_url, opener):
+    enterprise_documents = _fetch_optional_document_source(
+        lambda: fetch_enterprise_document_list(
+            text,
+            page_url,
+            opener,
+            should_cancel=should_cancel,
+            defer_rate_limit=defer_rate_limit,
+        ),
+        discovery_result,
+    )
+    for enterprise_document in enterprise_documents:
         if enterprise_document.url in seen:
             continue
         seen.add(enterprise_document.url)
         documents.append(enterprise_document)
-    for arcus_document in fetch_arcus_salesforce_document_list(text, page_url, opener):
-        if arcus_document.url in seen:
-            continue
-        seen.add(arcus_document.url)
-        documents.append(arcus_document)
-    for arcus_document in fetch_arcus_public_register_file_list(text, page_url, opener):
-        if arcus_document.url in seen:
-            continue
-        seen.add(arcus_document.url)
-        documents.append(arcus_document)
-    for arcus_document in fetch_arcus_files_public_document_list(text, page_url, opener):
-        if arcus_document.url in seen:
-            continue
-        seen.add(arcus_document.url)
-        documents.append(arcus_document)
+    for fetch_arcus_documents in _arcus_document_source_fetchers(text, page_url):
+        arcus_documents = _fetch_optional_document_source(
+            lambda fetch=fetch_arcus_documents: fetch(
+                text,
+                page_url,
+                opener,
+                should_cancel=should_cancel,
+                defer_rate_limit=defer_rate_limit,
+            ),
+            discovery_result,
+        )
+        for arcus_document in arcus_documents:
+            if arcus_document.url in seen:
+                continue
+            seen.add(arcus_document.url)
+            documents.append(arcus_document)
+    if follow_associated and _associated_depth < MAX_ASSOCIATED_DOCUMENT_SOURCE_DEPTH:
+        for associated_url in _associated_document_source_urls(text, page_url):
+            if normalize_url(associated_url) in visited_sources:
+                continue
+            try:
+                associated_documents = fetch_planit_documents(
+                    associated_url,
+                    follow_associated=True,
+                    discovery_result=discovery_result,
+                    should_cancel=should_cancel,
+                    defer_rate_limit=defer_rate_limit,
+                    _associated_depth=_associated_depth + 1,
+                    _visited_sources=visited_sources,
+                )
+            except DocumentDownloadCancelledError:
+                raise
+            except Exception as exc:
+                if discovery_result is None:
+                    raise
+                discovery_result.failed_sources.append(
+                    DocumentSourceFailure(associated_url, str(exc))
+                )
+                continue
+            if discovery_result is not None and associated_url not in discovery_result.successful_sources:
+                discovery_result.successful_sources.append(associated_url)
+            for associated_document in associated_documents:
+                if associated_document.url in seen:
+                    continue
+                seen.add(associated_document.url)
+                documents.append(associated_document)
     return documents
+
+
+def _arcus_document_source_fetchers(
+    text: str,
+    page_url: str,
+) -> tuple[Callable[[str, str, object], list[PlanningDocument]], ...]:
+    lowered_text = text.casefold()
+    explicit_sources = (
+        (
+            ("arc_content_version_viewer", "lc_arc_files_viewer"),
+            fetch_arcus_salesforce_document_list,
+        ),
+        (("pr_fileslistcont",), fetch_arcus_public_register_file_list),
+        (
+            ("markup://arcshared:filespublic", "arcshared.filespubliccont"),
+            fetch_arcus_files_public_document_list,
+        ),
+    )
+    advertised = [
+        (min(lowered_text.find(marker) for marker in markers if marker in lowered_text), fetcher)
+        for markers, fetcher in explicit_sources
+        if any(marker in lowered_text for marker in markers)
+    ]
+    if advertised:
+        return (min(advertised, key=lambda item: item[0])[1],)
+    path = urlsplit(page_url).path.casefold()
+    context = _salesforce_aura_context(text) or {}
+    if "/s/detail/" in path and context.get("app") == "siteforce:communityApp":
+        return (fetch_arcus_public_register_file_list,)
+    if "/s/papplication/" in path:
+        return (fetch_arcus_salesforce_document_list,)
+    if "/s/planning-application/" in path:
+        return (fetch_arcus_files_public_document_list,)
+    return ()
+
+
+def _associated_document_source_urls(html_text: str, page_url: str) -> list[str]:
+    document = html.fromstring(html_text)
+    urls: list[str] = []
+    for anchor in document.xpath("//a[@href]"):
+        if _is_page_chrome_link(anchor):
+            continue
+        label = (clean_text(" ".join(anchor.xpath(".//text()"))) or "").casefold()
+        if not (
+            _is_associated_document_source_label(label)
+            or any(
+                marker in label
+                for marker in (
+                    "view related documents",
+                    "documents for this application",
+                    "plans & documents",
+                    "plans and documents",
+                )
+            )
+        ):
+            continue
+        url = normalize_url(urljoin(page_url, anchor.get("href") or ""))
+        if url and url != normalize_url(page_url) and url not in urls:
+            urls.append(url)
+    return urls
+
+
+def _fetch_optional_document_source(
+    fetch: Callable[[], list[PlanningDocument]],
+    discovery_result: DocumentDiscoveryResult | None,
+) -> list[PlanningDocument]:
+    try:
+        return fetch()
+    except DocumentDiscoveryTransientError as exc:
+        if discovery_result is None:
+            raise
+        discovery_result.failed_sources.append(
+            DocumentSourceFailure(exc.source_url, str(exc))
+        )
+        return []
 
 
 def fetch_browser_document_list(page_url: str) -> list[PlanningDocument]:
@@ -1970,6 +2630,18 @@ def _download_pdf_documents_once(
     defer_transient: bool = True,
 ) -> DocumentDownloadBatchResult:
     result = DocumentDownloadBatchResult()
+    ready_documents: list[tuple[int, PlanningDocument]] = []
+    for index, document in enumerate(list(documents), start=1):
+        if not _looks_like_downloadable_document(document):
+            _log(log, f"Skipped excluded document link: {document.title}")
+            continue
+        if defer_transient and _document_has_active_rate_limit_cooldown(document):
+            result.transient_documents.append(document)
+            continue
+        ready_documents.append((index, document))
+    if not ready_documents:
+        return result
+
     blocked_hosts: set[str] = set()
     browser: CouncilBrowserClient | None = None
     browser_source_url: str | None = None
@@ -1979,12 +2651,34 @@ def _download_pdf_documents_once(
     def download_one(index: int, document: PlanningDocument) -> None:
         nonlocal browser, browser_source_url
         if _requires_browser_download(document):
+            request_urls_by_host: dict[str, str] = {}
+            for request_url in (document.source_url, document.url):
+                if not request_url:
+                    continue
+                request_urls_by_host.setdefault(
+                    urlsplit(request_url).netloc.casefold(),
+                    request_url,
+                )
+            for request_url in request_urls_by_host.values():
+                _throttle_request(
+                    request_url,
+                    should_cancel=should_cancel,
+                    defer_rate_limit=defer_transient,
+                )
             if browser is None:
                 browser = CouncilBrowserClient(timeout_seconds=60)
             if document.source_url and browser_source_url != document.source_url:
-                browser.get(document.source_url)
+                try:
+                    browser.get(document.source_url)
+                except CouncilFetchError as exc:
+                    exc.url = document.source_url
+                    raise
                 browser_source_url = document.source_url
-            response = browser.get_bytes(document.url)
+            try:
+                response = browser.get_bytes(document.url)
+            except CouncilFetchError as exc:
+                exc.url = document.url
+                raise
             downloaded_file = DownloadedFile(
                 payload=response.body,
                 final_url=response.url,
@@ -1996,7 +2690,13 @@ def _download_pdf_documents_once(
                 opener=opener,
                 source_cache=source_cache,
                 should_cancel=should_cancel,
+                defer_rate_limit=defer_transient,
             )
+        existing_path = _find_identical_payload(destination, downloaded_file.payload)
+        if existing_path is not None:
+            result.downloaded_count += 1
+            _log(log, f"Already captured identical document: {existing_path.name}")
+            return
         filename = document_filename(document, downloaded_file, fallback=f"document-{index}")
         path = _unique_path(destination / filename)
         path.write_bytes(downloaded_file.payload)
@@ -2006,17 +2706,25 @@ def _download_pdf_documents_once(
 
     with _DOCUMENT_DOWNLOAD_GATE:
         try:
-            for index, document in enumerate(documents, start=1):
+            for index, document in ready_documents:
                 if should_cancel and should_cancel():
                     break
-                if not _looks_like_downloadable_document(document):
-                    _log(log, f"Skipped excluded document link: {document.title}")
+                if defer_transient and _document_has_active_rate_limit_cooldown(
+                    document
+                ):
+                    result.transient_documents.append(document)
                     continue
                 document_host = urlsplit(document.source_url or document.url).netloc.casefold()
                 if document_host and document_host in blocked_hosts:
                     if defer_transient:
                         result.transient_documents.append(document)
                     else:
+                        result.failures.append(
+                            DocumentDownloadFailure(
+                                document,
+                                "portal remained unavailable",
+                            )
+                        )
                         _log(
                             log,
                             f"Could not download {document.title}: portal remained unavailable",
@@ -2027,19 +2735,32 @@ def _download_pdf_documents_once(
                 except Exception as exc:  # pragma: no cover - live network failures vary
                     if isinstance(exc, DocumentDownloadCancelledError):
                         break
+                    browser_status = _council_fetch_http_status(exc)
+                    error_url = str(getattr(exc, "url", "") or "")
+                    if browser_status == 429:
+                        _set_request_cooldown(
+                            error_url or document.url,
+                            RATE_LIMIT_DEFAULT_RETRY_DELAY_SECONDS,
+                        )
                     if _is_transient_document_error(exc):
-                        error_url = str(getattr(exc, "url", "") or "")
                         error_host = urlsplit(error_url).netloc.casefold()
-                        blocked_hosts.update(host for host in (document_host, error_host) if host)
+                        if not (isinstance(exc, HTTPError) and exc.code == 404):
+                            blocked_hosts.update(
+                                host for host in (document_host, error_host) if host
+                            )
                         if defer_transient:
                             result.transient_documents.append(document)
                             continue
                     if isinstance(exc, HTTPError) and exc.code == 404:
+                        reason = "HTTP 404"
                         _log(log, f"Skipped unavailable document link: {document.title}")
                     elif isinstance(exc, HTTPError):
+                        reason = f"HTTP {exc.code}"
                         _log(log, f"Could not download {document.title}: HTTP {exc.code}")
                     else:
+                        reason = str(exc) or type(exc).__name__
                         _log(log, f"Could not download {document.title}: {exc}")
+                    result.failures.append(DocumentDownloadFailure(document, reason))
         finally:
             if browser is not None:
                 browser.close()
@@ -2048,10 +2769,26 @@ def _download_pdf_documents_once(
 
 def _is_transient_document_error(exc: Exception) -> bool:
     if isinstance(exc, HTTPError):
-        return exc.code in {403, 408, 425, 429, 500, 502, 503, 504}
+        return exc.code in {403, 404, 408, 425, 429, 500, 502, 503, 504}
     if isinstance(exc, ValueError):
         return False
     return True
+
+
+def _council_fetch_http_status(exc: Exception) -> int | None:
+    if not isinstance(exc, CouncilFetchError):
+        return None
+    match = re.search(r"\bHTTP\s+(\d{3})\b", str(exc), flags=re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def _document_has_active_rate_limit_cooldown(
+    document: PlanningDocument,
+) -> bool:
+    urls = [document.url]
+    if _requires_browser_download(document) and document.source_url:
+        urls.insert(0, document.source_url)
+    return any(_request_cooldown_remaining_seconds(url) > 0 for url in urls)
 
 
 def _wait_for_document_retry_cooldown(
@@ -2160,12 +2897,14 @@ def download_document_file(
     opener=None,
     source_cache: dict[str, list[PlanningDocument]] | None = None,
     should_cancel: CancelCallback | None = None,
+    defer_rate_limit: bool = False,
 ) -> DownloadedFile:
     return _download_document_file(
         document,
         opener=opener,
         source_cache=source_cache,
         should_cancel=should_cancel,
+        defer_rate_limit=defer_rate_limit,
     )
 
 
@@ -2179,21 +2918,68 @@ def _download_document_file(
     opener=None,
     source_cache: dict[str, list[PlanningDocument]] | None = None,
     should_cancel: CancelCallback | None = None,
+    defer_rate_limit: bool = False,
 ) -> DownloadedFile:
     last_error: Exception | None = None
     opener = opener or _build_document_opener()
     verify_tls = True
     tls_compat = False
-    source_candidates: list[str] = []
-    if document.source_url:
-        source_candidates = source_document_candidates(
-            document,
-            opener,
-            cache=source_cache,
-        )
-    pending = deque([*source_candidates, *document_download_candidates(document.url)])
+    direct_candidates = (
+        []
+        if document.source_url and _is_session_bound_document_url(document.url)
+        else document_download_candidates(document.url)
+    )
+    pending = deque(direct_candidates)
+    source_discovery_attempted = False
     seen: set[str] = set()
-    while pending:
+    waited_cooldown_through: float | None = None
+
+    def replace_opener_for_tls(exc: Exception) -> bool:
+        nonlocal opener, verify_tls, tls_compat
+        if not tls_compat and _is_tls_compatibility_error(exc):
+            tls_compat = True
+        elif verify_tls and _is_tls_certificate_error(exc):
+            verify_tls = False
+        else:
+            return False
+        opener = _build_document_opener(
+            verify_tls=verify_tls,
+            tls_compat=tls_compat,
+        )
+        if source_cache is not None and document.source_url:
+            source_cache.pop(document.source_url, None)
+        return True
+
+    while pending or (document.source_url and not source_discovery_attempted):
+        if not pending:
+            source_discovery_attempted = True
+            try:
+                if should_cancel is None:
+                    discovered_candidates = source_document_candidates(
+                        document,
+                        opener,
+                        cache=source_cache,
+                        defer_rate_limit=defer_rate_limit,
+                    )
+                else:
+                    discovered_candidates = source_document_candidates(
+                        document,
+                        opener,
+                        cache=source_cache,
+                        should_cancel=should_cancel,
+                        defer_rate_limit=defer_rate_limit,
+                    )
+                pending.extend(discovered_candidates)
+            except Exception as exc:
+                last_error = exc
+                if replace_opener_for_tls(exc):
+                    source_discovery_attempted = False
+                    continue
+                raise
+            seen.difference_update(direct_candidates)
+            pending.extend(direct_candidates)
+            if not pending:
+                break
         url = pending.popleft()
         if url in seen:
             continue
@@ -2206,7 +2992,13 @@ def _download_document_file(
             if should_cancel and should_cancel():
                 raise DocumentDownloadCancelledError("Document download cancelled")
             try:
-                _throttle_request(url)
+                _throttle_request(
+                    url,
+                    should_cancel=should_cancel,
+                    ignore_cooldown_through=waited_cooldown_through,
+                    defer_rate_limit=defer_rate_limit,
+                )
+                waited_cooldown_through = None
                 with opener.open(request, timeout=30) as response:
                     payload = response.read()
                     content_type = response.headers.get("Content-Type", "").lower()
@@ -2230,35 +3022,35 @@ def _download_document_file(
                 last_error = exc
                 if exc.code == 404:
                     break
-                if exc.code not in RATE_LIMIT_HTTP_CODES or attempt == DOCUMENT_DOWNLOAD_ATTEMPTS - 1:
+                if exc.code not in RATE_LIMIT_HTTP_CODES:
                     raise
-                delay = min(
-                    _retry_delay_seconds(exc, min(5.0 * (2**attempt), 45.0)),
-                    DOCUMENT_DOWNLOAD_MAX_RETRY_DELAY_SECONDS,
+                delay = _rate_limit_aware_retry_delay_seconds(
+                    exc,
+                    min(5.0 * (2**attempt), 45.0),
+                    generic_max_seconds=DOCUMENT_DOWNLOAD_MAX_RETRY_DELAY_SECONDS,
                 )
-                _set_request_cooldown(url, delay)
+                cooldown_deadline = None
+                if exc.code == 429:
+                    cooldown_deadline = _set_request_cooldown(url, delay)
+                    if defer_rate_limit:
+                        raise
+                if attempt == DOCUMENT_DOWNLOAD_ATTEMPTS - 1:
+                    raise
                 if not _wait_for_cancelable_delay(delay, should_cancel):
-                    _clear_request_cooldown(url)
                     raise DocumentDownloadCancelledError("Document download cancelled")
-                _clear_request_cooldown(url)
+                waited_cooldown_through = cooldown_deadline
                 _skip_next_throttle(url)
+            except _HostRateLimitDeferredError:
+                raise
             except Exception as exc:
                 last_error = exc
-                if not tls_compat and _is_tls_compatibility_error(exc):
-                    tls_compat = True
-                    opener = _build_document_opener(tls_compat=True)
-                    if document.source_url:
-                        pending.extendleft(reversed(source_document_candidates(document, opener)))
-                    seen.discard(url)
-                    pending.appendleft(url)
-                    break
-                if verify_tls and _is_tls_certificate_error(exc):
-                    verify_tls = False
-                    opener = _build_document_opener(verify_tls=False)
-                    if document.source_url:
-                        pending.extendleft(reversed(source_document_candidates(document, opener)))
-                    seen.discard(url)
-                    pending.appendleft(url)
+                if replace_opener_for_tls(exc):
+                    if document.source_url and _is_session_bound_document_url(url):
+                        pending.clear()
+                        source_discovery_attempted = False
+                    else:
+                        seen.discard(url)
+                        pending.appendleft(url)
                     break
                 break
     raise last_error or RuntimeError(f"Could not download {document.url}")
@@ -2307,25 +3099,34 @@ def source_document_candidates(
     opener,
     *,
     cache: dict[str, list[PlanningDocument]] | None = None,
+    should_cancel: CancelCallback | None = None,
+    defer_rate_limit: bool = False,
 ) -> list[str]:
     if not document.source_url:
         return []
     source_url = document.source_url
     candidates: list[PlanningDocument]
-    if cache is not None and source_url in cache:
-        candidates = cache[source_url]
+    cached_candidates = cache.get(source_url) if cache is not None else None
+    if cached_candidates is not None and not any(
+        _is_session_bound_document_url(candidate.url)
+        for candidate in cached_candidates
+    ):
+        candidates = cached_candidates
     else:
         try:
-            text, page_url = _fetch_html_with_portal_session(source_url, opener, timeout=30)
+            text, page_url = _fetch_html_with_portal_session(
+                source_url,
+                opener,
+                timeout=30,
+                should_cancel=should_cancel,
+                defer_rate_limit=defer_rate_limit,
+            )
+        except DocumentDownloadCancelledError:
+            raise
         except Exception as exc:
-            if not _is_tls_certificate_error(exc):
-                return []
-            try:
-                fallback_opener = _build_document_opener(verify_tls=False)
-                text, page_url = _fetch_html_with_portal_session(source_url, fallback_opener, timeout=30)
-                opener = fallback_opener
-            except Exception:
-                return []
+            if _is_tls_certificate_error(exc) or _is_tls_compatibility_error(exc):
+                raise
+            return []
         candidates = []
         try:
             page = html.fromstring(text)
@@ -2336,24 +3137,91 @@ def source_document_candidates(
                 PlanningDocument(title=title, url=normalize_url(urljoin(page_url, href)), source_url=page_url)
                 for href, title in iter_document_links(page, page_url)
             )
-        candidates.extend(fetch_publisher_document_list(text, page_url, opener))
+        candidates.extend(
+            _fetch_isolated_document_fallback(
+                lambda: fetch_publisher_document_list(
+                    text,
+                    page_url,
+                    opener,
+                    should_cancel=should_cancel,
+                    defer_rate_limit=defer_rate_limit,
+                )
+            )
+        )
         candidates.extend(fetch_atrium_document_list(text, page_url))
-        candidates.extend(fetch_enterprise_document_list(text, page_url, opener))
-        candidates.extend(fetch_arcus_salesforce_document_list(text, page_url, opener))
-        candidates.extend(fetch_arcus_public_register_file_list(text, page_url, opener))
-        candidates.extend(fetch_arcus_files_public_document_list(text, page_url, opener))
+        candidates.extend(
+            _fetch_isolated_document_fallback(
+                lambda: fetch_enterprise_document_list(
+                    text,
+                    page_url,
+                    opener,
+                    should_cancel=should_cancel,
+                    defer_rate_limit=defer_rate_limit,
+                )
+            )
+        )
+        for fetch_arcus_documents in _arcus_document_source_fetchers(text, page_url):
+            candidates.extend(
+                _fetch_isolated_document_fallback(
+                    lambda fetch=fetch_arcus_documents: fetch(
+                        text,
+                        page_url,
+                        opener,
+                        should_cancel=should_cancel,
+                        defer_rate_limit=defer_rate_limit,
+                    )
+                )
+            )
         if cache is not None:
-            cache[source_url] = candidates
-    wanted = _comparable_title(document.title)
-    matching = [
-        candidate.url
+            if any(
+                _is_session_bound_document_url(candidate.url)
+                for candidate in candidates
+            ):
+                cache.pop(source_url, None)
+            else:
+                cache[source_url] = candidates
+    wanted = _document_identity(document)
+    generic_title = _is_generic_document_title(document.title)
+    identified_candidates = [
+        (candidate.url, identity)
         for candidate in candidates
-        if not wanted
-        or _comparable_title(candidate.title) == wanted
-        or wanted in _comparable_title(candidate.title)
-        or _comparable_title(candidate.title) in wanted
+        if (identity := _document_identity(candidate))
     ]
-    return list(dict.fromkeys(matching))
+    exact_matches = list(
+        dict.fromkeys(
+            url for url, identity in identified_candidates if identity == wanted
+        )
+    )
+    if exact_matches:
+        return exact_matches
+    if not wanted or generic_title:
+        return []
+    fuzzy_matches = list(
+        dict.fromkeys(
+            url
+            for url, identity in identified_candidates
+            if wanted in identity or identity in wanted
+        )
+    )
+    return fuzzy_matches if len(fuzzy_matches) == 1 else []
+
+
+def _is_session_bound_document_url(url: str) -> bool:
+    path = urlsplit(url).path.casefold()
+    return "/publisher/docs/" in path or "/document/download" in path
+
+
+def _fetch_isolated_document_fallback(
+    fetch: Callable[[], list[PlanningDocument]],
+) -> list[PlanningDocument]:
+    try:
+        return fetch()
+    except DocumentDownloadCancelledError:
+        raise
+    except Exception as exc:
+        if _is_tls_certificate_error(exc) or _is_tls_compatibility_error(exc):
+            raise
+        return []
 
 
 def document_download_candidates(url: str) -> list[str]:
@@ -2391,36 +3259,67 @@ def document_download_candidates(url: str) -> list[str]:
 def iter_document_links(document: html.HtmlElement, page_url: str) -> Iterable[tuple[str, str]]:
     yield from iter_public_access_model_links(document, page_url)
     for anchor in document.xpath("//a[@href]"):
+        if _is_page_chrome_link(anchor):
+            continue
         href = anchor.get("href")
+        if not href:
+            continue
         absolute_url = urljoin(page_url, href)
-        title = clean_text(" ".join(anchor.itertext())) or document_title_from_url(absolute_url)
-        if _is_generic_site_document(href, title):
+        title = _document_link_title(" ".join(anchor.itertext()), absolute_url)
+        if not title:
+            continue
+        if _is_associated_document_source_label(title):
+            continue
+        if _is_generic_site_document(absolute_url, title):
             continue
         if not _is_document_href(href) and not _is_document_link_text(title, href):
             continue
-        if not _is_document_href(href) and _is_application_tab_href(href):
+        if _is_application_tab_href(absolute_url):
             continue
         yield href, title
     for attr in ("data-disabled-link", "data-link", "data-url", "data-href"):
         for element in document.xpath(f"//*[@{attr}]"):
+            if _is_page_chrome_link(element):
+                continue
             href = element.get(attr)
             if not _is_document_href(href):
                 continue
             absolute_url = urljoin(page_url, href)
-            title = clean_text(element.get("aria-label") or " ".join(element.itertext())) or document_title_from_url(absolute_url)
-            title = re.sub(r"^link\s*\(\s*download\s*\)\s*", "", title, flags=re.IGNORECASE).strip()
-            if _is_generic_site_document(href, title):
+            title = _document_link_title(
+                element.get("aria-label") or " ".join(element.itertext()),
+                absolute_url,
+            )
+            if not title:
                 continue
-            yield href, title or document_title_from_url(absolute_url)
+            title = re.sub(r"^link\s*\(\s*download\s*\)\s*", "", title, flags=re.IGNORECASE).strip()
+            if not title:
+                continue
+            if _is_associated_document_source_label(title):
+                continue
+            if _is_generic_site_document(absolute_url, title):
+                continue
+            if _is_application_tab_href(absolute_url):
+                continue
+            yield href, title
     for element in document.xpath("//*[@onclick]"):
+        if _is_page_chrome_link(element):
+            continue
         onclick = element.get("onclick") or ""
         for href in re.findall(r"['\"]([^'\"]+(?:document|download|attachment|viewDocument|showDocuments|displaymedia|displaysearchdocument|file)[^'\"]*)['\"]", onclick, flags=re.IGNORECASE):
             absolute_url = urljoin(page_url, href)
-            title = clean_text(" ".join(element.itertext())) or document_title_from_url(absolute_url)
-            if _is_generic_site_document(href, title):
+            title = _document_link_title(" ".join(element.itertext()), absolute_url)
+            if not title:
+                continue
+            if _is_associated_document_source_label(title):
+                continue
+            if _is_generic_site_document(absolute_url, title):
+                continue
+            if _is_application_tab_href(absolute_url):
                 continue
             yield href, title
     for form in document.xpath("//form[@action]"):
+        if _is_page_chrome_link(form):
+            continue
         action = form.get("action") or ""
         if not _is_document_href(action):
             continue
@@ -2435,17 +3334,29 @@ def iter_document_links(document: html.HtmlElement, page_url: str) -> Iterable[t
             query_items.append((input_node.get("name") or "", input_node.get("value") or ""))
         parts = urlsplit(urljoin(page_url, action))
         href = _with_query_items(parts, [*parse_qsl(parts.query, keep_blank_values=True), *query_items])
-        title = clean_text(" ".join(form.itertext())) or document_title_from_url(href)
+        title = _document_link_title(" ".join(form.itertext()), href)
+        if not title:
+            continue
+        if _is_associated_document_source_label(title):
+            continue
         if _is_generic_site_document(href, title):
+            continue
+        if _is_application_tab_href(href):
             continue
         yield href, title
     for element in document.xpath("//iframe[@src] | //embed[@src] | //object[@data]"):
+        if _is_page_chrome_link(element):
+            continue
         href = element.get("src") or element.get("data")
         if not _is_document_href(href):
             continue
         absolute_url = urljoin(page_url, href)
-        title = document_title_from_url(absolute_url)
-        if _is_generic_site_document(href, title):
+        title = _document_link_title(None, absolute_url)
+        if not title:
+            continue
+        if _is_generic_site_document(absolute_url, title):
+            continue
+        if _is_application_tab_href(absolute_url):
             continue
         yield href, title
 
@@ -2473,7 +3384,14 @@ def iter_public_access_model_links(document: html.HtmlElement, page_url: str) ->
         yield href, title
 
 
-def fetch_publisher_document_list(text: str, page_url: str, opener) -> list[PlanningDocument]:
+def fetch_publisher_document_list(
+    text: str,
+    page_url: str,
+    opener,
+    *,
+    should_cancel: CancelCallback | None = None,
+    defer_rate_limit: bool = False,
+) -> list[PlanningDocument]:
     match = re.search(r'"url"\s*:\s*"([^"]*getDocumentList[^"]*)"', text)
     if not match:
         return []
@@ -2489,17 +3407,28 @@ def fetch_publisher_document_list(text: str, page_url: str, opener) -> list[Plan
         },
     )
     try:
-        with _open_url_with_retry(request, timeout=45, opener=opener) as response:
+        with _open_url_with_retry(
+            request,
+            timeout=45,
+            opener=opener,
+            should_cancel=should_cancel,
+            defer_rate_limit=defer_rate_limit,
+        ) as response:
             payload = response.read().decode("utf-8", errors="replace")
-    except Exception:
-        return []
-    try:
         data = json.loads(payload)
-    except json.JSONDecodeError:
-        return []
-    rows = data.get("data")
+    except DocumentDownloadCancelledError:
+        raise
+    except Exception as exc:
+        raise DocumentDiscoveryTransientError(
+            endpoint,
+            f"Publisher document list failed: {exc}",
+        ) from exc
+    rows = data.get("data") if isinstance(data, dict) else None
     if not isinstance(rows, list):
-        return []
+        raise DocumentDiscoveryTransientError(
+            endpoint,
+            "Publisher document list returned invalid data",
+        )
     documents: list[PlanningDocument] = []
     for row in rows:
         if not isinstance(row, list) or len(row) < 2:
@@ -2570,7 +3499,14 @@ def _integer_string(value: str | None) -> str:
         return "0"
 
 
-def fetch_enterprise_document_list(text: str, page_url: str, opener) -> list[PlanningDocument]:
+def fetch_enterprise_document_list(
+    text: str,
+    page_url: str,
+    opener,
+    *,
+    should_cancel: CancelCallback | None = None,
+    defer_rate_limit: bool = False,
+) -> list[PlanningDocument]:
     try:
         document = html.fromstring(text)
     except Exception:
@@ -2599,14 +3535,22 @@ def fetch_enterprise_document_list(text: str, page_url: str, opener) -> list[Pla
         method="POST",
     )
     try:
-        with _open_url_with_retry(request, timeout=45, opener=opener) as response:
+        with _open_url_with_retry(
+            request,
+            timeout=45,
+            opener=opener,
+            should_cancel=should_cancel,
+            defer_rate_limit=defer_rate_limit,
+        ) as response:
             fragment = response.read().decode("utf-8", errors="replace")
-    except Exception:
-        return []
-    try:
         fragment_document = html.fromstring(fragment)
-    except Exception:
-        return []
+    except DocumentDownloadCancelledError:
+        raise
+    except Exception as exc:
+        raise DocumentDiscoveryTransientError(
+            endpoint,
+            f"Enterprise document list failed: {exc}",
+        ) from exc
     documents: list[PlanningDocument] = []
     for anchor in fragment_document.xpath("//a[@href]"):
         href = anchor.get("href") or ""
@@ -2623,7 +3567,68 @@ def fetch_enterprise_document_list(text: str, page_url: str, opener) -> list[Pla
     return documents
 
 
-def fetch_arcus_salesforce_document_list(text: str, page_url: str, opener) -> list[PlanningDocument]:
+def _fetch_arcus_aura_actions(
+    request: Request,
+    endpoint: str,
+    opener,
+    source_name: str,
+    *,
+    should_cancel: CancelCallback | None = None,
+    defer_rate_limit: bool = False,
+) -> list[dict[str, object]]:
+    try:
+        with _open_url_with_retry(
+            request,
+            timeout=45,
+            opener=opener,
+            should_cancel=should_cancel,
+            defer_rate_limit=defer_rate_limit,
+        ) as response:
+            response_text = response.read().decode("utf-8", errors="replace")
+        payload_data = json.loads(response_text)
+    except DocumentDownloadCancelledError:
+        raise
+    except Exception as exc:
+        raise DocumentDiscoveryTransientError(
+            endpoint,
+            f"{source_name} document list failed: {exc}",
+        ) from exc
+    actions = payload_data.get("actions") if isinstance(payload_data, dict) else None
+    if (
+        not isinstance(actions, list)
+        or not actions
+        or any(not isinstance(action, dict) for action in actions)
+    ):
+        raise DocumentDiscoveryTransientError(
+            endpoint,
+            f"{source_name} document list returned invalid data",
+        )
+    return actions
+
+
+def _arcus_action_return_value(
+    actions: list[dict[str, object]],
+    endpoint: str,
+    source_name: str,
+) -> object:
+    action = actions[0]
+    state = action.get("state")
+    if state is not None and state != "SUCCESS":
+        raise DocumentDiscoveryTransientError(
+            endpoint,
+            f"{source_name} document list returned state {state}",
+        )
+    return action.get("returnValue")
+
+
+def fetch_arcus_salesforce_document_list(
+    text: str,
+    page_url: str,
+    opener,
+    *,
+    should_cancel: CancelCallback | None = None,
+    defer_rate_limit: bool = False,
+) -> list[PlanningDocument]:
     record_id = _salesforce_arcus_record_id(page_url)
     context = _salesforce_aura_context(text)
     if not record_id or not context:
@@ -2675,23 +3680,38 @@ def fetch_arcus_salesforce_document_list(text: str, page_url: str, opener) -> li
         },
         method="POST",
     )
-    try:
-        with _open_url_with_retry(request, timeout=45, opener=opener) as response:
-            response_text = response.read().decode("utf-8", errors="replace")
-    except Exception:
-        return []
-    try:
-        payload_data = json.loads(response_text)
-    except json.JSONDecodeError:
-        return []
-    records: list[dict[str, object]] = []
-    for action in payload_data.get("actions", []):
-        if isinstance(action, dict) and isinstance(action.get("returnValue"), list):
-            records.extend(action["returnValue"])
+    actions = _fetch_arcus_aura_actions(
+        request,
+        endpoint,
+        opener,
+        "Arcus Salesforce",
+        should_cancel=should_cancel,
+        defer_rate_limit=defer_rate_limit,
+    )
+    return_value = _arcus_action_return_value(
+        actions,
+        endpoint,
+        "Arcus Salesforce",
+    )
+    if not isinstance(return_value, list) or any(
+        not isinstance(item, dict) for item in return_value
+    ):
+        raise DocumentDiscoveryTransientError(
+            endpoint,
+            "Arcus Salesforce document list returned invalid data",
+        )
+    records = list(return_value)
     return _salesforce_content_version_documents(records, page_url)
 
 
-def fetch_arcus_public_register_file_list(text: str, page_url: str, opener) -> list[PlanningDocument]:
+def fetch_arcus_public_register_file_list(
+    text: str,
+    page_url: str,
+    opener,
+    *,
+    should_cancel: CancelCallback | None = None,
+    defer_rate_limit: bool = False,
+) -> list[PlanningDocument]:
     record_id = _salesforce_arcus_record_id(page_url)
     context = _salesforce_aura_context(text)
     if not record_id or not context:
@@ -2743,22 +3763,32 @@ def fetch_arcus_public_register_file_list(text: str, page_url: str, opener) -> l
         },
         method="POST",
     )
-    try:
-        with _open_url_with_retry(request, timeout=45, opener=opener) as response:
-            response_text = response.read().decode("utf-8", errors="replace")
-    except Exception:
-        return []
-    try:
-        payload_data = json.loads(response_text)
-    except json.JSONDecodeError:
-        return []
-    records: list[dict[str, object]] = []
-    for action in payload_data.get("actions", []):
-        if not isinstance(action, dict):
-            continue
-        return_value = action.get("returnValue")
-        if isinstance(return_value, dict) and isinstance(return_value.get("returnValue"), list):
-            records.extend(item for item in return_value["returnValue"] if isinstance(item, dict))
+    actions = _fetch_arcus_aura_actions(
+        request,
+        endpoint,
+        opener,
+        "Arcus public register",
+        should_cancel=should_cancel,
+        defer_rate_limit=defer_rate_limit,
+    )
+    return_value = _arcus_action_return_value(
+        actions,
+        endpoint,
+        "Arcus public register",
+    )
+    records_value = (
+        return_value.get("returnValue")
+        if isinstance(return_value, dict)
+        else None
+    )
+    if not isinstance(records_value, list) or any(
+        not isinstance(item, dict) for item in records_value
+    ):
+        raise DocumentDiscoveryTransientError(
+            endpoint,
+            "Arcus public register document list returned invalid data",
+        )
+    records = list(records_value)
     return _salesforce_content_version_documents(records, page_url)
 
 
@@ -2789,7 +3819,14 @@ def _salesforce_content_version_documents(records: list[dict[str, object]], page
     return documents
 
 
-def fetch_arcus_files_public_document_list(text: str, page_url: str, opener) -> list[PlanningDocument]:
+def fetch_arcus_files_public_document_list(
+    text: str,
+    page_url: str,
+    opener,
+    *,
+    should_cancel: CancelCallback | None = None,
+    defer_rate_limit: bool = False,
+) -> list[PlanningDocument]:
     record_id = _salesforce_arcus_record_id(page_url)
     context = _salesforce_aura_context(text)
     if not record_id or not context:
@@ -2835,22 +3872,27 @@ def fetch_arcus_files_public_document_list(text: str, page_url: str, opener) -> 
         },
         method="POST",
     )
-    try:
-        with _open_url_with_retry(request, timeout=45, opener=opener) as response:
-            response_text = response.read().decode("utf-8", errors="replace")
-    except Exception:
-        return []
-    try:
-        payload_data = json.loads(response_text)
-    except json.JSONDecodeError:
-        return []
-    records: list[dict[str, object]] = []
-    for action in payload_data.get("actions", []):
-        if not isinstance(action, dict):
-            continue
-        return_value = action.get("returnValue")
-        if isinstance(return_value, list):
-            records.extend(item for item in return_value if isinstance(item, dict))
+    actions = _fetch_arcus_aura_actions(
+        request,
+        endpoint,
+        opener,
+        "Arcus FilesPublic",
+        should_cancel=should_cancel,
+        defer_rate_limit=defer_rate_limit,
+    )
+    return_value = _arcus_action_return_value(
+        actions,
+        endpoint,
+        "Arcus FilesPublic",
+    )
+    if not isinstance(return_value, list) or any(
+        not isinstance(item, dict) for item in return_value
+    ):
+        raise DocumentDiscoveryTransientError(
+            endpoint,
+            "Arcus FilesPublic document list returned invalid data",
+        )
+    records = list(return_value)
     return _salesforce_content_version_documents(records, page_url)
 
 
@@ -2902,7 +3944,12 @@ def document_title_from_url(url: str) -> str:
 
 def document_filename(document: PlanningDocument, downloaded_file: DownloadedFile, *, fallback: str) -> str:
     extension = _downloaded_extension(downloaded_file)
-    for value in (downloaded_file.filename, document.title, document_title_from_url(downloaded_file.final_url), fallback):
+    for value in (
+        downloaded_file.filename,
+        _document_identity_title(document),
+        document_title_from_url(downloaded_file.final_url),
+        fallback,
+    ):
         if not value:
             continue
         filename = sanitize_path_part(Path(value.replace("\\", "/")).name)
@@ -2956,6 +4003,7 @@ def _is_document_href(href: str | None) -> bool:
             "showdocuments",
             "viewdocument",
             "displaysearchdocument",
+            "as_pdf_file",
             "wphappdocs",
             "wchdisplaymedia",
             "displaymedia",
@@ -2989,7 +4037,7 @@ def _is_document_href(href: str | None) -> bool:
 
 
 def _is_generic_site_document(href: str | None, title: str | None) -> bool:
-    text = " ".join(value for value in (href, title) if value).casefold()
+    text = unquote(" ".join(value for value in (href, title) if value)).casefold()
     if not text:
         return False
     if "design and access" in text or "access statement" in text:
@@ -3018,16 +4066,53 @@ def _is_generic_site_document(href: str | None, title: str | None) -> bool:
         "/onlineplanning/getonlinedocuments",
         "/onlineplanning/getcommentattachments",
         "/onlinedisplaydocument/opencommentattachment",
+        "/related-documents/related documents",
     )
     return any(token in text for token in generic_tokens)
 
 
-def _is_document_link_text(title: str, href: str | None) -> bool:
-    normalized_title = title.casefold().strip()
+def _is_page_chrome_link(element: html.HtmlElement) -> bool:
+    if element.xpath("ancestor::header | ancestor::nav | ancestor::footer"):
+        return True
+    chrome_markers = {"banner", "breadcrumb", "contentinfo", "footer", "navigation"}
+    for ancestor in element.xpath("ancestor-or-self::*"):
+        role = (ancestor.get("role") or "").casefold()
+        identifiers = " ".join(
+            value for value in (ancestor.get("id"), ancestor.get("class")) if value
+        ).casefold()
+        if role in chrome_markers or any(
+            marker in identifiers for marker in chrome_markers
+        ):
+            return True
+    return False
+
+
+def _document_link_title(value: str | None, url: str) -> str | None:
+    return clean_text(value) or clean_text(document_title_from_url(url))
+
+
+def _is_document_link_text(title: str | None, href: str | None) -> bool:
+    normalized_title = (title or "").casefold().strip()
     lowered_href = (href or "").casefold()
     if normalized_title not in {"documents", "view associated documents", "associated documents"}:
         return False
     return any(token in lowered_href for token in ("searchresult", "publicaccess", "documents", "runthirdpartysearch"))
+
+
+def _is_associated_document_source_label(value: str | None) -> bool:
+    normalized = (clean_text(value) or "").casefold()
+    labels = {
+        "associated application documents",
+        "associated documents",
+        "click to view associated application documents",
+        "click to view associated documents",
+        "view associated application documents",
+        "view associated documents",
+    }
+    return any(
+        normalized == label or normalized.startswith(f"{label} ")
+        for label in labels
+    )
 
 
 def _is_application_tab_href(href: str | None) -> bool:
@@ -3035,8 +4120,13 @@ def _is_application_tab_href(href: str | None) -> bool:
         return False
     lowered = href.strip().lower()
     parts = urlsplit(lowered)
+    query_names = {
+        name.casefold()
+        for name, _value in parse_qsl(parts.query, keep_blank_values=True)
+    }
     return (
-        "applicationdetails.do" in lowered and "activetab=documents" in lowered
+        "applicationdetails.do" in parts.path.casefold()
+        and "activetab" in query_names
     ) or parts.fragment in {"tabdocuments", "documents"}
 
 
@@ -3166,7 +4256,7 @@ def sanitize_path_part(value: str) -> str:
 
 def _application_from_planit_record(authority: str, record: dict[str, object]) -> PlanningApplication:
     other_fields = record.get("other_fields") if isinstance(record.get("other_fields"), dict) else {}
-    reference = _record_string(record, "uid") or _record_string(record, "reference") or _record_string(record, "name")
+    reference = _planit_application_reference(record)
     raw = {
         "source": "planit",
         "docs_url": _record_string(other_fields, "docs_url"),
@@ -3196,17 +4286,57 @@ def _application_from_planit_record(authority: str, record: dict[str, object]) -
     )
 
 
-def _open_url_with_retry(request: Request, *, timeout: float, opener=None):
+def _planit_application_reference(record: dict[str, object]) -> str | None:
+    return (
+        _record_string(record, "uid")
+        or _record_string(record, "reference")
+        or _record_string(record, "name")
+    )
+
+
+def _open_url_with_retry(
+    request: Request,
+    *,
+    timeout: float,
+    opener=None,
+    should_cancel: CancelCallback | None = None,
+    defer_rate_limit: bool = False,
+):
+    waited_cooldown_through: float | None = None
     for attempt in range(4):
+        if should_cancel and should_cancel():
+            raise DocumentDownloadCancelledError("Document download cancelled")
         try:
-            _throttle_request(request.full_url)
+            _throttle_request(
+                request.full_url,
+                should_cancel=should_cancel,
+                ignore_cooldown_through=waited_cooldown_through,
+                defer_rate_limit=defer_rate_limit,
+            )
+            waited_cooldown_through = None
             if opener is not None:
                 return opener.open(request, timeout=timeout)
             return urlopen(request, timeout=timeout)
         except HTTPError as exc:
-            if exc.code not in RATE_LIMIT_HTTP_CODES or attempt == 3:
+            if exc.code not in RATE_LIMIT_HTTP_CODES:
                 raise
-            sleep(_retry_delay_seconds(exc, 5.0 * (attempt + 1)))
+            delay = _rate_limit_aware_retry_delay_seconds(
+                exc,
+                5.0 * (attempt + 1),
+            )
+            cooldown_deadline = None
+            if exc.code == 429:
+                cooldown_deadline = _set_request_cooldown(
+                    request.full_url,
+                    delay,
+                )
+                if defer_rate_limit:
+                    raise
+            if attempt == 3:
+                raise
+            if not _wait_for_cancelable_delay(delay, should_cancel):
+                raise DocumentDownloadCancelledError("Document download cancelled")
+            waited_cooldown_through = cooldown_deadline
             _skip_next_throttle(request.full_url)
     raise RuntimeError(f"Could not fetch {request.full_url}")
 
@@ -3222,12 +4352,25 @@ def _build_document_opener(*, verify_tls: bool = True, tls_compat: bool = False)
     return build_opener(*handlers)
 
 
-def _fetch_html_with_portal_session(url: str, opener, *, timeout: float) -> tuple[str, str]:
+def _fetch_html_with_portal_session(
+    url: str,
+    opener,
+    *,
+    timeout: float,
+    should_cancel: CancelCallback | None = None,
+    defer_rate_limit: bool = False,
+) -> tuple[str, str]:
     page_url = url
     text = ""
     for _ in range(4):
         request = Request(page_url, headers={"User-Agent": USER_AGENT})
-        with _open_url_with_retry(request, timeout=timeout, opener=opener) as response:
+        with _open_url_with_retry(
+            request,
+            timeout=timeout,
+            opener=opener,
+            should_cancel=should_cancel,
+            defer_rate_limit=defer_rate_limit,
+        ) as response:
             text = response.read().decode("utf-8", errors="replace")
             page_url = response.geturl()
         redirect_url = _html_redirect_url(text, page_url)
@@ -3248,26 +4391,56 @@ def _fetch_html_with_portal_session(url: str, opener, *, timeout: float) -> tupl
             },
             method="POST",
         )
-        with _open_url_with_retry(accept_request, timeout=timeout, opener=opener) as response:
+        with _open_url_with_retry(
+            accept_request,
+            timeout=timeout,
+            opener=opener,
+            should_cancel=should_cancel,
+            defer_rate_limit=defer_rate_limit,
+        ) as response:
             text = response.read().decode("utf-8", errors="replace")
             page_url = response.geturl()
     return text, page_url
 
 
-def _fetch_html_document_page(url: str, *, timeout: float):
+def _fetch_html_document_page(
+    url: str,
+    *,
+    timeout: float,
+    should_cancel: CancelCallback | None = None,
+    defer_rate_limit: bool = False,
+):
     opener = _build_document_opener()
     try:
-        text, page_url = _fetch_html_with_portal_session(url, opener, timeout=timeout)
+        text, page_url = _fetch_html_with_portal_session(
+            url,
+            opener,
+            timeout=timeout,
+            should_cancel=should_cancel,
+            defer_rate_limit=defer_rate_limit,
+        )
         return text, page_url, opener
     except Exception as exc:
         if _is_tls_compatibility_error(exc):
             opener = _build_document_opener(tls_compat=True)
-            text, page_url = _fetch_html_with_portal_session(url, opener, timeout=timeout)
+            text, page_url = _fetch_html_with_portal_session(
+                url,
+                opener,
+                timeout=timeout,
+                should_cancel=should_cancel,
+                defer_rate_limit=defer_rate_limit,
+            )
             return text, page_url, opener
         if not _is_tls_certificate_error(exc):
             raise
     opener = _build_document_opener(verify_tls=False)
-    text, page_url = _fetch_html_with_portal_session(url, opener, timeout=timeout)
+    text, page_url = _fetch_html_with_portal_session(
+        url,
+        opener,
+        timeout=timeout,
+        should_cancel=should_cancel,
+        defer_rate_limit=defer_rate_limit,
+    )
     return text, page_url, opener
 
 
@@ -3313,13 +4486,32 @@ def _html_redirect_url(text: str, page_url: str) -> str | None:
     return normalize_url(urljoin(page_url, match.group(1))) if match else None
 
 
-def _fetch_json_with_retry(url: str) -> dict[str, object]:
+def _fetch_json_with_retry(
+    url: str,
+    *,
+    should_cancel: CancelCallback | None = None,
+) -> dict[str, object]:
     attempts = 4
     tls_compat_opener = None
+    waited_cooldown_through: float | None = None
     for attempt in range(attempts):
         request = Request(url, headers={"User-Agent": USER_AGENT})
+        if should_cancel and should_cancel():
+            raise CouncilSearchCancelledError(
+                "Cancelled while fetching public planning metadata"
+            )
         try:
-            _throttle_request(url)
+            try:
+                _throttle_request(
+                    url,
+                    should_cancel=should_cancel,
+                    ignore_cooldown_through=waited_cooldown_through,
+                )
+                waited_cooldown_through = None
+            except DocumentDownloadCancelledError as exc:
+                raise CouncilSearchCancelledError(
+                    "Cancelled while fetching public planning metadata"
+                ) from exc
             if tls_compat_opener is not None:
                 response_context = tls_compat_opener.open(request, timeout=DEFAULT_REQUEST_TIMEOUT_SECONDS)
             else:
@@ -3327,9 +4519,23 @@ def _fetch_json_with_retry(url: str) -> dict[str, object]:
             with response_context as response:
                 return json.loads(response.read().decode("utf-8", errors="replace"))
         except HTTPError as exc:
-            if exc.code not in RATE_LIMIT_HTTP_CODES or attempt == attempts - 1:
+            if exc.code not in RATE_LIMIT_HTTP_CODES:
                 raise
-            sleep(min(_retry_delay_seconds(exc, 2.0 * (attempt + 1)), 8.0))
+            delay = _rate_limit_aware_retry_delay_seconds(
+                exc,
+                2.0 * (attempt + 1),
+                generic_max_seconds=8.0,
+            )
+            cooldown_deadline = None
+            if exc.code == 429:
+                cooldown_deadline = _set_request_cooldown(url, delay)
+            if attempt == attempts - 1:
+                raise
+            if not _wait_for_cancelable_delay(delay, should_cancel):
+                raise CouncilSearchCancelledError(
+                    "Cancelled while fetching public planning metadata"
+                )
+            waited_cooldown_through = cooldown_deadline
             _skip_next_throttle(url)
         except URLError as exc:
             if not _should_retry_json_without_tls_verification(url, exc) or attempt == attempts - 1:
@@ -3346,44 +4552,75 @@ def _should_retry_json_without_tls_verification(url: str, exc: URLError) -> bool
     return isinstance(reason, ssl.SSLCertVerificationError)
 
 
-def _throttle_request(url: str) -> None:
+def _throttle_request(
+    url: str,
+    *,
+    should_cancel: CancelCallback | None = None,
+    ignore_cooldown_through: float | None = None,
+    defer_rate_limit: bool = False,
+) -> None:
     netloc = urlsplit(url).netloc.casefold()
     if not netloc:
         return
     delay = PLANIT_REQUEST_THROTTLE_SECONDS if netloc.endswith("planit.org.uk") else REQUEST_THROTTLE_SECONDS
     with _REQUEST_THROTTLE_LOCK:
         host_lock = _REQUEST_HOST_LOCKS.setdefault(netloc, threading.Lock())
-    with host_lock:
-        with _REQUEST_THROTTLE_LOCK:
-            now = monotonic()
-            ready_at = max(
-                _LAST_REQUEST_AT.get(netloc, 0.0) + delay,
-                _REQUEST_COOLDOWN_UNTIL.get(netloc, 0.0),
-            )
-            wait = max(ready_at - now, 0.0)
-        if wait:
-            sleep(wait)
-        with _REQUEST_THROTTLE_LOCK:
-            _LAST_REQUEST_AT[netloc] = monotonic()
+    cooldown_bypass = ignore_cooldown_through
+    while True:
+        with host_lock:
+            with _REQUEST_THROTTLE_LOCK:
+                now = monotonic()
+                cooldown_until = _REQUEST_COOLDOWN_UNTIL.get(netloc, 0.0)
+                if (
+                    cooldown_bypass is not None
+                    and cooldown_until <= cooldown_bypass
+                ):
+                    cooldown_until = 0.0
+                cooldown_wait = max(cooldown_until - now, 0.0)
+                if defer_rate_limit and cooldown_wait:
+                    raise _HostRateLimitDeferredError(url)
+                throttle_wait = max(
+                    _LAST_REQUEST_AT.get(netloc, 0.0) + delay - now,
+                    0.0,
+                )
+            if not cooldown_wait:
+                if throttle_wait:
+                    if not _wait_for_cancelable_delay(
+                        throttle_wait,
+                        should_cancel,
+                    ):
+                        raise DocumentDownloadCancelledError(
+                            "Document download cancelled"
+                        )
+                    continue
+                with _REQUEST_THROTTLE_LOCK:
+                    _LAST_REQUEST_AT[netloc] = monotonic()
+                return
+        if not _wait_for_cancelable_delay(cooldown_wait, should_cancel):
+            raise DocumentDownloadCancelledError("Document download cancelled")
+        cooldown_bypass = max(cooldown_bypass or 0.0, cooldown_until)
 
 
-def _set_request_cooldown(url: str, seconds: float) -> None:
+def _request_cooldown_remaining_seconds(url: str) -> float:
     netloc = urlsplit(url).netloc.casefold()
     if not netloc:
-        return
+        return 0.0
+    with _REQUEST_THROTTLE_LOCK:
+        cooldown_until = _REQUEST_COOLDOWN_UNTIL.get(netloc, 0.0)
+    return max(cooldown_until - monotonic(), 0.0)
+
+
+def _set_request_cooldown(url: str, seconds: float) -> float:
+    netloc = urlsplit(url).netloc.casefold()
+    if not netloc:
+        return 0.0
+    deadline = monotonic() + max(seconds, 0.0)
     with _REQUEST_THROTTLE_LOCK:
         _REQUEST_COOLDOWN_UNTIL[netloc] = max(
             _REQUEST_COOLDOWN_UNTIL.get(netloc, 0.0),
-            monotonic() + max(seconds, 0.0),
+            deadline,
         )
-
-
-def _clear_request_cooldown(url: str) -> None:
-    netloc = urlsplit(url).netloc.casefold()
-    if not netloc:
-        return
-    with _REQUEST_THROTTLE_LOCK:
-        _REQUEST_COOLDOWN_UNTIL.pop(netloc, None)
+    return deadline
 
 
 def _skip_next_throttle(url: str) -> None:
@@ -3413,6 +4650,23 @@ def _retry_delay_seconds(exc: HTTPError, fallback_seconds: float) -> float:
     return fallback_seconds
 
 
+def _rate_limit_aware_retry_delay_seconds(
+    exc: HTTPError,
+    generic_fallback_seconds: float,
+    *,
+    generic_max_seconds: float | None = None,
+) -> float:
+    fallback = (
+        RATE_LIMIT_DEFAULT_RETRY_DELAY_SECONDS
+        if exc.code == 429
+        else generic_fallback_seconds
+    )
+    delay = _retry_delay_seconds(exc, fallback)
+    if exc.code != 429 and generic_max_seconds is not None:
+        return min(delay, generic_max_seconds)
+    return delay
+
+
 def _record_string(record: object, key: str) -> str | None:
     if not isinstance(record, dict):
         return None
@@ -3425,8 +4679,15 @@ def _record_string(record: object, key: str) -> str | None:
 def _parse_iso_date(value: str | None) -> date | None:
     if not value:
         return None
+    text = value.strip()
     try:
-        return date.fromisoformat(value[:10])
+        return date.fromisoformat(text)
+    except ValueError:
+        pass
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        return datetime.fromisoformat(text).date()
     except ValueError:
         return None
 
@@ -3448,9 +4709,29 @@ def _looks_like_downloadable_document(document: PlanningDocument) -> bool:
 
 def _is_excluded_document(document: PlanningDocument) -> bool:
     text = _document_filter_text(document)
-    if ".exe" in text or _path_suffix(document.url) == ".exe":
+    if (
+        _path_suffix(document.url) == ".exe"
+        or any(
+            _mentions_executable_filename(value)
+            for value in (document.title, document.description)
+        )
+        or (document.document_type or "").casefold()
+        in {"exe", "executable", "application/x-msdownload"}
+    ):
         return True
-    return "existing" in text and "proposed" not in text
+    if "existing" in text and "proposed" not in text:
+        return not is_existing_only_drawing_metadata(text)
+    return False
+
+
+def _mentions_executable_filename(value: str | None) -> bool:
+    return bool(
+        value
+        and re.search(
+            r"(?i)(?:^|[\s/\\])[^/\\?#&]*\.exe(?=$|[\s?#&(),;])",
+            value,
+        )
+    )
 
 
 def _document_filter_text(document: PlanningDocument) -> str:
@@ -3472,19 +4753,43 @@ def _path_suffix(url: str | None) -> str:
 
 
 def _is_tls_certificate_error(exc: Exception) -> bool:
-    if isinstance(exc, ssl.SSLCertVerificationError):
-        return True
-    if isinstance(exc, URLError):
-        reason = exc.reason
-        return isinstance(reason, ssl.SSLCertVerificationError) or "certificate" in str(reason).casefold()
-    return "certificate" in str(exc).casefold() and "ssl" in str(exc).casefold()
+    for error in _exception_chain(exc):
+        if isinstance(error, ssl.SSLCertVerificationError):
+            return True
+        if isinstance(error, URLError):
+            reason = error.reason
+            if isinstance(reason, ssl.SSLCertVerificationError) or "certificate" in str(reason).casefold():
+                return True
+        text = str(error).casefold()
+        if "certificate" in text and "ssl" in text:
+            return True
+    return False
 
 
 def _is_tls_compatibility_error(exc: Exception) -> bool:
-    text = str(exc).casefold()
-    if isinstance(exc, URLError):
-        text = f"{exc.reason} {exc}".casefold()
-    return "forcibly closed" in text or "winerror 10054" in text or "sslv3 alert handshake failure" in text
+    for error in _exception_chain(exc):
+        text = str(error).casefold()
+        if isinstance(error, URLError):
+            text = f"{error.reason} {error}".casefold()
+        if any(
+            marker in text
+            for marker in (
+                "forcibly closed",
+                "winerror 10054",
+                "sslv3 alert handshake failure",
+            )
+        ):
+            return True
+    return False
+
+
+def _exception_chain(exc: Exception) -> Iterable[Exception]:
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while isinstance(current, Exception) and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
 
 
 def _comparable_title(value: str | None) -> str:
@@ -3495,6 +4800,27 @@ def _comparable_title(value: str | None) -> str:
     text = re.sub(r"\.[a-z0-9]{2,5}$", "", text, flags=re.IGNORECASE)
     text = re.sub(r"[^a-z0-9]+", " ", text.casefold())
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _is_generic_document_title(value: str | None) -> bool:
+    return _comparable_title(value) in {
+        "document",
+        "documents",
+        "plan",
+        "plans",
+        "plans documents",
+    }
+
+
+def _document_identity(document: PlanningDocument) -> str:
+    return _comparable_title(_document_identity_title(document))
+
+
+def _document_identity_title(document: PlanningDocument) -> str:
+    url_title = document_title_from_url(document.url)
+    if _is_generic_document_title(document.title) and url_title:
+        return url_title
+    return document.title or url_title
 
 
 def _filename_from_headers(headers: Message) -> str | None:
@@ -3648,6 +4974,23 @@ def _unique_path(path: Path) -> Path:
         if not candidate.exists():
             return candidate
     raise FileExistsError(path)
+
+
+def _find_identical_payload(destination: Path, payload: bytes) -> Path | None:
+    payload_digest = sha256(payload).digest()
+    for path in destination.iterdir():
+        try:
+            if not path.is_file() or path.stat().st_size != len(payload):
+                continue
+            digest = sha256()
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            if digest.digest() == payload_digest:
+                return path
+        except OSError:
+            continue
+    return None
 
 
 def _log(callback: LogCallback | None, message: str) -> None:

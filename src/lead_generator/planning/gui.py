@@ -63,6 +63,7 @@ class LeadGeneratorApp(ctk.CTk):
         self.messages: queue.Queue[tuple[str, object]] = queue.Queue()
         self.worker: threading.Thread | None = None
         self.cancel_requested = False
+        self._reset_run_progress_counts()
         self.download_files_var = BooleanVar(value=True)
         self.worker_count_values = [str(value) for value in range(1, MAX_SEARCH_WORKER_COUNT + 1)]
 
@@ -279,6 +280,7 @@ class LeadGeneratorApp(ctk.CTk):
         self.run_button.configure(state="disabled")
         self.cancel_button.configure(state="normal")
         self.progress_bar.set(0)
+        self._reset_run_progress_counts()
         self._set_captured(0)
         if config.download_application_files:
             self._set_document_progress(0, 0, requested=True)
@@ -374,20 +376,60 @@ class LeadGeneratorApp(ctk.CTk):
         self.progress_label.configure(text=f"{completed} complete / {total} councils")
         self.progress_bar.set(0 if total == 0 else completed / total)
 
+    def _reset_run_progress_counts(self) -> None:
+        self._captured_display_count = 0
+        self._document_display_progress = (0, 0)
+        self._enrichment_display_progress = (0, 0)
+
     def _set_captured(self, captured: int) -> None:
-        self.captured_label.configure(text=f"{captured} relevant applications captured")
+        displayed = max(
+            getattr(self, "_captured_display_count", 0),
+            captured,
+        )
+        self._captured_display_count = displayed
+        self.captured_label.configure(text=f"{displayed} relevant applications captured")
 
     def _set_document_progress(self, completed: int, total: int, *, requested: bool) -> None:
         if requested:
-            text = f"{completed} of {total} applications downloaded"
+            previous_completed, previous_total = getattr(
+                self,
+                "_document_display_progress",
+                (0, 0),
+            )
+            displayed_completed = max(previous_completed, completed)
+            displayed_total = max(previous_total, total, displayed_completed)
+            self._document_display_progress = (
+                displayed_completed,
+                displayed_total,
+            )
+            text = (
+                f"{displayed_completed} of {displayed_total} "
+                "applications downloaded"
+            )
         else:
+            self._document_display_progress = (0, 0)
             text = "Document downloads not requested"
         self.enrichment_label.configure(text=text)
 
     def _set_enrichment_progress(self, completed: int, total: int, *, requested: bool) -> None:
         if requested:
-            text = f"{completed} of {total} applications enriched"
+            previous_completed, previous_total = getattr(
+                self,
+                "_enrichment_display_progress",
+                (0, 0),
+            )
+            displayed_completed = max(previous_completed, completed)
+            displayed_total = max(previous_total, total, displayed_completed)
+            self._enrichment_display_progress = (
+                displayed_completed,
+                displayed_total,
+            )
+            text = (
+                f"{displayed_completed} of {displayed_total} "
+                "applications enriched"
+            )
         else:
+            self._enrichment_display_progress = (0, 0)
             text = "PDF enrichment not requested"
         self.enrichment_label.configure(text=text)
 

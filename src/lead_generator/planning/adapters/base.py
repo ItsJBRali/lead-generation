@@ -5,6 +5,10 @@ from abc import ABC, abstractmethod
 from lead_generator.planning.models import DiscoveryResult, PlanningApplication
 
 
+class PortalSearchCompletenessError(RuntimeError):
+    """A portal response could not prove that the requested result set is complete."""
+
+
 class PlanningScraper(ABC):
     def __init__(self, authority: str) -> None:
         self.authority = authority

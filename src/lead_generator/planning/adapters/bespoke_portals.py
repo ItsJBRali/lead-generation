@@ -481,9 +481,6 @@ class KensingtonPlanningScraper(NativeListingScraper):
                 "Referer": page.url,
             },
         )
-        if response.body.lstrip().startswith((b"<", b"{")):
-            raise CouncilFetchError("Kensington and Chelsea's planning API returned an unexpected response")
-
         records = self._decode_records(response.body)
         applications: list[PlanningApplication] = []
         for record in records:

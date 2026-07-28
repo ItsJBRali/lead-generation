@@ -7,24 +7,39 @@ import threading
 import tempfile
 import unittest
 from datetime import date
+from time import monotonic
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
+from urllib.request import Request
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from lxml import html
 
+import lead_generator.planning.leads as leads_module
 from lead_generator.planning.adapters.generic import GenericLabelledPlanningScraper
 from lead_generator.planning.enrichment import ContactEnrichment
+from lead_generator.planning.drawing_sources import is_existing_only_drawing_metadata
 from lead_generator.planning.leads import (
+    CouncilSearchCancelledError,
     CouncilSearchDegradedError,
     CouncilTarget,
     DocumentDownloadBatchResult,
+    DocumentDownloadCancelledError,
+    DocumentDiscoveryResult,
+    DocumentDiscoveryTransientError,
+    DocumentSourceFailure,
     DownloadedFile,
     LeadSearchConfig,
     _discover_planit_applications_serial,
+    _download_document_file,
     _download_pdf_documents_once,
+    _open_url_with_retry,
+    _throttle_request,
+    _is_document_link_text,
+    _looks_like_listing_url,
     _fetch_json_with_retry,
+    _associated_document_source_urls,
     application_in_geojson,
     application_matches_search_area,
     application_matches,
@@ -32,6 +47,8 @@ from lead_generator.planning.leads import (
     document_source_url_from_application_url,
     document_filename,
     document_download_candidates,
+    discover_application_documents,
+    discover_planit_reconciliation_applications,
     discover_portal_applications,
     discover_portal_applications_with_deadline,
     download_document_bytes,
@@ -42,6 +59,8 @@ from lead_generator.planning.leads import (
     fetch_arcus_files_public_document_list,
     fetch_arcus_salesforce_document_list,
     fetch_atrium_document_list,
+    fetch_enterprise_document_list,
+    fetch_planit_documents,
     fetch_publisher_document_list,
     iter_document_links,
     load_authority_catalogue,
@@ -51,10 +70,12 @@ from lead_generator.planning.leads import (
     point_in_geometry,
     run_lead_search,
     sanitize_path_part,
+    scheduled_council_task,
     select_overlapping_authorities,
+    source_document_candidates,
 )
-from lead_generator.planning.models import PlanningApplication, PlanningDocument
-from lead_generator.planning.http import CouncilHttpClient
+from lead_generator.planning.models import DiscoveryResult, PlanningApplication, PlanningDocument
+from lead_generator.planning.http import CouncilFetchError, CouncilHttpClient
 
 
 def polygon_feature(name: str, xmin: float, ymin: float, xmax: float, ymax: float) -> dict[str, object]:
@@ -106,10 +127,102 @@ def write_search_fixture(root: Path, authorities: list[str]) -> tuple[Path, Path
 
 
 class LeadSearchTest(unittest.TestCase):
+    def setUp(self) -> None:
+        with leads_module._REQUEST_THROTTLE_LOCK:
+            leads_module._LAST_REQUEST_AT.clear()
+            leads_module._REQUEST_COOLDOWN_UNTIL.clear()
+        reconciliation_patcher = patch(
+            "lead_generator.planning.leads.discover_planit_reconciliation_applications",
+            return_value=[],
+        )
+        reconciliation_patcher.start()
+        self.addCleanup(reconciliation_patcher.stop)
+
+    def test_existing_only_drawing_metadata(self) -> None:
+        assert is_existing_only_drawing_metadata("Existing elevations.pdf")
+        assert not is_existing_only_drawing_metadata("Existing survey report.pdf")
+        assert not is_existing_only_drawing_metadata("Existing planning statement.pdf")
+
     def test_parse_keywords_deduplicates_and_strips_quotes(self) -> None:
         self.assertEqual(
             parse_keywords(' "gates" \n"electric gates"\ngates\n'),
             ["gates", "electric gates"],
+        )
+
+    def test_application_reference_key_is_the_exact_stripped_reference(self) -> None:
+        application = PlanningApplication(
+            authority="A",
+            uid="uid",
+            url="u",
+            reference="  ABC/1  ",
+        )
+
+        self.assertEqual(leads_module.application_reference_key(application), "ABC/1")
+
+    def test_application_reference_key_does_not_fall_back_to_uid(self) -> None:
+        application = PlanningApplication(
+            authority="A",
+            uid="uid-only",
+            url="u",
+            reference=" \t ",
+        )
+
+        self.assertEqual(leads_module.application_reference_key(application), "")
+
+    def test_application_outside_or_without_received_date_is_not_in_range(self) -> None:
+        for value in [None, "", "not-a-date", "2026-07-19", "2026-07-27"]:
+            with self.subTest(value=value):
+                application = PlanningApplication(
+                    authority="A",
+                    uid="uid",
+                    url="u",
+                    date_received=value,
+                )
+
+                self.assertFalse(
+                    leads_module.application_is_in_date_range(
+                        application,
+                        date(2026, 7, 20),
+                        date(2026, 7, 26),
+                    )
+                )
+
+    def test_application_received_date_in_range_is_in_range(self) -> None:
+        for value in [
+            "2026-07-20",
+            "2026-07-20T14:30:00Z",
+            "2026-07-20 14:30:00+01:00",
+        ]:
+            with self.subTest(value=value):
+                application = PlanningApplication(
+                    authority="A",
+                    uid="uid",
+                    url="u",
+                    date_received=value,
+                )
+
+                self.assertTrue(
+                    leads_module.application_is_in_date_range(
+                        application,
+                        date(2026, 7, 20),
+                        date(2026, 7, 26),
+                    )
+                )
+
+    def test_application_malformed_date_with_valid_prefix_is_not_in_range(self) -> None:
+        application = PlanningApplication(
+            authority="A",
+            uid="uid",
+            url="u",
+            date_received="2026-07-22garbage",
+        )
+
+        self.assertFalse(
+            leads_module.application_is_in_date_range(
+                application,
+                date(2026, 7, 20),
+                date(2026, 7, 26),
+            )
         )
 
     def test_select_overlapping_authorities_uses_app_catalogue_not_user_properties(self) -> None:
@@ -475,41 +588,42 @@ class LeadSearchTest(unittest.TestCase):
 
         self.assertTrue(application_matches_search_area(application, user_geojson))
 
-    def test_discover_portal_applications_falls_back_to_planit_after_portal_error(self) -> None:
-        class BrokenScraper:
-            def discover_ids(self, **kwargs):
-                raise RuntimeError("portal unavailable")
-
+    def test_primary_discovery_does_not_wait_for_planit(self) -> None:
         target = CouncilTarget(
-            authority="Hampshire",
-            portal_family="unknown",
-            scraper_type="Custom",
-            base_url="https://maps.hants.gov.uk/MwpMapping/",
-            listing_url="https://maps.hants.gov.uk/MwpMapping/",
+            authority="Example",
+            portal_family="idox",
+            scraper_type="Idox",
+            base_url="https://planning.example.gov.uk",
+            listing_url="https://planning.example.gov.uk/search",
             geometry={},
         )
-        fallback = [
-            PlanningApplication(
-                authority="Hampshire",
-                uid="26/01274/DDTPO",
-                url="https://example.test/app",
-                reference="26/01274/DDTPO",
-                date_received="2026-06-10",
-            )
-        ]
+        direct = PlanningApplication(
+            authority="Example",
+            uid="26/00001/FUL",
+            url="https://planning.example.gov.uk/application/1",
+            reference="26/00001/FUL",
+            date_received="2026-06-10",
+            raw={"detail_complete": True},
+        )
+        discovery = DiscoveryResult(
+            authority="Example",
+            source_url=target.listing_url,
+            applications=[direct],
+        )
 
         with (
-            patch("lead_generator.planning.leads.planning_scraper_for_target", return_value=BrokenScraper()),
-            patch("lead_generator.planning.leads.discover_planit_applications", return_value=fallback) as planit,
+            patch(
+                "lead_generator.planning.leads._discover_portal_listing",
+                return_value=(discovery, object()),
+            ),
+            patch("lead_generator.planning.leads.discover_planit_applications") as planit,
         ):
             applications = discover_portal_applications(target, date(2026, 6, 8), date(2026, 6, 14))
 
-        planit.assert_called_once_with("Hampshire", date(2026, 6, 8), date(2026, 6, 14))
-        self.assertEqual(applications[0].authority, "Hampshire")
-        self.assertEqual(applications[0].raw["source"], "planit_fallback")
-        self.assertIn("portal unavailable", applications[0].raw["portal_fetch_error"])
+        self.assertEqual(applications, discovery.applications)
+        planit.assert_not_called()
 
-    def test_discover_portal_applications_uses_planit_alias_before_shared_buckinghamshire_portal(self) -> None:
+    def test_primary_discovery_groups_planit_alias_authority_by_its_portal(self) -> None:
         target = CouncilTarget(
             authority="Wycombe",
             portal_family="idox",
@@ -518,56 +632,112 @@ class LeadSearchTest(unittest.TestCase):
             listing_url="https://publicaccess.buckinghamshire.gov.uk/online-applications/search.do?action=advanced",
             geometry={},
         )
-        fallback = [
-            PlanningApplication(
-                authority="Buckinghamshire",
-                uid="PL/26/00001/FA",
-                url="https://example.test/app",
-                reference="PL/26/00001/FA",
-                date_received="2026-06-10",
-            )
-        ]
+        task = scheduled_council_task(target)
 
-        with (
-            patch("lead_generator.planning.leads.planning_scraper_for_target") as scraper_factory,
-            patch("lead_generator.planning.leads.discover_planit_applications", return_value=fallback) as planit,
-        ):
-            applications = discover_portal_applications(target, date(2026, 6, 8), date(2026, 6, 14))
+        self.assertEqual(task.platform, "idox")
+        self.assertEqual(task.host, "publicaccess.buckinghamshire.gov.uk")
 
-        scraper_factory.assert_not_called()
-        planit.assert_called_once_with("Buckinghamshire", date(2026, 6, 8), date(2026, 6, 14))
-        self.assertEqual(applications[0].authority, "Wycombe")
-        self.assertEqual(applications[0].raw["source"], "planit_fallback")
-
-    def test_discover_portal_applications_uses_planit_first_for_problem_portals(self) -> None:
+    def test_reconciliation_tries_aliases_and_retags_selected_council(self) -> None:
         target = CouncilTarget(
-            authority="Surrey",
-            portal_family="unknown",
-            scraper_type="Atrium",
-            base_url="https://planning.surreycc.gov.uk/",
-            listing_url="https://planning.surreycc.gov.uk/planappsearch.aspx",
+            authority="Wycombe",
+            portal_family="idox",
+            scraper_type="Idox",
+            base_url="https://publicaccess.buckinghamshire.gov.uk",
+            listing_url="https://publicaccess.buckinghamshire.gov.uk/online-applications/search.do?action=advanced",
             geometry={},
         )
-        fallback = [
-            PlanningApplication(
-                authority="Surrey",
-                uid="PLAN/2026/0498",
-                url="https://example.test/app",
-                reference="PLAN/2026/0498",
-                date_received="2026-06-10",
+        application = PlanningApplication(
+            authority="Buckinghamshire",
+            uid="PL/26/00001/FA",
+            url="https://www.planit.org.uk/planapplic/PL/26/00001/FA",
+            reference="PL/26/00001/FA",
+            date_received="2026-06-10",
+        )
+
+        with patch(
+            "lead_generator.planning.leads.discover_planit_applications",
+            side_effect=[RuntimeError("alias unavailable"), [application]],
+        ) as discover:
+            applications = discover_planit_reconciliation_applications(
+                target,
+                date(2026, 6, 8),
+                date(2026, 6, 14),
             )
-        ]
 
-        with (
-            patch("lead_generator.planning.leads.planning_scraper_for_target") as scraper_factory,
-            patch("lead_generator.planning.leads.discover_planit_applications", return_value=fallback) as planit,
+        self.assertEqual(discover.call_args_list, [
+            call("Buckinghamshire", date(2026, 6, 8), date(2026, 6, 14), should_cancel=None),
+            call("Wycombe", date(2026, 6, 8), date(2026, 6, 14), should_cancel=None),
+        ])
+        self.assertEqual([item.authority for item in applications], ["Wycombe"])
+        self.assertEqual(applications[0].raw["source"], "planit_reconciliation")
+        self.assertEqual(applications[0].raw["planit_authority"], "Wycombe")
+
+    def test_reconciliation_returns_empty_after_a_successful_empty_query(self) -> None:
+        target = CouncilTarget(
+            authority="Example",
+            portal_family="idox",
+            scraper_type="Idox",
+            base_url="https://planning.example.gov.uk",
+            listing_url="https://planning.example.gov.uk/search",
+            geometry={},
+        )
+
+        with patch(
+            "lead_generator.planning.leads.discover_planit_applications",
+            return_value=[],
         ):
-            applications = discover_portal_applications(target, date(2026, 6, 8), date(2026, 6, 14))
+            applications = discover_planit_reconciliation_applications(
+                target,
+                date(2026, 6, 8),
+                date(2026, 6, 14),
+            )
 
-        scraper_factory.assert_not_called()
-        planit.assert_called_once_with("Surrey", date(2026, 6, 8), date(2026, 6, 14))
-        self.assertEqual([application.reference for application in applications], ["PLAN/2026/0498"])
-        self.assertEqual(applications[0].raw["source"], "planit_fallback")
+        self.assertEqual(applications, [])
+
+    def test_reconciliation_raises_when_every_candidate_fails(self) -> None:
+        target = CouncilTarget(
+            authority="Wycombe",
+            portal_family="idox",
+            scraper_type="Idox",
+            base_url="https://publicaccess.buckinghamshire.gov.uk",
+            listing_url="https://publicaccess.buckinghamshire.gov.uk/online-applications/search.do?action=advanced",
+            geometry={},
+        )
+
+        with patch(
+            "lead_generator.planning.leads.discover_planit_applications",
+            side_effect=[RuntimeError("alias unavailable"), RuntimeError("authority unavailable")],
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "Buckinghamshire: alias unavailable; Wycombe: authority unavailable",
+            ):
+                discover_planit_reconciliation_applications(
+                    target,
+                    date(2026, 6, 8),
+                    date(2026, 6, 14),
+                )
+
+    def test_reconciliation_propagates_cancellation(self) -> None:
+        target = CouncilTarget(
+            authority="Example",
+            portal_family="idox",
+            scraper_type="Idox",
+            base_url="https://planning.example.gov.uk",
+            listing_url="https://planning.example.gov.uk/search",
+            geometry={},
+        )
+
+        with patch(
+            "lead_generator.planning.leads.discover_planit_applications",
+            side_effect=CouncilSearchCancelledError("cancelled"),
+        ):
+            with self.assertRaisesRegex(CouncilSearchCancelledError, "cancelled"):
+                discover_planit_reconciliation_applications(
+                    target,
+                    date(2026, 6, 8),
+                    date(2026, 6, 14),
+                )
 
     def test_discover_portal_applications_marks_blocked_but_responsive_portal_as_degraded(self) -> None:
         class BlockedScraper:
@@ -583,10 +753,7 @@ class LeadSearchTest(unittest.TestCase):
             geometry={},
         )
 
-        with (
-            patch("lead_generator.planning.leads.planning_scraper_for_target", return_value=BlockedScraper()),
-            patch("lead_generator.planning.leads.discover_planit_applications", return_value=[]),
-        ):
+        with patch("lead_generator.planning.leads.planning_scraper_for_target", return_value=BlockedScraper()):
             with self.assertRaisesRegex(CouncilSearchDegradedError, "HTTP 403"):
                 discover_portal_applications(target, date(2026, 6, 8), date(2026, 6, 14))
 
@@ -604,10 +771,7 @@ class LeadSearchTest(unittest.TestCase):
             geometry={},
         )
 
-        with (
-            patch("lead_generator.planning.leads.planning_scraper_for_target", return_value=UnavailableScraper()),
-            patch("lead_generator.planning.leads.discover_planit_applications", return_value=[]),
-        ):
+        with patch("lead_generator.planning.leads.planning_scraper_for_target", return_value=UnavailableScraper()):
             with self.assertRaisesRegex(RuntimeError, "HTTP 503"):
                 discover_portal_applications(target, date(2026, 6, 8), date(2026, 6, 14))
 
@@ -625,10 +789,7 @@ class LeadSearchTest(unittest.TestCase):
             geometry={},
         )
 
-        with (
-            patch("lead_generator.planning.leads.planning_scraper_for_target", return_value=TimedOutScraper()),
-            patch("lead_generator.planning.leads.discover_planit_applications", return_value=[]),
-        ):
+        with patch("lead_generator.planning.leads.planning_scraper_for_target", return_value=TimedOutScraper()):
             with self.assertRaisesRegex(CouncilSearchDegradedError, "timed out"):
                 discover_portal_applications(target, date(2026, 6, 8), date(2026, 6, 14))
 
@@ -679,41 +840,6 @@ class LeadSearchTest(unittest.TestCase):
         self.assertEqual(scraper_factory.call_count, 2)
         planit.assert_not_called()
 
-    def test_discover_portal_applications_uses_planit_for_empty_portal_result(self) -> None:
-        class EmptyScraper:
-            def discover_ids(self, **kwargs):
-                from lead_generator.planning.models import DiscoveryResult
-
-                return DiscoveryResult(authority="Example", source_url="https://planning.example.gov.uk", applications=[])
-
-        target = CouncilTarget(
-            authority="Example",
-            portal_family="idox",
-            scraper_type="Idox",
-            base_url="https://planning.example.gov.uk",
-            listing_url="https://planning.example.gov.uk/online-applications/search.do?action=advanced",
-            geometry={},
-        )
-        fallback = [
-            PlanningApplication(
-                authority="Example",
-                uid="26/01723/NMC",
-                url="https://example.test/app",
-                reference="26/01723/NMC",
-                date_received="2026-06-10",
-            )
-        ]
-
-        with (
-            patch("lead_generator.planning.leads.planning_scraper_for_target", return_value=EmptyScraper()),
-            patch("lead_generator.planning.leads.discover_planit_applications", return_value=fallback) as planit,
-        ):
-            applications = discover_portal_applications(target, date(2026, 6, 8), date(2026, 6, 14))
-
-        planit.assert_called_once_with("Example", date(2026, 6, 8), date(2026, 6, 14))
-        self.assertEqual([application.reference for application in applications], ["26/01723/NMC"])
-        self.assertEqual(applications[0].raw["source"], "planit_fallback")
-
     def test_portal_filtered_weekly_result_is_not_removed_by_received_date(self) -> None:
         from lead_generator.planning.models import DiscoveryResult
 
@@ -744,69 +870,1182 @@ class LeadSearchTest(unittest.TestCase):
             geometry={},
         )
 
-        with (
-            patch("lead_generator.planning.leads.planning_scraper_for_target", return_value=WeeklyScraper()),
-            patch("lead_generator.planning.leads.discover_planit_applications", return_value=[]),
-        ):
+        with patch("lead_generator.planning.leads.planning_scraper_for_target", return_value=WeeklyScraper()):
             applications = discover_portal_applications(target, date(2026, 7, 13), date(2026, 7, 19))
 
         self.assertEqual([application.reference for application in applications], ["26/00001/FUL"])
 
-    def test_discover_portal_applications_supplements_failed_details_from_planit(self) -> None:
-        from lead_generator.planning.models import DiscoveryResult
+    def test_run_lead_search_excludes_thousands_of_undated_records_from_total(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_geojson, catalogue = write_search_fixture(root, ["Example Council"])
+            config = LeadSearchConfig(
+                geojson_path=user_geojson,
+                output_root=root,
+                start_date=date(2026, 7, 20),
+                end_date=date(2026, 7, 26),
+                keywords=["gates"],
+                catalogue_path=catalogue,
+                download_application_files=False,
+                worker_count=1,
+            )
+            applications = [
+                PlanningApplication(
+                    authority="Example Council",
+                    uid=f"VALID-{index}",
+                    url=f"https://planning.example.gov.uk/valid/{index}",
+                    reference=f"VALID-{index}",
+                    date_received="2026-07-22",
+                )
+                for index in range(2)
+            ]
+            applications.extend(
+                PlanningApplication(
+                    authority="Example Council",
+                    uid=f"UNDATED-{index}",
+                    url=f"https://planning.example.gov.uk/undated/{index}",
+                    reference=f"UNDATED-{index}",
+                )
+                for index in range(2_000)
+            )
+            applications.append(
+                PlanningApplication(
+                    authority="Example Council",
+                    uid="MALFORMED-DATE",
+                    url="https://planning.example.gov.uk/malformed",
+                    reference="MALFORMED-DATE",
+                    date_received="2026-07-22garbage",
+                )
+            )
 
-        class PartialScraper:
-            def discover_ids(self, **kwargs):
-                return DiscoveryResult(
-                    authority="Example",
-                    source_url="https://planning.example.gov.uk/search",
-                    applications=[
-                        PlanningApplication(
-                            authority="Example",
-                            uid="APP1",
-                            url="https://planning.example.gov.uk/application/APP1",
-                            reference="26/00001/FUL",
-                            date_received="2026-06-10",
-                        )
-                    ],
+            with patch(
+                "lead_generator.planning.leads.discover_portal_applications",
+                return_value=applications,
+            ):
+                result = run_lead_search(config)
+
+        self.assertEqual(result.total_applications, 2)
+
+    def test_run_lead_search_excludes_blank_reference_uid_before_totals_and_output(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_geojson, catalogue = write_search_fixture(root, ["Example Council"])
+            config = LeadSearchConfig(
+                geojson_path=user_geojson,
+                output_root=root,
+                start_date=date(2026, 7, 20),
+                end_date=date(2026, 7, 26),
+                keywords=["gates"],
+                catalogue_path=catalogue,
+                worker_count=1,
+            )
+            application = PlanningApplication(
+                authority="Example Council",
+                uid="STATMAP-INTERNAL-ID",
+                url="https://planning.example.gov.uk/application/internal-id",
+                reference="   ",
+                description="Install driveway gates",
+                date_received="2026-07-22",
+            )
+            logs: list[str] = []
+            captured_counts: list[int] = []
+
+            with (
+                patch(
+                    "lead_generator.planning.leads.discover_portal_applications",
+                    return_value=[application],
+                ),
+                patch(
+                    "lead_generator.planning.leads.application_matches",
+                    return_value=True,
+                ) as matches_keywords,
+                patch(
+                    "lead_generator.planning.leads.application_matches_search_area",
+                    return_value=True,
+                ) as matches_area,
+                patch(
+                    "lead_generator.planning.leads.discover_application_documents",
+                    return_value=DocumentDiscoveryResult(),
+                ) as discover_documents,
+                patch(
+                    "lead_generator.planning.leads.enrich_application_folder",
+                    return_value=ContactEnrichment(),
+                ) as enrich_application,
+            ):
+                result = run_lead_search(
+                    config,
+                    log=logs.append,
+                    captured=captured_counts.append,
                 )
 
-            def fetch_application(self, *args, **kwargs):
-                raise RuntimeError("detail page changed")
+            with result.csv_path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
 
+        self.assertEqual(result.total_applications, 0)
+        self.assertEqual(result.leads_found, 0)
+        self.assertEqual(rows, [])
+        self.assertEqual(captured_counts, [])
+        matches_keywords.assert_not_called()
+        matches_area.assert_not_called()
+        discover_documents.assert_not_called()
+        enrich_application.assert_not_called()
+        self.assertTrue(
+            any(
+                "excluded 1 application(s) without a usable application reference"
+                in message
+                for message in logs
+            )
+        )
+
+    def test_run_lead_search_shared_pipeline_keeps_primary_record_for_duplicate_reference(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_geojson, catalogue = write_search_fixture(root, ["Example Council"])
+            config = LeadSearchConfig(
+                geojson_path=user_geojson,
+                output_root=root,
+                start_date=date(2026, 7, 20),
+                end_date=date(2026, 7, 26),
+                keywords=["gates"],
+                catalogue_path=catalogue,
+                worker_count=1,
+            )
+            primary = PlanningApplication(
+                authority="Example Council",
+                uid="PRIMARY-1",
+                url="https://planning.example.gov.uk/primary/ABC-1",
+                reference="ABC/1",
+                address="1 Primary Street",
+                description="Install driveway gates",
+                date_received="2026-07-22",
+                raw={"location": {"type": "Point", "coordinates": [0.5, 0.5]}},
+            )
+            secondary = PlanningApplication(
+                authority="Example Council",
+                uid="SECONDARY-1",
+                url="https://planit.example.test/secondary/ABC-1",
+                reference="ABC/1",
+                address="1 Secondary Street",
+                description="Install driveway gates",
+                date_received="2026-07-22",
+                raw={
+                    "source": "planit_reconciliation",
+                    "location": {"type": "Point", "coordinates": [0.5, 0.5]},
+                },
+            )
+            captured_counts: list[int] = []
+
+            with (
+                patch(
+                    "lead_generator.planning.leads.discover_portal_applications",
+                    return_value=[primary, secondary],
+                ),
+                patch(
+                    "lead_generator.planning.leads.discover_application_documents",
+                    return_value=DocumentDiscoveryResult(),
+                ) as discover_documents,
+                patch(
+                    "lead_generator.planning.leads.enrich_application_folder",
+                    return_value=ContactEnrichment(),
+                ) as enrich_application,
+            ):
+                result = run_lead_search(config, captured=captured_counts.append)
+
+            with result.csv_path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertEqual(result.total_applications, 1)
+        self.assertEqual(result.leads_found, 1)
+        self.assertEqual(captured_counts, [1])
+        self.assertEqual(discover_documents.call_count, 1)
+        self.assertEqual(enrich_application.call_count, 1)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            rows[0]["application link"],
+            "https://planning.example.gov.uk/primary/ABC-1",
+        )
+
+    def test_run_lead_search_reconciliation_phase_orders_primary_secondary_and_documents(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_geojson, catalogue = write_search_fixture(
+                root,
+                ["First Council", "Second Council"],
+            )
+            config = LeadSearchConfig(
+                geojson_path=user_geojson,
+                output_root=root,
+                start_date=date(2026, 7, 20),
+                end_date=date(2026, 7, 26),
+                keywords=["gates"],
+                catalogue_path=catalogue,
+                worker_count=2,
+            )
+            primary = PlanningApplication(
+                authority="First Council",
+                uid="PRIMARY-1",
+                url="https://planning.example.gov.uk/primary/ABC-1",
+                reference="ABC/1",
+                address="1 Primary Street",
+                description="Install driveway gates",
+                date_received="2026-07-22",
+                raw={"location": {"type": "Point", "coordinates": [0.5, 0.5]}},
+            )
+            duplicate = PlanningApplication(
+                authority="First Council",
+                uid="PLANIT-DUPLICATE",
+                url="https://planit.example.test/duplicate/ABC-1",
+                reference="ABC/1",
+                address="1 Secondary Street",
+                description="Install driveway gates",
+                date_received="2026-07-22",
+                raw={"location": {"type": "Point", "coordinates": [0.5, 0.5]}},
+            )
+            first_secondary = PlanningApplication(
+                authority="First Council",
+                uid="PLANIT-FIRST",
+                url="https://planit.example.test/first/ABC-2",
+                reference="ABC/2",
+                address="2 Secondary Street",
+                description="Install timber gates",
+                date_received="2026-07-23",
+                raw={"location": {"type": "Point", "coordinates": [0.5, 0.5]}},
+            )
+            second_secondary = PlanningApplication(
+                authority="Second Council",
+                uid="PLANIT-SECOND",
+                url="https://planit.example.test/second/XYZ-1",
+                reference="XYZ/1",
+                address="3 Secondary Street",
+                description="Install metal gates",
+                date_received="2026-07-24",
+                raw={"location": {"type": "Point", "coordinates": [0.5, 0.5]}},
+            )
+            events: list[str] = []
+            logs: list[str] = []
+            captured_counts: list[int] = []
+            reconciliation_thread_ids: list[int] = []
+            calling_thread_id = threading.get_ident()
+            final_reconciliation_log = (
+                "Second Council: reconciliation primary=0 secondary=1 added=1"
+            )
+
+            def fake_primary(target, start_date, end_date, *, should_cancel=None):
+                events.append(f"primary-query:{target.authority}")
+                if target.authority == "First Council":
+                    return [primary]
+                return []
+
+            def record_progress(current: int, total: int) -> None:
+                if current == total:
+                    events.append("all-primary-finished")
+
+            def fake_reconciliation(target, start_date, end_date, *, should_cancel=None):
+                reconciliation_thread_ids.append(threading.get_ident())
+                if target.authority == "First Council":
+                    events.append("first-planit-query")
+                    return [duplicate, first_secondary]
+                return [second_secondary]
+
+            def record_captured(current: int) -> None:
+                captured_counts.append(current)
+                if current == 3:
+                    events.append("final-reconciliation-row-committed")
+
+            def record_log(message: str) -> None:
+                logs.append(message)
+                if message == final_reconciliation_log:
+                    events.append("final-reconciliation-complete")
+
+            def fake_document_discovery(application, *, should_cancel=None, defer_rate_limit=False):
+                events.append("first-document-discovery")
+                return DocumentDiscoveryResult()
+
+            with (
+                patch(
+                    "lead_generator.planning.leads.discover_portal_applications",
+                    side_effect=fake_primary,
+                ),
+                patch(
+                    "lead_generator.planning.leads.discover_planit_reconciliation_applications",
+                    side_effect=fake_reconciliation,
+                ),
+                patch(
+                    "lead_generator.planning.leads.discover_application_documents",
+                    side_effect=fake_document_discovery,
+                ),
+                patch(
+                    "lead_generator.planning.leads.enrich_application_folder",
+                    return_value=ContactEnrichment(),
+                ),
+            ):
+                result = run_lead_search(
+                    config,
+                    log=record_log,
+                    progress=record_progress,
+                    captured=record_captured,
+                )
+
+            with result.csv_path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+
+        reconciliation_messages = [
+            message for message in logs if ": reconciliation primary=" in message
+        ]
+        primary_row = next(row for row in rows if row["Reference"] == "ABC/1")
+        self.assertEqual(result.leads_found, 3)
+        self.assertEqual(result.total_applications, 3)
+        self.assertEqual(captured_counts, [1, 2, 3])
+        self.assertTrue(
+            all("reconciliation" in message for message in reconciliation_messages)
+        )
+        self.assertEqual(
+            reconciliation_messages,
+            [
+                "First Council: reconciliation primary=1 secondary=2 added=1",
+                final_reconciliation_log,
+            ],
+        )
+        self.assertEqual(
+            primary_row["application link"],
+            "https://planning.example.gov.uk/primary/ABC-1",
+        )
+        self.assertEqual(set(reconciliation_thread_ids), {calling_thread_id})
+        self.assertEqual(len(reconciliation_thread_ids), 2)
+        self.assertLess(
+            events.index("all-primary-finished"),
+            events.index("first-planit-query"),
+        )
+        self.assertLess(
+            events.index("final-reconciliation-row-committed"),
+            events.index("final-reconciliation-complete"),
+        )
+        self.assertLess(
+            events.index("final-reconciliation-complete"),
+            events.index("first-document-discovery"),
+        )
+
+    def test_run_lead_search_secondary_filter_equivalence_keeps_only_matching_inside_row(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_geojson, catalogue = write_search_fixture(root, ["Partial Council"])
+            catalogue_data = json.loads(catalogue.read_text(encoding="utf-8"))
+            catalogue_data["features"][0]["geometry"] = polygon_feature(
+                "Partial Council",
+                0,
+                0,
+                2,
+                1,
+            )["geometry"]
+            catalogue.write_text(json.dumps(catalogue_data), encoding="utf-8")
+            config = LeadSearchConfig(
+                geojson_path=user_geojson,
+                output_root=root,
+                start_date=date(2026, 7, 20),
+                end_date=date(2026, 7, 26),
+                keywords=["gates"],
+                catalogue_path=catalogue,
+                download_application_files=False,
+                worker_count=1,
+            )
+
+            def secondary(
+                reference: str,
+                description: str,
+                received: str,
+                coordinates: list[float],
+            ) -> PlanningApplication:
+                return PlanningApplication(
+                    authority="Partial Council",
+                    uid=f"PLANIT-{reference}",
+                    url=f"https://planit.example.test/{reference}",
+                    reference=reference,
+                    description=description,
+                    date_received=received,
+                    raw={
+                        "source": "planit_reconciliation",
+                        "location": {"type": "Point", "coordinates": coordinates},
+                    },
+                )
+
+            applications = [
+                secondary("OUT-OF-DATE", "Install driveway gates", "2026-07-19", [0.5, 0.5]),
+                secondary(
+                    "EXCLUDED-PROPOSAL",
+                    "Discharge of condition 3 for driveway gates",
+                    "2026-07-22",
+                    [0.5, 0.5],
+                ),
+                secondary("NO-KEYWORD", "Build a garden wall", "2026-07-22", [0.5, 0.5]),
+                secondary("OUTSIDE-AREA", "Install driveway gates", "2026-07-22", [1.5, 0.5]),
+                secondary("MATCH", "Install driveway gates", "2026-07-22", [0.5, 0.5]),
+            ]
+
+            with (
+                patch(
+                    "lead_generator.planning.leads.discover_portal_applications",
+                    return_value=[],
+                ),
+                patch(
+                    "lead_generator.planning.leads.discover_planit_reconciliation_applications",
+                    return_value=applications,
+                ),
+            ):
+                result = run_lead_search(config)
+
+            with result.csv_path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertEqual(result.leads_found, 1)
+        self.assertEqual([row["Reference"] for row in rows], ["MATCH"])
+
+    def test_run_lead_search_reconciliation_cancel_preserves_rows_and_skips_documents(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_geojson, catalogue = write_search_fixture(
+                root,
+                ["First Council", "Second Council"],
+            )
+            config = LeadSearchConfig(
+                geojson_path=user_geojson,
+                output_root=root,
+                start_date=date(2026, 7, 20),
+                end_date=date(2026, 7, 26),
+                keywords=["gates"],
+                catalogue_path=catalogue,
+                worker_count=1,
+            )
+            primary = PlanningApplication(
+                authority="First Council",
+                uid="PRIMARY",
+                url="https://planning.example.test/primary",
+                reference="PRIMARY",
+                description="Install driveway gates",
+                date_received="2026-07-22",
+            )
+            secondary_rows = [
+                PlanningApplication(
+                    authority="First Council",
+                    uid=f"SECONDARY-{index}",
+                    url=f"https://planit.example.test/secondary-{index}",
+                    reference=f"SECONDARY-{index}",
+                    description="Install driveway gates",
+                    date_received="2026-07-22",
+                )
+                for index in range(1, 3)
+            ]
+            cancelled = False
+            reconciliation_calls: list[str] = []
+
+            def should_cancel() -> bool:
+                return cancelled
+
+            def capture_and_cancel(current: int) -> None:
+                nonlocal cancelled
+                if current == 2:
+                    cancelled = True
+
+            def fake_primary(target, start_date, end_date, *, should_cancel=None):
+                if target.authority == "First Council":
+                    return [primary]
+                return []
+
+            def fake_reconciliation(target, start_date, end_date, *, should_cancel=None):
+                reconciliation_calls.append(target.authority)
+                return secondary_rows
+
+            with (
+                patch(
+                    "lead_generator.planning.leads.discover_portal_applications",
+                    side_effect=fake_primary,
+                ),
+                patch(
+                    "lead_generator.planning.leads.discover_planit_reconciliation_applications",
+                    side_effect=fake_reconciliation,
+                ),
+                patch(
+                    "lead_generator.planning.leads.discover_application_documents",
+                    side_effect=AssertionError("document discovery started after cancellation"),
+                ),
+            ):
+                result = run_lead_search(
+                    config,
+                    captured=capture_and_cancel,
+                    should_cancel=should_cancel,
+                )
+
+            with result.csv_path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertEqual(result.completion, "Cancelled")
+        self.assertEqual(reconciliation_calls, ["First Council"])
+        self.assertEqual(
+            [row["Reference"] for row in rows],
+            ["PRIMARY", "SECONDARY-1"],
+        )
+
+    def test_run_lead_search_primary_pagination_cancel_preserves_rows_and_stops_followup_work(
+        self,
+    ) -> None:
+        class PagingHeaders:
+            def get_content_charset(self) -> str:
+                return "utf-8"
+
+        class PagingResponse:
+            headers = PagingHeaders()
+            status = 200
+
+            def __init__(self, url: str) -> None:
+                self.url = url
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def geturl(self) -> str:
+                return self.url
+
+            def read(self) -> bytes:
+                return b"<html>page</html>"
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_geojson, catalogue = write_search_fixture(
+                root,
+                ["Saved Council", "Paging Council"],
+            )
+            config = LeadSearchConfig(
+                geojson_path=user_geojson,
+                output_root=root,
+                start_date=date(2026, 7, 20),
+                end_date=date(2026, 7, 26),
+                keywords=["gates"],
+                catalogue_path=catalogue,
+                worker_count=1,
+            )
+            saved = PlanningApplication(
+                authority="Saved Council",
+                uid="SAVED-1",
+                url="https://saved.example.test/SAVED-1",
+                reference="SAVED/1",
+                description="Install driveway gates",
+                date_received="2026-07-22",
+            )
+            cancel_requested = threading.Event()
+            pagination_stopped = threading.Event()
+            fetched_pages: list[int] = []
+
+            class PagingOpener:
+                def open(self, request, timeout):
+                    page = int(request.full_url.rsplit("/", 1)[-1])
+                    fetched_pages.append(page)
+                    if page == 2:
+                        cancel_requested.set()
+                    return PagingResponse(request.full_url)
+
+            class PagingClient(CouncilHttpClient):
+                def _opener(self):
+                    return PagingOpener()
+
+            def fake_primary(
+                target,
+                start_date,
+                end_date,
+                *,
+                should_cancel=None,
+            ):
+                if target.authority == "Saved Council":
+                    return [saved]
+                client = PagingClient(min_delay_seconds=0, retries=0)
+                try:
+                    for page in range(1, 11):
+                        client.get(f"https://paging.example.test/pages/{page}")
+                finally:
+                    pagination_stopped.set()
+                return []
+
+            started = monotonic()
+            with (
+                patch(
+                    "lead_generator.planning.leads.discover_portal_applications",
+                    side_effect=fake_primary,
+                ),
+                patch(
+                    "lead_generator.planning.leads.discover_planit_reconciliation_applications",
+                    side_effect=AssertionError(
+                        "reconciliation started after primary cancellation"
+                    ),
+                ),
+                patch(
+                    "lead_generator.planning.leads.discover_application_documents",
+                    side_effect=AssertionError(
+                        "document discovery started after primary cancellation"
+                    ),
+                ),
+            ):
+                result = run_lead_search(
+                    config,
+                    should_cancel=cancel_requested.is_set,
+                )
+            elapsed = monotonic() - started
+            self.assertTrue(pagination_stopped.wait(1.0))
+
+            with result.csv_path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertEqual(result.completion, "Cancelled")
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(fetched_pages, [1, 2])
+        self.assertEqual([row["Reference"] for row in rows], ["SAVED/1"])
+
+    def test_run_lead_search_reconciliation_cancel_finalizes_completed_councils(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_geojson, catalogue = write_search_fixture(
+                root,
+                [
+                    "Warning Council",
+                    "Failed Council",
+                    "Interrupted Council",
+                    "Unreconciled Council",
+                ],
+            )
+            config = LeadSearchConfig(
+                geojson_path=user_geojson,
+                output_root=root,
+                start_date=date(2026, 7, 20),
+                end_date=date(2026, 7, 26),
+                keywords=["gates"],
+                catalogue_path=catalogue,
+                worker_count=1,
+            )
+            captured_primary = PlanningApplication(
+                authority="Interrupted Council",
+                uid="INTERRUPTED-1",
+                url="https://planning.example.test/interrupted-1",
+                reference="INTERRUPTED/1",
+                description="Install driveway gates",
+                date_received="2026-07-22",
+            )
+            reconciliation_calls: list[str] = []
+
+            def fake_primary(target, start_date, end_date, *, should_cancel=None):
+                if target.authority == "Failed Council":
+                    raise RuntimeError("primary unavailable")
+                if target.authority == "Interrupted Council":
+                    return [captured_primary]
+                return []
+
+            def fake_reconciliation(
+                target,
+                start_date,
+                end_date,
+                *,
+                should_cancel=None,
+            ):
+                reconciliation_calls.append(target.authority)
+                if target.authority == "Warning Council":
+                    raise RuntimeError("reconciliation warning")
+                if target.authority == "Failed Council":
+                    raise RuntimeError("reconciliation unavailable")
+                raise CouncilSearchCancelledError("cancelled during reconciliation")
+
+            with (
+                patch(
+                    "lead_generator.planning.leads.discover_portal_applications",
+                    side_effect=fake_primary,
+                ),
+                patch(
+                    "lead_generator.planning.leads.discover_planit_reconciliation_applications",
+                    side_effect=fake_reconciliation,
+                ),
+                patch(
+                    "lead_generator.planning.leads.discover_application_documents",
+                    side_effect=AssertionError(
+                        "document discovery started after cancellation"
+                    ),
+                ),
+            ):
+                result = run_lead_search(config)
+
+            with result.csv_path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            with result.failure_csv_path.open(newline="", encoding="utf-8") as handle:
+                failures = list(csv.DictReader(handle))
+
+        self.assertEqual(result.completion, "Cancelled")
+        self.assertEqual(
+            reconciliation_calls,
+            ["Warning Council", "Failed Council", "Interrupted Council"],
+        )
+        self.assertEqual(result.failed_councils, ["Failed Council"])
+        self.assertEqual(result.no_application_councils, ["Warning Council"])
+        self.assertEqual([row["Reference"] for row in rows], ["INTERRUPTED/1"])
+        self.assertEqual(
+            [row["council"] for row in failures],
+            ["Warning Council", "Failed Council"],
+        )
+        self.assertIn("reconciliation warning", failures[0]["reason"])
+        self.assertIn("primary unavailable", failures[1]["reason"])
+        self.assertIn("reconciliation unavailable", failures[1]["reason"])
+
+    def test_run_lead_search_reconciliation_phase_records_warning_and_continues(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_geojson, catalogue = write_search_fixture(
+                root,
+                ["Broken Council", "Working Council"],
+            )
+            config = LeadSearchConfig(
+                geojson_path=user_geojson,
+                output_root=root,
+                start_date=date(2026, 7, 20),
+                end_date=date(2026, 7, 26),
+                keywords=["gates"],
+                catalogue_path=catalogue,
+                download_application_files=False,
+                worker_count=1,
+            )
+            recovered = PlanningApplication(
+                authority="Working Council",
+                uid="WORKING-1",
+                url="https://planit.example.test/working-1",
+                reference="WORKING-1",
+                description="Install driveway gates",
+                date_received="2026-07-22",
+            )
+            reconciliation_calls: list[str] = []
+
+            def fake_reconciliation(target, start_date, end_date, *, should_cancel=None):
+                reconciliation_calls.append(target.authority)
+                if target.authority == "Broken Council":
+                    raise RuntimeError("PlanIt unavailable")
+                return [recovered]
+
+            with (
+                patch(
+                    "lead_generator.planning.leads.discover_portal_applications",
+                    return_value=[],
+                ),
+                patch(
+                    "lead_generator.planning.leads.discover_planit_reconciliation_applications",
+                    side_effect=fake_reconciliation,
+                ),
+            ):
+                result = run_lead_search(config)
+
+            with result.failure_csv_path.open(newline="", encoding="utf-8") as handle:
+                failures = list(csv.DictReader(handle))
+
+        self.assertEqual(
+            reconciliation_calls,
+            ["Broken Council", "Working Council"],
+        )
+        self.assertEqual(result.leads_found, 1)
+        self.assertEqual(result.failed_councils, [])
+        self.assertEqual(result.completion, "Completed")
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["council"], "Broken Council")
+        self.assertIn("PlanIt unavailable", failures[0]["reason"])
+
+    def test_run_lead_search_source_classification_matrix(self) -> None:
+        cases = [
+            {
+                "name": "primary_success_secondary_failure_zero_records",
+                "primary_error": None,
+                "primary_records": [],
+                "secondary_error": "reconciliation unavailable",
+                "secondary_records": [],
+                "failed": [],
+                "no_applications": ["Test Council"],
+                "completion": "Completed",
+            },
+            {
+                "name": "primary_failure_secondary_success_zero_records",
+                "primary_error": "primary unavailable",
+                "primary_records": [],
+                "secondary_error": None,
+                "secondary_records": [],
+                "failed": [],
+                "no_applications": ["Test Council"],
+                "completion": "Completed",
+            },
+            {
+                "name": "primary_failure_secondary_success_records",
+                "primary_error": "primary unavailable",
+                "primary_records": [],
+                "secondary_error": None,
+                "secondary_records": ["SECONDARY/1"],
+                "failed": [],
+                "no_applications": [],
+                "completion": "Completed",
+            },
+            {
+                "name": "primary_failure_secondary_failure",
+                "primary_error": "primary unavailable",
+                "primary_records": [],
+                "secondary_error": "reconciliation unavailable",
+                "secondary_records": [],
+                "failed": ["Test Council"],
+                "no_applications": [],
+                "completion": "Failed",
+            },
+            {
+                "name": "primary_success_secondary_success_records",
+                "primary_error": None,
+                "primary_records": ["PRIMARY/1"],
+                "secondary_error": None,
+                "secondary_records": ["SECONDARY/1"],
+                "failed": [],
+                "no_applications": [],
+                "completion": "Completed",
+            },
+        ]
+
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    user_geojson, catalogue = write_search_fixture(root, ["Test Council"])
+                    config = LeadSearchConfig(
+                        geojson_path=user_geojson,
+                        output_root=root,
+                        start_date=date(2026, 7, 20),
+                        end_date=date(2026, 7, 26),
+                        keywords=["gates"],
+                        catalogue_path=catalogue,
+                        download_application_files=False,
+                        worker_count=1,
+                    )
+
+                    def application(reference: str) -> PlanningApplication:
+                        return PlanningApplication(
+                            authority="Test Council",
+                            uid=reference,
+                            url=f"https://planning.example.test/{quote(reference, safe='')}",
+                            reference=reference,
+                            description="Install driveway gates",
+                            date_received="2026-07-22",
+                        )
+
+                    def fake_primary(target, start_date, end_date, *, should_cancel=None):
+                        if case["primary_error"]:
+                            raise RuntimeError(case["primary_error"])
+                        return [application(reference) for reference in case["primary_records"]]
+
+                    def fake_reconciliation(
+                        target,
+                        start_date,
+                        end_date,
+                        *,
+                        should_cancel=None,
+                    ):
+                        if case["secondary_error"]:
+                            raise RuntimeError(case["secondary_error"])
+                        return [
+                            application(reference)
+                            for reference in case["secondary_records"]
+                        ]
+
+                    with (
+                        patch(
+                            "lead_generator.planning.leads.discover_portal_applications",
+                            side_effect=fake_primary,
+                        ),
+                        patch(
+                            "lead_generator.planning.leads.discover_planit_reconciliation_applications",
+                            side_effect=fake_reconciliation,
+                        ),
+                    ):
+                        result = run_lead_search(config)
+
+                    with result.failure_csv_path.open(
+                        newline="",
+                        encoding="utf-8",
+                    ) as handle:
+                        failures = list(csv.DictReader(handle))
+
+                self.assertEqual(result.failed_councils, case["failed"])
+                self.assertEqual(
+                    result.no_application_councils,
+                    case["no_applications"],
+                )
+                self.assertEqual(result.completion, case["completion"])
+                if case["name"] == "primary_failure_secondary_failure":
+                    self.assertEqual(len(failures), 1)
+                    combined_reasons = [
+                        row["reason"]
+                        for row in failures
+                        if "primary unavailable" in row["reason"]
+                        and "reconciliation unavailable" in row["reason"]
+                    ]
+                    self.assertEqual(len(combined_reasons), 1)
+
+    def test_run_lead_search_archive_reconciliation_document_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_geojson, catalogue = write_search_fixture(root, ["Test Council"])
+            history_path = root / "archive" / "search_history.csv"
+            config = LeadSearchConfig(
+                geojson_path=user_geojson,
+                output_root=root,
+                start_date=date(2026, 7, 20),
+                end_date=date(2026, 7, 26),
+                keywords=["gates"],
+                catalogue_path=catalogue,
+                history_csv_path=history_path,
+                worker_count=1,
+            )
+
+            def application(reference: str, received: str | None) -> PlanningApplication:
+                return PlanningApplication(
+                    authority="Test Council",
+                    uid=reference,
+                    url=f"https://planning.example.test/{quote(reference, safe='')}",
+                    reference=reference,
+                    description="Install driveway gates",
+                    date_received=received,
+                    applicant_name=reference,
+                )
+
+            primary = application("PRIMARY/1", "2026-07-22")
+            duplicate = application("PRIMARY/1", "2026-07-22")
+            undated = application("UNDATED/1", None)
+            secondary_only = application("SECONDARY/1", "2026-07-23")
+            document_references: list[str] = []
+            enrichment_references: list[str] = []
+
+            def fake_document_discovery(
+                discovered_application,
+                *,
+                should_cancel=None,
+                defer_rate_limit=False,
+            ):
+                document_references.append(discovered_application.reference)
+                return DocumentDiscoveryResult(
+                    successful_sources={discovered_application.url},
+                )
+
+            def fake_enrichment(
+                folder,
+                *,
+                applicant_name=None,
+                agent_name=None,
+                site_address=None,
+                log=None,
+            ):
+                enrichment_references.append(applicant_name)
+                return ContactEnrichment()
+
+            with (
+                patch(
+                    "lead_generator.planning.leads.discover_portal_applications",
+                    return_value=[primary, undated],
+                ),
+                patch(
+                    "lead_generator.planning.leads.discover_planit_reconciliation_applications",
+                    return_value=[duplicate, secondary_only],
+                ),
+                patch(
+                    "lead_generator.planning.leads.discover_application_documents",
+                    side_effect=fake_document_discovery,
+                ),
+                patch(
+                    "lead_generator.planning.leads.enrich_application_folder",
+                    side_effect=fake_enrichment,
+                ),
+            ):
+                result = run_lead_search(config)
+
+            with history_path.open(newline="", encoding="utf-8") as handle:
+                history_row = next(csv.DictReader(handle))
+
+        self.assertEqual(history_row["Total Applications"], "2")
+        self.assertEqual(history_row["Relevant Captured Applications"], "2")
+        self.assertEqual(history_row["% Relevant"], "100.00%")
+        self.assertEqual(document_references, ["PRIMARY/1", "SECONDARY/1"])
+        self.assertEqual(enrichment_references, ["PRIMARY/1", "SECONDARY/1"])
+        self.assertEqual(result.total_applications, 2)
+        self.assertEqual(result.leads_found, 2)
+        self.assertEqual(result.no_application_councils, [])
+
+    def test_shared_pipeline_cross_source_counts_secondary_and_keeps_primary_record(
+        self,
+    ) -> None:
         target = CouncilTarget(
-            authority="Example",
-            portal_family="custom",
-            scraper_type="Custom",
+            authority="Example Council",
+            portal_family="idox",
+            scraper_type="Idox",
             base_url="https://planning.example.gov.uk",
             listing_url="https://planning.example.gov.uk/search",
             geometry={},
         )
-        fallback = [
-            PlanningApplication(
-                authority="Example",
-                uid="PLANIT1",
-                url="https://planit.example.test/application/1",
-                reference="26/00001/FUL",
-                address="1 High Street AB1 2CD",
-                description="Install entrance gates",
-                date_received="2026-06-10",
-                raw={"location": {"type": "Point", "coordinates": [-0.1, 51.5]}},
+        state = leads_module.CouncilDiscoveryState(target=target)
+        user_geojson = {
+            "type": "FeatureCollection",
+            "features": [polygon_feature("search area", 0, 0, 1, 1)],
+        }
+        primary = PlanningApplication(
+            authority=target.authority,
+            uid="PRIMARY-1",
+            url="https://planning.example.gov.uk/primary/ABC-1",
+            reference="ABC/1",
+            description="Install driveway gates",
+            date_received="2026-07-22",
+            raw={"location": {"type": "Point", "coordinates": [0.5, 0.5]}},
+        )
+        secondary = PlanningApplication(
+            authority=target.authority,
+            uid="SECONDARY-1",
+            url="https://planit.example.test/secondary/ABC-1",
+            reference="ABC/1",
+            description="Install driveway gates",
+            date_received="2026-07-22",
+            raw={"location": {"type": "Point", "coordinates": [0.5, 0.5]}},
+        )
+        total_references: set[str] = set()
+        reserved_references: set[str] = set()
+        emitted: list[PlanningApplication] = []
+        captured_counts: list[int] = []
+
+        def reserve_reference(reference: str) -> bool:
+            if reference in reserved_references:
+                return False
+            reserved_references.add(reference)
+            return True
+
+        def release_reference(reference: str) -> None:
+            reserved_references.discard(reference)
+
+        def prepare_output(application, reference):
+            def commit_output():
+                emitted.append(application)
+                return len(emitted)
+
+            return commit_output
+
+        def notify_output_saved(application, reference, current):
+            captured_counts.append(current)
+
+        common = {
+            "state": state,
+            "start_date": date(2026, 7, 20),
+            "end_date": date(2026, 7, 26),
+            "keywords": ["gates"],
+            "user_geojson": user_geojson,
+            "total_application_references": total_references,
+            "reserve_reference": reserve_reference,
+            "release_reference": release_reference,
+            "prepare_output": prepare_output,
+            "notify_output_saved": notify_output_saved,
+        }
+
+        primary_valid = leads_module._process_discovered_applications(
+            target,
+            [primary],
+            source="primary",
+            **common,
+        )
+        secondary_valid = leads_module._process_discovered_applications(
+            target,
+            [secondary],
+            source="PlanIt",
+            **common,
+        )
+
+        self.assertEqual(primary_valid, 1)
+        self.assertEqual(secondary_valid, 1)
+        self.assertEqual(state.primary_date_valid_count, 1)
+        self.assertEqual(state.secondary_date_valid_count, 1)
+        self.assertEqual(state.date_valid_references, {"ABC/1"})
+        self.assertEqual(total_references, {"ABC/1"})
+        self.assertEqual(captured_counts, [1])
+        self.assertEqual([application.url for application in emitted], [primary.url])
+
+    def test_run_lead_search_processing_failure_retry_releases_output_reference(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_geojson, catalogue = write_search_fixture(root, ["Example Council"])
+            config = LeadSearchConfig(
+                geojson_path=user_geojson,
+                output_root=root,
+                start_date=date(2026, 7, 20),
+                end_date=date(2026, 7, 26),
+                keywords=["gates"],
+                catalogue_path=catalogue,
+                worker_count=1,
             )
-        ]
+            application = PlanningApplication(
+                authority="Example Council",
+                uid="PRIMARY-1",
+                url="https://planning.example.gov.uk/primary/ABC-1",
+                reference="ABC/1",
+                address="1 Primary Street",
+                description="Install driveway gates",
+                date_received="2026-07-22",
+                raw={"location": {"type": "Point", "coordinates": [0.5, 0.5]}},
+            )
+            captured_counts: list[int] = []
+            create_attempts = 0
+            create_lead_folder = leads_module.create_lead_folder
 
-        with (
-            patch("lead_generator.planning.leads.planning_scraper_for_target", return_value=PartialScraper()),
-            patch("lead_generator.planning.leads.discover_planit_applications", return_value=fallback),
-        ):
-            applications = discover_portal_applications(target, date(2026, 6, 8), date(2026, 6, 14))
+            def flaky_create_lead_folder(output_dir, council, discovered_application):
+                nonlocal create_attempts
+                create_attempts += 1
+                if create_attempts == 1:
+                    raise RuntimeError("lead folder unavailable")
+                return create_lead_folder(output_dir, council, discovered_application)
 
-        self.assertEqual(len(applications), 1)
-        self.assertEqual(applications[0].url, "https://planning.example.gov.uk/application/APP1")
-        self.assertEqual(applications[0].address, "1 High Street AB1 2CD")
-        self.assertEqual(applications[0].description, "Install entrance gates")
-        self.assertTrue(applications[0].raw["planit_supplemented"])
-        self.assertIn("location", applications[0].raw)
+            with (
+                patch(
+                    "lead_generator.planning.leads.discover_portal_applications",
+                    return_value=[application],
+                ),
+                patch(
+                    "lead_generator.planning.leads.create_lead_folder",
+                    side_effect=flaky_create_lead_folder,
+                ),
+                patch(
+                    "lead_generator.planning.leads.discover_application_documents",
+                    return_value=DocumentDiscoveryResult(),
+                ) as discover_documents,
+                patch(
+                    "lead_generator.planning.leads.enrich_application_folder",
+                    return_value=ContactEnrichment(),
+                ) as enrich_application,
+            ):
+                result = run_lead_search(config, captured=captured_counts.append)
+
+            with result.csv_path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertEqual(create_attempts, 2)
+        self.assertEqual(result.completion, "Completed")
+        self.assertEqual(result.total_applications, 1)
+        self.assertEqual(result.leads_found, 1)
+        self.assertEqual(captured_counts, [1])
+        self.assertEqual(discover_documents.call_count, 1)
+        self.assertEqual(enrich_application.call_count, 1)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["Reference"], "ABC/1")
 
     def test_run_lead_search_writes_only_location_matched_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -922,7 +2161,7 @@ class LeadSearchTest(unittest.TestCase):
             )
             events: list[str] = []
 
-            def fake_discover(target, start_date, end_date):
+            def fake_discover(target, start_date, end_date, *, should_cancel=None):
                 events.append(f"search:{target.authority}")
                 suffix = target.authority[-1]
                 return [
@@ -938,14 +2177,18 @@ class LeadSearchTest(unittest.TestCase):
                     )
                 ]
 
-            def fake_enrich(application):
-                application.documents = [
+            def fake_document_discovery(
+                application,
+                *,
+                should_cancel=None,
+                defer_rate_limit=False,
+            ):
+                return DocumentDiscoveryResult(documents=[
                     PlanningDocument(
                         title=f"{application.reference}.pdf",
                         url=f"https://documents.example.gov.uk/{application.uid}.pdf",
                     )
-                ]
-                return application
+                ])
 
             def fake_download(documents, destination, **kwargs):
                 document = list(documents)[0]
@@ -954,7 +2197,10 @@ class LeadSearchTest(unittest.TestCase):
 
             with (
                 patch("lead_generator.planning.leads.discover_portal_applications", side_effect=fake_discover),
-                patch("lead_generator.planning.leads.enrich_application_documents", side_effect=fake_enrich),
+                patch(
+                    "lead_generator.planning.leads.discover_application_documents",
+                    side_effect=fake_document_discovery,
+                ),
                 patch("lead_generator.planning.leads._download_pdf_documents_once", side_effect=fake_download),
                 patch("lead_generator.planning.leads.MAX_CONCURRENT_DOCUMENT_BATCHES", 1),
                 patch("lead_generator.planning.leads.enrich_application_folder", return_value=ContactEnrichment()),
@@ -967,7 +2213,7 @@ class LeadSearchTest(unittest.TestCase):
             ["search:Council A", "search:Council B", "download:REF-A", "download:REF-B"],
         )
 
-    def test_run_lead_search_retries_document_jobs_after_first_download_pass(self) -> None:
+    def test_run_lead_search_retries_temporary_404_at_final_queue_pass(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             user_geojson, catalogue = write_search_fixture(root, ["Example Council"])
@@ -995,27 +2241,42 @@ class LeadSearchTest(unittest.TestCase):
             ]
             events: list[str] = []
 
-            def fake_enrich(application):
-                application.documents = [
+            def fake_document_discovery(
+                application,
+                *,
+                should_cancel=None,
+                defer_rate_limit=False,
+            ):
+                return DocumentDiscoveryResult(documents=[
                     PlanningDocument(
                         title=f"{application.reference}.pdf",
                         url=f"https://documents.example.gov.uk/{application.uid}.pdf",
                     )
-                ]
-                return application
+                ])
 
-            def fake_download(documents, destination, *, defer_transient=True, **kwargs):
-                document = list(documents)[0]
+            attempts: dict[str, int] = {}
+
+            def fake_download(document, **kwargs):
                 reference = Path(document.title).stem
-                events.append(f"{'first' if defer_transient else 'retry'}:{reference}")
-                if defer_transient and reference == "REF-1":
-                    return DocumentDownloadBatchResult(transient_documents=[document])
-                return DocumentDownloadBatchResult(downloaded_count=1)
+                attempts[reference] = attempts.get(reference, 0) + 1
+                events.append(
+                    f"{'first' if attempts[reference] == 1 else 'retry'}:{reference}"
+                )
+                if reference == "REF-1" and attempts[reference] == 1:
+                    raise HTTPError(document.url, 404, "Not Found", {}, None)
+                return DownloadedFile(
+                    payload=b"%PDF-1.4",
+                    final_url=document.url,
+                    content_type="application/pdf",
+                )
 
             with (
                 patch("lead_generator.planning.leads.discover_portal_applications", return_value=applications),
-                patch("lead_generator.planning.leads.enrich_application_documents", side_effect=fake_enrich),
-                patch("lead_generator.planning.leads._download_pdf_documents_once", side_effect=fake_download),
+                patch(
+                    "lead_generator.planning.leads.discover_application_documents",
+                    side_effect=fake_document_discovery,
+                ),
+                patch("lead_generator.planning.leads.download_document_file", side_effect=fake_download),
                 patch("lead_generator.planning.leads._wait_for_document_retry_cooldown", return_value=True),
                 patch("lead_generator.planning.leads.MAX_CONCURRENT_DOCUMENT_BATCHES", 1),
                 patch("lead_generator.planning.leads.enrich_application_folder", return_value=ContactEnrichment()),
@@ -1024,6 +2285,122 @@ class LeadSearchTest(unittest.TestCase):
 
         self.assertEqual(events, ["first:REF-1", "first:REF-2", "retry:REF-1"])
         self.assertEqual(result.captured_documents, 2)
+
+    def test_run_lead_search_rediscovers_partial_document_jobs_at_queue_end(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_geojson, catalogue = write_search_fixture(root, ["Example Council"])
+            config = LeadSearchConfig(
+                geojson_path=user_geojson,
+                output_root=root,
+                start_date=date(2026, 6, 1),
+                end_date=date(2026, 6, 30),
+                keywords=["gates"],
+                catalogue_path=catalogue,
+                worker_count=1,
+            )
+            application = PlanningApplication(
+                authority="Example Council",
+                uid="APP-1",
+                url="https://planning.example.test/APP-1",
+                reference="REF-1",
+                address="1 Example Street",
+                description="Install driveway gates",
+                date_received="2026-06-10",
+                raw={"location": {"type": "Point", "coordinates": [0.5, 0.5]}},
+            )
+            first = PlanningDocument(title="Proposed plan.pdf", url="https://docs.test/one.pdf")
+            second = PlanningDocument(title="Proposed elevations.pdf", url="https://docs.test/two.pdf")
+            discoveries = [
+                DocumentDiscoveryResult(
+                    documents=[first],
+                    successful_sources=["https://docs.test/a"],
+                    failed_sources=[DocumentSourceFailure("https://docs.test/b", "HTTP 503")],
+                ),
+                DocumentDiscoveryResult(
+                    documents=[first, second],
+                    successful_sources=["https://docs.test/a", "https://docs.test/b"],
+                ),
+            ]
+            download_batches: list[list[str]] = []
+            progress: list[tuple[int, int]] = []
+
+            def fake_download(documents, destination, **kwargs):
+                batch = list(documents)
+                download_batches.append([document.url for document in batch])
+                return DocumentDownloadBatchResult(downloaded_count=len(batch))
+
+            with (
+                patch("lead_generator.planning.leads.discover_portal_applications", return_value=[application]),
+                patch(
+                    "lead_generator.planning.leads.discover_application_documents",
+                    side_effect=discoveries,
+                ) as discover_documents,
+                patch("lead_generator.planning.leads._download_pdf_documents_once", side_effect=fake_download),
+                patch("lead_generator.planning.leads._wait_for_document_retry_cooldown", return_value=True),
+                patch("lead_generator.planning.leads.MAX_CONCURRENT_DOCUMENT_BATCHES", 1),
+                patch("lead_generator.planning.leads.enrich_application_folder", return_value=ContactEnrichment()),
+            ):
+                result = run_lead_search(
+                    config,
+                    document_progress=lambda done, total: progress.append((done, total)),
+                )
+
+        self.assertEqual(download_batches, [[first.url], [second.url]])
+        self.assertEqual(discover_documents.call_count, 2)
+        self.assertEqual(
+            [
+                call.kwargs["defer_rate_limit"]
+                for call in discover_documents.call_args_list
+            ],
+            [True, False],
+        )
+        self.assertEqual(progress, [(0, 1), (1, 1)])
+        self.assertEqual(result.captured_documents, 1)
+
+    def test_run_lead_search_does_not_retry_confirmed_empty_document_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_geojson, catalogue = write_search_fixture(root, ["Example Council"])
+            config = LeadSearchConfig(
+                geojson_path=user_geojson,
+                output_root=root,
+                start_date=date(2026, 6, 1),
+                end_date=date(2026, 6, 30),
+                keywords=["gates"],
+                catalogue_path=catalogue,
+                worker_count=1,
+            )
+            application = PlanningApplication(
+                authority="Example Council",
+                uid="APP-1",
+                url="https://planning.example.test/APP-1",
+                reference="REF-1",
+                address="1 Example Street",
+                description="Install driveway gates",
+                date_received="2026-06-10",
+                raw={"location": {"type": "Point", "coordinates": [0.5, 0.5]}},
+            )
+            confirmed_empty = DocumentDiscoveryResult(
+                successful_sources=["https://planning.example.test/APP-1"]
+            )
+
+            with (
+                patch("lead_generator.planning.leads.discover_portal_applications", return_value=[application]),
+                patch(
+                    "lead_generator.planning.leads.discover_application_documents",
+                    return_value=confirmed_empty,
+                ) as discover_documents,
+                patch("lead_generator.planning.leads._download_pdf_documents_once") as download_documents,
+                patch("lead_generator.planning.leads._wait_for_document_retry_cooldown") as wait_for_retry,
+                patch("lead_generator.planning.leads.enrich_application_folder", return_value=ContactEnrichment()),
+            ):
+                result = run_lead_search(config)
+
+        discover_documents.assert_called_once()
+        download_documents.assert_not_called()
+        wait_for_retry.assert_not_called()
+        self.assertEqual(result.failed_councils, [])
 
     def test_run_lead_search_reports_document_progress(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1052,7 +2429,10 @@ class LeadSearchTest(unittest.TestCase):
 
             with (
                 patch("lead_generator.planning.leads.discover_portal_applications", return_value=[application]),
-                patch("lead_generator.planning.leads.enrich_application_documents", return_value=application),
+                patch(
+                    "lead_generator.planning.leads.discover_application_documents",
+                    return_value=DocumentDiscoveryResult(),
+                ),
                 patch(
                     "lead_generator.planning.leads._download_pdf_documents_once",
                     return_value=DocumentDownloadBatchResult(),
@@ -1089,7 +2469,17 @@ class LeadSearchTest(unittest.TestCase):
 
             with (
                 patch("lead_generator.planning.leads.discover_portal_applications", return_value=[application]),
-                patch("lead_generator.planning.leads.enrich_application_documents", side_effect=RuntimeError("document portal timed out")),
+                patch(
+                    "lead_generator.planning.leads.discover_application_documents",
+                    return_value=DocumentDiscoveryResult(
+                        failed_sources=[
+                            DocumentSourceFailure(
+                                application.url,
+                                "document portal timed out",
+                            )
+                        ]
+                    ),
+                ),
                 patch("lead_generator.planning.leads._wait_for_document_retry_cooldown", return_value=True),
                 patch("lead_generator.planning.leads.enrich_application_folder", return_value=ContactEnrichment()),
             ):
@@ -1154,7 +2544,7 @@ class LeadSearchTest(unittest.TestCase):
 
             with (
                 patch("lead_generator.planning.leads.discover_portal_applications", return_value=[application]),
-                patch("lead_generator.planning.leads.enrich_application_documents", side_effect=AssertionError("Documents should not be enriched")),
+                patch("lead_generator.planning.leads.discover_application_documents", side_effect=AssertionError("Documents should not be discovered")),
                 patch("lead_generator.planning.leads.download_pdf_documents", side_effect=AssertionError("Documents should not be downloaded")),
             ):
                 result = run_lead_search(config)
@@ -1369,7 +2759,7 @@ class LeadSearchTest(unittest.TestCase):
 
             broken_attempts = 0
 
-            def fake_discover(target, start_date, end_date):
+            def fake_discover(target, start_date, end_date, *, should_cancel=None):
                 nonlocal broken_attempts
                 if target.authority == "Broken Council":
                     broken_attempts += 1
@@ -1439,7 +2829,10 @@ class LeadSearchTest(unittest.TestCase):
                 result = run_lead_search(config)
 
             self.assertEqual(result.failed_councils, [])
-            self.assertEqual(result.no_application_councils, [])
+            self.assertEqual(
+                result.no_application_councils,
+                ["Responsive Council"],
+            )
             self.assertEqual(result.completion, "Completed")
             with result.failure_csv_path.open(newline="", encoding="utf-8") as handle:
                 failures = list(csv.DictReader(handle))
@@ -1509,7 +2902,7 @@ class LeadSearchTest(unittest.TestCase):
                 worker_count=1,
             )
 
-            def fake_discover(target, start_date, end_date):
+            def fake_discover(target, start_date, end_date, *, should_cancel=None):
                 if target.authority == "Broken Council":
                     raise RuntimeError("portal exploded")
                 if target.authority == "Empty Council":
@@ -1533,19 +2926,42 @@ class LeadSearchTest(unittest.TestCase):
                     ),
                 ]
 
-            def fake_enrich(application):
-                application.documents = [
+            def fake_document_discovery(
+                application,
+                *,
+                should_cancel=None,
+                defer_rate_limit=False,
+            ):
+                return DocumentDiscoveryResult(documents=[
                     PlanningDocument(
                         title="Proposed plan.pdf",
                         url="https://applications.example.gov.uk/document/proposed.pdf",
                     )
-                ]
-                return application
+                ])
 
             captured_counts: list[int] = []
+
+            def fake_reconciliation(
+                target,
+                start_date,
+                end_date,
+                *,
+                should_cancel=None,
+            ):
+                if target.authority == "Broken Council":
+                    raise RuntimeError("PlanIt unavailable")
+                return []
+
             with (
                 patch("lead_generator.planning.leads.discover_portal_applications", side_effect=fake_discover),
-                patch("lead_generator.planning.leads.enrich_application_documents", side_effect=fake_enrich),
+                patch(
+                    "lead_generator.planning.leads.discover_planit_reconciliation_applications",
+                    side_effect=fake_reconciliation,
+                ),
+                patch(
+                    "lead_generator.planning.leads.discover_application_documents",
+                    side_effect=fake_document_discovery,
+                ),
                 patch(
                     "lead_generator.planning.leads._download_pdf_documents_once",
                     return_value=DocumentDownloadBatchResult(downloaded_count=1),
@@ -1647,7 +3063,7 @@ class LeadSearchTest(unittest.TestCase):
             )
             started: list[str] = []
 
-            def fake_discover(target, start_date, end_date):
+            def fake_discover(target, start_date, end_date, *, should_cancel=None):
                 started.append(target.authority)
                 return []
 
@@ -1709,7 +3125,7 @@ class LeadSearchTest(unittest.TestCase):
             calls: list[str] = []
             rate_limited_attempts = 0
 
-            def fake_discover(target, start_date, end_date):
+            def fake_discover(target, start_date, end_date, *, should_cancel=None):
                 nonlocal rate_limited_attempts
                 calls.append(target.authority)
                 if target.authority == "Rate Limited":
@@ -1788,10 +3204,21 @@ class LeadSearchTest(unittest.TestCase):
             calls: list[str] = []
             logs: list[str] = []
 
-            def fake_discover(target, start_date, end_date):
+            def fake_discover(target, start_date, end_date, *, should_cancel=None):
                 calls.append(target.authority)
                 if target.authority == "Stuck Council":
                     release_stuck_searches.wait(timeout=2)
+                return []
+
+            def fake_reconciliation(
+                target,
+                start_date,
+                end_date,
+                *,
+                should_cancel=None,
+            ):
+                if target.authority == "Stuck Council":
+                    raise RuntimeError("PlanIt unavailable")
                 return []
 
             try:
@@ -1802,6 +3229,10 @@ class LeadSearchTest(unittest.TestCase):
                     patch(
                         "lead_generator.planning.leads.discover_portal_applications",
                         side_effect=fake_discover,
+                    ),
+                    patch(
+                        "lead_generator.planning.leads.discover_planit_reconciliation_applications",
+                        side_effect=fake_reconciliation,
                     ),
                 ):
                     result = run_lead_search(config, log=logs.append)
@@ -1884,6 +3315,35 @@ class LeadSearchTest(unittest.TestCase):
 
         self.assertEqual(applications, [])
 
+    def test_council_deadline_propagates_attempt_cancellation_to_discovery(self) -> None:
+        target = CouncilTarget(
+            authority="Cancelable Council",
+            portal_family="custom",
+            scraper_type="Custom",
+            base_url="https://planning.example.gov.uk",
+            listing_url="https://planning.example.gov.uk/search",
+            geometry={},
+        )
+        received_callbacks = []
+
+        def discover(*args, should_cancel=None, **kwargs):
+            received_callbacks.append(should_cancel)
+            return []
+
+        with patch(
+            "lead_generator.planning.leads.discover_portal_applications",
+            side_effect=discover,
+        ):
+            applications = discover_portal_applications_with_deadline(
+                target,
+                date(2026, 7, 6),
+                date(2026, 7, 12),
+            )
+
+        self.assertEqual(applications, [])
+        self.assertEqual(len(received_callbacks), 1)
+        self.assertTrue(callable(received_callbacks[0]))
+
     def test_run_lead_search_caps_configured_worker_count_at_eight(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1936,7 +3396,7 @@ class LeadSearchTest(unittest.TestCase):
             first_batch_ready = threading.Event()
             release_workers = threading.Event()
 
-            def fake_discover(target, start_date, end_date):
+            def fake_discover(target, start_date, end_date, *, should_cancel=None):
                 nonlocal active, max_active
                 with lock:
                     started.append(target.authority)
@@ -2019,8 +3479,431 @@ class LeadSearchTest(unittest.TestCase):
         with patch("lead_generator.planning.leads.fetch_planit_documents", return_value=documents) as fetch_documents:
             enriched = enrich_planit_application(application)
 
-        fetch_documents.assert_called_once_with("https://planning.bcpcouncil.gov.uk/Planning/Display/P/26/02835/HOU")
+        fetch_documents.assert_called_once()
+        self.assertEqual(
+            fetch_documents.call_args.args[0],
+            "https://planning.bcpcouncil.gov.uk/Planning/Display/P/26/02835/HOU",
+        )
         self.assertEqual(enriched.documents, documents)
+
+    def test_camden_document_source_uses_camdocs_reference_lookup(self) -> None:
+        application = PlanningApplication(
+            authority="Camden",
+            uid="2026/2898/P",
+            reference="2026/2898/P",
+            url="https://opendata.camden.gov.uk/resource/2eiu-s2cw.json",
+        )
+        expected = "https://camdocs.camden.gov.uk/CMWebDrawer/PlanRec?" + urlencode(
+            {"q": 'recContainer:"2026/2898/P"'}
+        )
+
+        self.assertIn(expected, planit_document_source_urls(application))
+
+    def test_exeter_document_source_uses_related_documents_lookup(self) -> None:
+        application = PlanningApplication(
+            authority="Exeter",
+            uid="26/1049/FUL",
+            reference="26/1049/FUL",
+            url="https://exeter.gov.uk/planning-services/permissions-and-applications/",
+        )
+        expected = (
+            "https://exeter.gov.uk/planning-services/permissions-and-applications/"
+            "related-documents?" + urlencode({"appref": "26/1049/FUL"})
+        )
+
+        self.assertIn(expected, planit_document_source_urls(application))
+
+    def test_bath_document_source_uses_active_application_host(self) -> None:
+        application = PlanningApplication(
+            authority="Bath and North East Somerset",
+            uid="26/1049/FUL",
+            reference="26/1049/FUL",
+            url="https://planning.bathnes.gov.uk/application/26-1049-FUL",
+            raw={"portal_family": "bath_planning_api"},
+        )
+
+        self.assertIn(
+            "https://planning.bathnes.gov.uk/planningdocuments=26%2F1049%2FFUL",
+            planit_document_source_urls(application),
+        )
+
+    def test_iter_document_links_skips_missing_derived_title_and_keeps_valid_link(self) -> None:
+        page_url = "https://planning.example.gov.uk/application/ABC123"
+        markup = html.fromstring(
+            """
+            <html><body>
+              <a href="/documents/download?id=missing-title"></a>
+              <a href="/documents/download?id=proposed-plan">Proposed Site Plan</a>
+            </body></html>
+            """
+        )
+
+        with patch(
+            "lead_generator.planning.leads.document_title_from_url",
+            side_effect=[None, "Proposed Site Plan.pdf"],
+        ):
+            documents = list(iter_document_links(markup, page_url))
+
+        self.assertEqual(
+            documents,
+            [("/documents/download?id=proposed-plan", "Proposed Site Plan")],
+        )
+        self.assertFalse(_is_document_link_text(None, "/documents"))
+
+    def test_associated_document_source_reads_wandsworth_link_once(self) -> None:
+        page_url = "https://planning2.wandsworth.gov.uk/planningcase/CaseDetails.aspx?case=2026/2589"
+        markup = """
+            <html><body>
+              <a href="/planningcase/comments.aspx?case=2026/2589">
+                View Associated Application Documents
+              </a>
+              <a href="/planningcase/comments.aspx?case=2026/2589">
+                View Associated Application Documents
+              </a>
+            </body></html>
+        """
+
+        self.assertEqual(
+            _associated_document_source_urls(markup, page_url),
+            ["https://planning2.wandsworth.gov.uk/planningcase/comments.aspx?case=2026/2589"],
+        )
+
+    def test_associated_document_source_skips_empty_label_and_keeps_later_link(self) -> None:
+        page_url = "https://planning.example.test/application/ABC123"
+        markup = """
+            <html><body>
+              <a href="/documents/empty"></a>
+              <a href="/documents/related">View Related Documents</a>
+            </body></html>
+        """
+
+        self.assertEqual(
+            _associated_document_source_urls(markup, page_url),
+            ["https://planning.example.test/documents/related"],
+        )
+
+    def test_associated_document_labels_are_source_only(self) -> None:
+        page_url = "https://planning.example.test/application/ABC123"
+        for label in (
+            "Click to view associated documents",
+            "View associated documents",
+            "Associated documents",
+        ):
+            with self.subTest(label=label):
+                markup = f"""
+                    <html><body>
+                      <a href="/planning/planning-documents?reference=ABC123">{label}</a>
+                      <a href="/files/proposed-elevations.pdf">Proposed elevations</a>
+                    </body></html>
+                """
+
+                self.assertEqual(
+                    _associated_document_source_urls(markup, page_url),
+                    [
+                        "https://planning.example.test/planning/"
+                        "planning-documents?reference=ABC123"
+                    ],
+                )
+                self.assertEqual(
+                    list(iter_document_links(html.fromstring(markup), page_url)),
+                    [("/files/proposed-elevations.pdf", "Proposed elevations")],
+                )
+
+    def test_suffixed_associated_document_label_is_source_only(self) -> None:
+        page_url = "https://planning.example.test/application/ABC123"
+        markup = """
+            <html><body>
+              <a href="/planning/planning-documents?reference=ABC123">
+                Click to view associated documents (opens in new window)
+              </a>
+              <a href="/files/proposed-elevations.pdf">Proposed elevations</a>
+            </body></html>
+        """
+
+        self.assertEqual(
+            _associated_document_source_urls(markup, page_url),
+            [
+                "https://planning.example.test/planning/"
+                "planning-documents?reference=ABC123"
+            ],
+        )
+        self.assertEqual(
+            list(iter_document_links(html.fromstring(markup), page_url)),
+            [("/files/proposed-elevations.pdf", "Proposed elevations")],
+        )
+
+    def test_associated_document_sources_ignore_page_chrome(self) -> None:
+        page_url = "https://planning.example.test/application/ABC123"
+        markup = """
+            <html><body>
+              <nav><a href="/navigation/documents">Plans &amp; Documents</a></nav>
+              <main><a href="/application/documents">Plans &amp; Documents</a></main>
+            </body></html>
+        """
+
+        self.assertEqual(
+            _associated_document_source_urls(markup, page_url),
+            ["https://planning.example.test/application/documents"],
+        )
+
+    def test_document_links_exclude_breadcrumb_tab_navigation_and_footer_pdf(self) -> None:
+        page_url = (
+            "https://planning.example.gov.uk/online-applications/"
+            "applicationDetails.do?keyVal=ABC123"
+        )
+        markup = html.fromstring(
+            """
+            <html><body>
+              <div class="breadcrumb">
+                <a href="/related-documents/Related%20Documents">Related Documents</a>
+              </div>
+              <nav>
+                <a href="applicationDetails.do?activeTab=externalDocuments&amp;keyVal=ABC123">
+                  Plans &amp; Documents
+                </a>
+              </nav>
+              <main>
+                <a href="/files/proposed-elevations.pdf">Proposed elevations</a>
+              </main>
+              <footer>
+                <a href="https://www.westminster.gov.uk/pay-gap.pdf">Pay Gap PDF</a>
+              </footer>
+            </body></html>
+            """
+        )
+
+        self.assertEqual(
+            list(iter_document_links(markup, page_url)),
+            [("/files/proposed-elevations.pdf", "Proposed elevations")],
+        )
+
+    def test_document_links_filter_resolved_exeter_navigation_url(self) -> None:
+        page_url = (
+            "https://exeter.gov.uk/planning-services/permissions-and-applications/"
+            "related-documents/?appref=26%2F1049%2FFUL"
+        )
+        markup = html.fromstring(
+            """
+            <html><body>
+              <a href="Related Documents">MyExeter</a>
+              <a href="26_1049_FUL-Proposed_Plan.pdf">Proposed plan</a>
+            </body></html>
+            """
+        )
+
+        self.assertEqual(
+            list(iter_document_links(markup, page_url)),
+            [("26_1049_FUL-Proposed_Plan.pdf", "Proposed plan")],
+        )
+
+    def test_associated_document_chain_is_bounded_and_does_not_loop(self) -> None:
+        root_url = "https://planning.example.gov.uk/summary/ABC123"
+        plans_url = (
+            "https://planning.example.gov.uk/online-applications/"
+            "applicationDetails.do?activeTab=externalDocuments&keyVal=ABC123"
+        )
+        associated_url = "https://planning.example.gov.uk/associated/ABC123"
+        pages = {
+            root_url: (
+                '<a href="/online-applications/applicationDetails.do?'
+                'activeTab=externalDocuments&amp;keyVal=ABC123">Plans &amp; Documents</a>'
+            ),
+            plans_url: '<a href="/associated/ABC123">view associated documents</a>',
+            associated_url: (
+                '<a href="/files/proposed-plan.pdf">Proposed plan</a>'
+                '<a href="/summary/ABC123">Plans &amp; Documents</a>'
+            ),
+        }
+        visits: list[str] = []
+
+        def fake_fetch(
+            url: str,
+            *,
+            timeout: float,
+            defer_rate_limit: bool = False,
+        ):
+            visits.append(url)
+            return pages[url], url, object()
+
+        with patch(
+            "lead_generator.planning.leads._fetch_html_document_page",
+            side_effect=fake_fetch,
+        ):
+            documents = fetch_planit_documents(root_url)
+
+        self.assertEqual(
+            [(document.title, document.url) for document in documents],
+            [("Proposed plan", "https://planning.example.gov.uk/files/proposed-plan.pdf")],
+        )
+        self.assertEqual(visits, [root_url, plans_url, associated_url])
+
+    def test_tascomi_search_url_is_treated_as_listing_page(self) -> None:
+        self.assertTrue(
+            _looks_like_listing_url(
+                "https://planning.example.test/planning/index.html?fa=search"
+            )
+        )
+
+    def test_tascomi_browser_documents_reconcile_same_source_http_failure(self) -> None:
+        application = PlanningApplication(
+            authority="Waltham Forest",
+            uid="261479",
+            url="https://planning.example.test/planning/application details?id=261479",
+            raw={"portal_family": "tascomi"},
+        )
+        normalized_source = "https://planning.example.test/planning/application%20details?id=261479"
+        unrelated_source = "https://documents.example.test/secondary"
+        document = PlanningDocument(
+            title="Proposed elevations.pdf",
+            url="https://planning.example.test/documents/proposed-elevations.pdf",
+        )
+
+        with (
+            patch(
+                "lead_generator.planning.leads.application_document_source_urls",
+                return_value=[normalized_source, unrelated_source],
+            ),
+            patch(
+                "lead_generator.planning.leads.fetch_planit_documents",
+                side_effect=[
+                    HTTPError(normalized_source, 503, "Unavailable", {}, None),
+                    HTTPError(unrelated_source, 503, "Unavailable", {}, None),
+                ],
+            ),
+            patch(
+                "lead_generator.planning.leads.fetch_browser_document_list",
+                return_value=[document],
+            ),
+        ):
+            result = discover_application_documents(application)
+
+        self.assertEqual(result.documents, [document])
+        self.assertEqual(
+            [failure.source_url for failure in result.failed_sources],
+            [unrelated_source],
+        )
+        self.assertIn(application.url, result.successful_sources)
+
+    def test_tascomi_confirmed_empty_browser_reconciles_same_source_http_failure(self) -> None:
+        application = PlanningApplication(
+            authority="Rother",
+            uid="RR/2026/0814/FULL",
+            url="https://planning.example.test/planning/index.html?fa=getApplication&id=123",
+            raw={"portal_family": "tascomi"},
+        )
+
+        with (
+            patch(
+                "lead_generator.planning.leads.application_document_source_urls",
+                return_value=[application.url],
+            ),
+            patch(
+                "lead_generator.planning.leads.fetch_planit_documents",
+                side_effect=HTTPError(application.url, 503, "Unavailable", {}, None),
+            ),
+            patch(
+                "lead_generator.planning.leads.fetch_browser_document_list",
+                return_value=[],
+            ),
+        ):
+            result = discover_application_documents(application)
+
+        self.assertEqual(result.documents, [])
+        self.assertEqual(result.failed_sources, [])
+        self.assertIn(application.url, result.successful_sources)
+
+    def test_tascomi_rate_limit_deferral_cannot_become_successful_empty(self) -> None:
+        application = PlanningApplication(
+            authority="Rother",
+            uid="RR/2026/0814/FULL",
+            url="https://planning.example.test/planning/index.html?fa=getApplication&id=123",
+            raw={"portal_family": "tascomi"},
+        )
+
+        with (
+            patch(
+                "lead_generator.planning.leads.application_document_source_urls",
+                return_value=[application.url],
+            ),
+            patch(
+                "lead_generator.planning.leads.fetch_planit_documents",
+                side_effect=leads_module._HostRateLimitDeferredError(
+                    application.url
+                ),
+            ),
+            patch(
+                "lead_generator.planning.leads._request_cooldown_remaining_seconds",
+                return_value=60.0,
+            ),
+            patch(
+                "lead_generator.planning.leads.fetch_browser_document_list",
+                return_value=[],
+            ) as browser_fallback,
+        ):
+            result = discover_application_documents(
+                application,
+                defer_rate_limit=True,
+            )
+
+        browser_fallback.assert_not_called()
+        self.assertEqual(result.documents, [])
+        self.assertEqual(result.successful_sources, [])
+        self.assertEqual(len(result.failed_sources), 1)
+        self.assertEqual(result.failed_sources[0].source_url, application.url)
+
+    def test_tascomi_browser_failure_retains_same_source_failure(self) -> None:
+        application = PlanningApplication(
+            authority="Rother",
+            uid="RR/2026/0802/LBC",
+            url="https://planning.example.test/planning/index.html?fa=getApplication&id=456",
+            raw={"portal_family": "tascomi"},
+        )
+
+        with (
+            patch(
+                "lead_generator.planning.leads.application_document_source_urls",
+                return_value=[application.url],
+            ),
+            patch(
+                "lead_generator.planning.leads.fetch_planit_documents",
+                side_effect=HTTPError(application.url, 503, "Unavailable", {}, None),
+            ),
+            patch(
+                "lead_generator.planning.leads.fetch_browser_document_list",
+                side_effect=HTTPError(application.url, 503, "Unavailable", {}, None),
+            ),
+        ):
+            result = discover_application_documents(application)
+
+        self.assertGreaterEqual(len(result.failed_sources), 1)
+        self.assertTrue(
+            all(failure.source_url == application.url for failure in result.failed_sources)
+        )
+        self.assertEqual(result.successful_sources, [])
+
+    def test_tascomi_browser_failure_is_retained_after_successful_http_empty(self) -> None:
+        application = PlanningApplication(
+            authority="Rother",
+            uid="RR/2026/0802/LBC",
+            url="https://planning.example.test/planning/index.html?fa=getApplication&id=456",
+            raw={"portal_family": "tascomi"},
+        )
+
+        with (
+            patch(
+                "lead_generator.planning.leads.application_document_source_urls",
+                return_value=[application.url],
+            ),
+            patch("lead_generator.planning.leads.fetch_planit_documents", return_value=[]),
+            patch(
+                "lead_generator.planning.leads.fetch_browser_document_list",
+                side_effect=HTTPError(application.url, 503, "Unavailable", {}, None),
+            ),
+        ):
+            result = discover_application_documents(application)
+
+        self.assertEqual(len(result.failed_sources), 1)
+        self.assertEqual(result.failed_sources[0].source_url, application.url)
 
     def test_enrich_application_documents_merges_documents_from_every_source(self) -> None:
         application = PlanningApplication(
@@ -2033,7 +3916,7 @@ class LeadSearchTest(unittest.TestCase):
             },
         )
 
-        def fake_fetch(url: str) -> list[PlanningDocument]:
+        def fake_fetch(url: str, **kwargs) -> list[PlanningDocument]:
             if "SearchResult" in url:
                 return [
                     PlanningDocument(title="Application form.pdf", url="https://documents.example.gov.uk/document/form.pdf"),
@@ -2057,32 +3940,91 @@ class LeadSearchTest(unittest.TestCase):
             ["Application form.pdf", "Site plan.pdf", "Decision notice.pdf", "Proposed elevations.dwg"],
         )
 
-    def test_download_pdf_documents_skips_exe_and_existing_only_files(self) -> None:
+    def test_discover_application_documents_keeps_partial_results(self) -> None:
+        application = PlanningApplication(
+            authority="Example",
+            uid="ABC123",
+            url="https://example.test/application/ABC123",
+        )
+        source_a = "https://example.test/documents-a"
+        source_b = "https://example.test/documents-b"
+        proposed_plan = PlanningDocument(
+            title="Proposed plan.pdf",
+            url="https://example.test/proposed-plan.pdf",
+        )
+        unavailable = HTTPError(source_b, 503, "Unavailable", {}, None)
+
+        with (
+            patch(
+                "lead_generator.planning.leads.application_document_source_urls",
+                return_value=[source_a, source_b],
+            ),
+            patch(
+                "lead_generator.planning.leads.fetch_planit_documents",
+                side_effect=[[proposed_plan], unavailable],
+            ),
+        ):
+            result = discover_application_documents(application)
+
+        self.assertEqual([document.title for document in result.documents], ["Proposed plan.pdf"])
+        self.assertEqual(result.successful_sources, [source_a])
+        self.assertEqual(result.failed_sources[0].source_url, source_b)
+        self.assertIn("503", result.failed_sources[0].reason)
+
+    def test_download_pdf_documents_allows_existing_only_drawings(self) -> None:
         documents = [
-            PlanningDocument(title="Existing elevations.pdf", url="https://planning.example.gov.uk/docs/existing-elevations.pdf"),
-            PlanningDocument(title="Existing and proposed elevations.pdf", url="https://planning.example.gov.uk/docs/existing-proposed-elevations.pdf"),
-            PlanningDocument(title="Viewer.exe", url="https://planning.example.gov.uk/docs/viewer.exe"),
+            PlanningDocument(title="Existing elevations.pdf", url="https://example.test/existing-elevations.pdf"),
+            PlanningDocument(title="Existing survey report.pdf", url="https://example.test/existing-survey.pdf"),
+            PlanningDocument(title="Existing and proposed elevations.pdf", url="https://example.test/combined.pdf"),
+            PlanningDocument(title="Viewer.exe", url="https://example.test/viewer.exe"),
         ]
 
         with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory)
             with patch(
                 "lead_generator.planning.leads.download_document_file",
                 return_value=DownloadedFile(
                     payload=b"%PDF-1.4",
-                    final_url="https://planning.example.gov.uk/docs/existing-proposed-elevations.pdf",
+                    final_url="https://example.test/file.pdf",
                     content_type="application/pdf",
                 ),
             ) as download_file:
-                downloaded = download_pdf_documents(documents, Path(directory))
+                downloaded = download_pdf_documents(documents, destination)
 
-            self.assertEqual(downloaded, 1)
-            download_file.assert_called_once()
-            self.assertIs(download_file.call_args.args[0], documents[1])
-            self.assertTrue((Path(directory) / "Existing and proposed elevations.pdf").exists())
-            self.assertFalse((Path(directory) / "Existing elevations.pdf").exists())
-            self.assertFalse((Path(directory) / "Viewer.exe").exists())
+            self.assertEqual(downloaded, 2)
+            self.assertEqual(
+                [call.args[0].title for call in download_file.call_args_list],
+                ["Existing elevations.pdf", "Existing and proposed elevations.pdf"],
+            )
+            self.assertTrue((destination / "Existing elevations.pdf").exists())
+            self.assertFalse((destination / "Existing survey report.pdf").exists())
+            self.assertFalse((destination / "Viewer.exe").exists())
 
-    def test_download_pdf_documents_does_not_retry_permanent_404(self) -> None:
+    def test_exeter_direct_pdf_route_is_downloadable(self) -> None:
+        document = PlanningDocument(
+            title="14/07/2026_Proposed elevations",
+            url=(
+                "https://planningdocs.exeter.gov.uk/servlets/direct/"
+                "Kexample/2/976562/1/1/AS_PDF_FILE"
+            ),
+            source_url=(
+                "https://exeter.gov.uk/planning-services/"
+                "permissions-and-applications/related-documents/"
+                "?appref=26%2F1050%2FLBC"
+            ),
+        )
+
+        self.assertTrue(leads_module._looks_like_downloadable_document(document))
+
+    def test_executable_title_with_size_is_not_downloadable(self) -> None:
+        document = PlanningDocument(
+            title="Viewer.exe (123 KB)",
+            url="https://planning.example.gov.uk/download?id=123",
+        )
+
+        self.assertFalse(leads_module._looks_like_downloadable_document(document))
+
+    def test_download_pdf_documents_retries_temporary_404_once(self) -> None:
         document = PlanningDocument(
             title="Removed plan.pdf",
             url="https://planning.example.gov.uk/docs/removed-plan.pdf",
@@ -2097,11 +4039,45 @@ class LeadSearchTest(unittest.TestCase):
                 downloaded = download_pdf_documents([document], Path(directory))
 
         self.assertEqual(downloaded, 0)
-        download_file.assert_called_once()
-        self.assertIs(download_file.call_args.args[0], document)
-        wait.assert_not_called()
+        self.assertEqual(download_file.call_count, 2)
+        self.assertTrue(all(call.args[0] is document for call in download_file.call_args_list))
+        wait.assert_called_once()
 
-    def test_download_pdf_documents_reuses_source_page_session(self) -> None:
+    def test_document_batch_defers_first_pass_404_without_blocking_same_host(self) -> None:
+        missing = PlanningDocument(
+            title="Temporarily missing plan.pdf",
+            url="https://planning.example.gov.uk/docs/missing-plan.pdf",
+        )
+        sibling = PlanningDocument(
+            title="Available elevations.pdf",
+            url="https://planning.example.gov.uk/docs/available-elevations.pdf",
+        )
+
+        def fake_download(document, **kwargs):
+            if document is missing:
+                raise HTTPError(document.url, 404, "Not Found", {}, None)
+            return DownloadedFile(
+                payload=b"%PDF-1.4",
+                final_url=document.url,
+                content_type="application/pdf",
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch(
+                "lead_generator.planning.leads.download_document_file",
+                side_effect=fake_download,
+            ) as download_file:
+                result = _download_pdf_documents_once(
+                    [missing, sibling],
+                    Path(directory),
+                )
+
+        self.assertEqual(download_file.call_count, 2)
+        self.assertEqual(result.downloaded_count, 1)
+        self.assertEqual(result.transient_documents, [missing])
+        self.assertEqual(result.failures, [])
+
+    def test_download_pdf_documents_skip_source_page_when_direct_urls_work(self) -> None:
         source_url = (
             "https://planning.example.gov.uk/online-applications/"
             "applicationDetails.do?activeTab=documents&keyVal=ABC123"
@@ -2166,7 +4142,7 @@ class LeadSearchTest(unittest.TestCase):
                 downloaded = download_pdf_documents(documents, Path(directory))
 
         self.assertEqual(downloaded, 2)
-        self.assertEqual(opener.urls.count(source_url), 1)
+        self.assertEqual(opener.urls, [document.url for document in documents])
 
     def test_document_batch_defers_remaining_same_host_after_rate_limit(self) -> None:
         documents = [
@@ -2188,6 +4164,530 @@ class LeadSearchTest(unittest.TestCase):
         self.assertEqual(download_file.call_count, 1)
         self.assertEqual(result.downloaded_count, 0)
         self.assertEqual(result.transient_documents, documents)
+
+    def test_large_rate_limited_host_batch_does_not_block_another_host(self) -> None:
+        rate_limited = [
+            PlanningDocument(
+                title=f"Plan {index}.pdf",
+                url=f"https://limited.example.gov.uk/docs/plan-{index}.pdf",
+            )
+            for index in range(1, 13)
+        ]
+        available = PlanningDocument(
+            title="Available plan.pdf",
+            url="https://available.example.gov.uk/docs/available-plan.pdf",
+        )
+
+        def download(document, **kwargs):
+            if "limited.example.gov.uk" in document.url:
+                raise HTTPError(document.url, 429, "Too Many Requests", {}, None)
+            return DownloadedFile(
+                payload=b"%PDF-available",
+                final_url=document.url,
+                content_type="application/pdf",
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch(
+                "lead_generator.planning.leads.download_document_file",
+                side_effect=download,
+            ) as download_file:
+                result = _download_pdf_documents_once(
+                    [*rate_limited, available],
+                    Path(directory),
+                )
+
+        self.assertEqual(download_file.call_count, 2)
+        self.assertEqual(result.transient_documents, rate_limited)
+        self.assertEqual(result.downloaded_count, 1)
+
+    def test_real_first_pass_429_releases_slot_for_unrelated_host(self) -> None:
+        limited_first = PlanningDocument(
+            title="First limited plan.pdf",
+            url="https://limited.example.gov.uk/docs/first.pdf",
+        )
+        limited_second = PlanningDocument(
+            title="Second limited plan.pdf",
+            url="https://limited.example.gov.uk/docs/second.pdf",
+        )
+        available = PlanningDocument(
+            title="Available plan.pdf",
+            url="https://available.example.gov.uk/docs/available.pdf",
+        )
+        cooldown_recorded = threading.Event()
+        second_waiting = threading.Event()
+        release_waits = threading.Event()
+        available_started = threading.Event()
+        results: dict[str, DocumentDownloadBatchResult] = {}
+
+        class FakeResponse:
+            headers = {"Content-Type": "application/pdf"}
+
+            def __init__(self, url: str) -> None:
+                self.url = url
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return b"%PDF-available"
+
+            def geturl(self) -> str:
+                return self.url
+
+        class HostAwareOpener:
+            def open(self, request, timeout):
+                if "limited.example.gov.uk" in request.full_url:
+                    raise HTTPError(
+                        request.full_url,
+                        429,
+                        "Too Many Requests",
+                        {},
+                        None,
+                    )
+                available_started.set()
+                return FakeResponse(request.full_url)
+
+        original_set_cooldown = leads_module._set_request_cooldown
+
+        def record_cooldown(url: str, seconds: float) -> None:
+            original_set_cooldown(url, seconds)
+            cooldown_recorded.set()
+
+        def controlled_wait(seconds: float, should_cancel) -> bool:
+            if threading.current_thread().name == "limited-second":
+                second_waiting.set()
+            return release_waits.wait(timeout=2.0)
+
+        def run_batch(name: str, document: PlanningDocument, destination: Path) -> None:
+            results[name] = _download_pdf_documents_once(
+                [document],
+                destination,
+                defer_transient=True,
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            destinations = {
+                name: root / name
+                for name in ("limited-first", "limited-second", "available")
+            }
+            for destination in destinations.values():
+                destination.mkdir()
+            with (
+                patch(
+                    "lead_generator.planning.leads._build_document_opener",
+                    return_value=HostAwareOpener(),
+                ),
+                patch(
+                    "lead_generator.planning.leads._REQUEST_COOLDOWN_UNTIL",
+                    {},
+                ),
+                patch("lead_generator.planning.leads._LAST_REQUEST_AT", {}),
+                patch(
+                    "lead_generator.planning.leads._set_request_cooldown",
+                    side_effect=record_cooldown,
+                ),
+                patch(
+                    "lead_generator.planning.leads._wait_for_cancelable_delay",
+                    side_effect=controlled_wait,
+                ),
+            ):
+                first = threading.Thread(
+                    target=run_batch,
+                    args=("limited-first", limited_first, destinations["limited-first"]),
+                    name="limited-first",
+                )
+                second = threading.Thread(
+                    target=run_batch,
+                    args=("limited-second", limited_second, destinations["limited-second"]),
+                    name="limited-second",
+                )
+                third = threading.Thread(
+                    target=run_batch,
+                    args=("available", available, destinations["available"]),
+                    name="available",
+                )
+                first.start()
+                self.assertTrue(cooldown_recorded.wait(timeout=1.0))
+                second.start()
+                second.join(timeout=1.0)
+                self.assertFalse(second.is_alive())
+                third.start()
+                try:
+                    self.assertTrue(available_started.wait(timeout=0.5))
+                finally:
+                    release_waits.set()
+                    for worker in (first, second, third):
+                        worker.join(timeout=2.0)
+
+        self.assertEqual(results["limited-first"].transient_documents, [limited_first])
+        self.assertEqual(results["limited-second"].transient_documents, [limited_second])
+        self.assertEqual(results["available"].downloaded_count, 1)
+        self.assertFalse(second_waiting.is_set())
+
+    def test_two_precooled_same_host_jobs_do_not_occupy_both_batch_slots(self) -> None:
+        limited_documents = [
+            PlanningDocument(
+                title=f"Limited plan {index}.pdf",
+                url=f"https://limited.example.gov.uk/docs/plan-{index}.pdf",
+            )
+            for index in range(1, 3)
+        ]
+        available = PlanningDocument(
+            title="Available plan.pdf",
+            url="https://available.example.gov.uk/docs/available.pdf",
+        )
+        release_waits = threading.Event()
+        available_started = threading.Event()
+        ready_for_available = threading.Event()
+        limited_finished = 0
+        state_lock = threading.Lock()
+        results: dict[str, DocumentDownloadBatchResult] = {}
+
+        class TrackingGate:
+            def __init__(self) -> None:
+                self._semaphore = threading.BoundedSemaphore(2)
+                self._lock = threading.Lock()
+                self._active = 0
+
+            def __enter__(self):
+                self._semaphore.acquire()
+                with self._lock:
+                    self._active += 1
+                    if self._active == 2:
+                        ready_for_available.set()
+                return self
+
+            def __exit__(self, *args):
+                with self._lock:
+                    self._active -= 1
+                self._semaphore.release()
+
+        class FakeResponse:
+            headers = {"Content-Type": "application/pdf"}
+
+            def __init__(self, url: str) -> None:
+                self.url = url
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return b"%PDF-available"
+
+            def geturl(self) -> str:
+                return self.url
+
+        class HostAwareOpener:
+            def open(self, request, timeout):
+                if "limited.example.gov.uk" in request.full_url:
+                    raise HTTPError(
+                        request.full_url,
+                        429,
+                        "Too Many Requests",
+                        {},
+                        None,
+                    )
+                available_started.set()
+                return FakeResponse(request.full_url)
+
+        def controlled_wait(seconds: float, should_cancel) -> bool:
+            return release_waits.wait(timeout=2.0)
+
+        def run_limited(name: str, document: PlanningDocument, destination: Path) -> None:
+            nonlocal limited_finished
+            results[name] = _download_pdf_documents_once(
+                [document],
+                destination,
+                defer_transient=True,
+            )
+            with state_lock:
+                limited_finished += 1
+                if limited_finished == 2:
+                    ready_for_available.set()
+
+        def run_available(destination: Path) -> None:
+            results["available"] = _download_pdf_documents_once(
+                [available],
+                destination,
+                defer_transient=True,
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            destinations = {
+                name: root / name
+                for name in ("limited-1", "limited-2", "available")
+            }
+            for destination in destinations.values():
+                destination.mkdir()
+            cooldowns = {
+                "limited.example.gov.uk": leads_module.monotonic() + 60.0,
+            }
+            with (
+                patch(
+                    "lead_generator.planning.leads._build_document_opener",
+                    return_value=HostAwareOpener(),
+                ),
+                patch(
+                    "lead_generator.planning.leads._DOCUMENT_DOWNLOAD_GATE",
+                    TrackingGate(),
+                ),
+                patch(
+                    "lead_generator.planning.leads._REQUEST_COOLDOWN_UNTIL",
+                    cooldowns,
+                ),
+                patch("lead_generator.planning.leads._LAST_REQUEST_AT", {}),
+                patch(
+                    "lead_generator.planning.leads._wait_for_cancelable_delay",
+                    side_effect=controlled_wait,
+                ),
+            ):
+                limited_workers = [
+                    threading.Thread(
+                        target=run_limited,
+                        args=(
+                            f"limited-{index}",
+                            document,
+                            destinations[f"limited-{index}"],
+                        ),
+                    )
+                    for index, document in enumerate(limited_documents, start=1)
+                ]
+                for worker in limited_workers:
+                    worker.start()
+                self.assertTrue(ready_for_available.wait(timeout=1.0))
+                available_worker = threading.Thread(
+                    target=run_available,
+                    args=(destinations["available"],),
+                )
+                available_worker.start()
+                try:
+                    self.assertTrue(available_started.wait(timeout=0.25))
+                finally:
+                    release_waits.set()
+                    for worker in (*limited_workers, available_worker):
+                        worker.join(timeout=2.0)
+
+        self.assertEqual(
+            results["limited-1"].transient_documents,
+            [limited_documents[0]],
+        )
+        self.assertEqual(
+            results["limited-2"].transient_documents,
+            [limited_documents[1]],
+        )
+        self.assertEqual(results["available"].downloaded_count, 1)
+
+    def test_document_batch_reuses_identical_payload_in_same_folder(self) -> None:
+        documents = [
+            PlanningDocument(
+                title="Proposed plan.pdf",
+                url="https://planning.example.gov.uk/docs/proposed-plan.pdf",
+            ),
+            PlanningDocument(
+                title="Proposed plan duplicate.pdf",
+                url="https://planning.example.gov.uk/docs/proposed-plan-copy.pdf",
+            ),
+        ]
+
+        def download(document, **kwargs):
+            return DownloadedFile(
+                payload=b"%PDF-identical",
+                final_url=document.url,
+                content_type="application/pdf",
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory)
+            with patch(
+                "lead_generator.planning.leads.download_document_file",
+                side_effect=download,
+            ):
+                result = _download_pdf_documents_once(documents, destination)
+
+            self.assertEqual(result.downloaded_count, 2)
+            files = list(destination.iterdir())
+            self.assertEqual(len(files), 1)
+            self.assertEqual(files[0].name, "Proposed plan.pdf")
+            self.assertEqual(files[0].read_bytes(), b"%PDF-identical")
+
+    def test_document_batch_counts_preexisting_identical_payload_without_copying(self) -> None:
+        document = PlanningDocument(
+            title="Renamed proposed plan.pdf",
+            url="https://planning.example.gov.uk/docs/proposed-plan.pdf",
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory)
+            existing = destination / "Previously captured.pdf"
+            existing.write_bytes(b"%PDF-identical")
+            downloaded = DownloadedFile(
+                payload=b"%PDF-identical",
+                final_url=document.url,
+                content_type="application/pdf",
+            )
+            with patch(
+                "lead_generator.planning.leads.download_document_file",
+                return_value=downloaded,
+            ):
+                result = _download_pdf_documents_once([document], destination)
+
+            self.assertEqual(result.downloaded_count, 1)
+            self.assertEqual(list(destination.iterdir()), [existing])
+
+    def test_identical_payloads_are_preserved_in_different_application_folders(self) -> None:
+        document = PlanningDocument(
+            title="Proposed plan.pdf",
+            url="https://planning.example.gov.uk/docs/proposed-plan.pdf",
+        )
+        downloaded = DownloadedFile(
+            payload=b"%PDF-identical",
+            final_url=document.url,
+            content_type="application/pdf",
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "REF-1"
+            second = root / "REF-2"
+            first.mkdir()
+            second.mkdir()
+            with patch(
+                "lead_generator.planning.leads.download_document_file",
+                return_value=downloaded,
+            ):
+                first_result = _download_pdf_documents_once([document], first)
+                second_result = _download_pdf_documents_once([document], second)
+
+            self.assertEqual(first_result.downloaded_count, 1)
+            self.assertEqual(second_result.downloaded_count, 1)
+            self.assertEqual(len(list(first.iterdir())), 1)
+            self.assertEqual(len(list(second.iterdir())), 1)
+
+    def test_document_batch_reports_permanent_and_final_transient_failures(self) -> None:
+        documents = [
+            PlanningDocument(
+                title="Missing plan.pdf",
+                url="https://documents.example.gov.uk/missing.pdf",
+            ),
+            PlanningDocument(
+                title="Rate limited plan.pdf",
+                url="https://planning.example.gov.uk/docs/rate-limited.pdf",
+            ),
+            PlanningDocument(
+                title="Blocked sibling plan.pdf",
+                url="https://planning.example.gov.uk/docs/blocked-sibling.pdf",
+            ),
+        ]
+
+        def fail_download(document, **kwargs):
+            code = 404 if "missing" in document.url else 503
+            raise HTTPError(document.url, code, "Unavailable", {}, None)
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch(
+                "lead_generator.planning.leads.download_document_file",
+                side_effect=fail_download,
+            ) as download_file:
+                result = _download_pdf_documents_once(
+                    documents,
+                    Path(directory),
+                    defer_transient=False,
+                )
+
+        self.assertEqual(download_file.call_count, 2)
+        self.assertEqual(result.transient_documents, [])
+        self.assertEqual(
+            [(failure.document, failure.reason) for failure in result.failures],
+            [
+                (documents[0], "HTTP 404"),
+                (documents[1], "HTTP 503"),
+                (documents[2], "portal remained unavailable"),
+            ],
+        )
+
+    def test_document_batch_does_not_block_host_after_optional_source_failure(self) -> None:
+        source_url = "https://planning.example.gov.uk/pr/s/detail/a0iABC"
+        documents = [
+            PlanningDocument(
+                title="Stale plan.pdf",
+                url="https://planning.example.gov.uk/docs/stale-plan.pdf",
+                source_url=source_url,
+            ),
+            PlanningDocument(
+                title="Current elevations.pdf",
+                url="https://planning.example.gov.uk/docs/current-elevations.pdf",
+                source_url=source_url,
+            ),
+        ]
+
+        class FakeResponse:
+            headers = {"Content-Type": "application/pdf"}
+
+            def __init__(self, url: str) -> None:
+                self.url = url
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return b"%PDF-1.4"
+
+            def geturl(self) -> str:
+                return self.url
+
+        class FakeOpener:
+            def __init__(self) -> None:
+                self.urls: list[str] = []
+
+            def open(self, request, timeout):
+                self.urls.append(request.full_url)
+                if request.full_url == documents[0].url:
+                    not_found = HTTPError(request.full_url, 404, "Not Found", {}, None)
+                    not_found.close()
+                    raise not_found
+                return FakeResponse(request.full_url)
+
+        opener = FakeOpener()
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch("lead_generator.planning.leads._build_document_opener", return_value=opener),
+                patch(
+                    "lead_generator.planning.leads._fetch_html_with_portal_session",
+                    return_value=("<html></html>", source_url),
+                ),
+                patch(
+                    "lead_generator.planning.leads.fetch_publisher_document_list",
+                    side_effect=RuntimeError("optional source failed"),
+                ),
+                patch("lead_generator.planning.leads.fetch_enterprise_document_list", return_value=[]),
+                patch("lead_generator.planning.leads.fetch_arcus_salesforce_document_list", return_value=[]),
+                patch("lead_generator.planning.leads.fetch_arcus_public_register_file_list", return_value=[]),
+                patch("lead_generator.planning.leads.fetch_arcus_files_public_document_list", return_value=[]),
+            ):
+                result = _download_pdf_documents_once(
+                    documents,
+                    Path(directory),
+                    defer_transient=False,
+                )
+
+        self.assertEqual(result.downloaded_count, 1)
+        self.assertEqual(
+            [(failure.document, failure.reason) for failure in result.failures],
+            [(documents[0], "HTTP 404")],
+        )
+        self.assertIn(documents[1].url, opener.urls)
 
     def test_document_rate_limit_backoff_stops_when_cancelled(self) -> None:
         document = PlanningDocument(
@@ -2224,6 +4724,552 @@ class LeadSearchTest(unittest.TestCase):
 
         self.assertEqual(opener.calls, 1)
         wait.assert_not_called()
+
+    def test_document_429_uses_conservative_default_and_retains_final_host_cooldown(self) -> None:
+        document = PlanningDocument(
+            title="Proposed plan.pdf",
+            url="https://planning.example.gov.uk/docs/proposed-plan.pdf",
+        )
+
+        class RateLimitedOpener:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def open(self, request, timeout):
+                self.calls += 1
+                raise HTTPError(request.full_url, 429, "Too Many Requests", {}, None)
+
+        opener = RateLimitedOpener()
+        with (
+            patch("lead_generator.planning.leads._throttle_request"),
+            patch(
+                "lead_generator.planning.leads._wait_for_cancelable_delay",
+                return_value=True,
+            ) as wait,
+            patch("lead_generator.planning.leads._set_request_cooldown") as set_cooldown,
+        ):
+            with self.assertRaises(HTTPError):
+                download_document_file(document, opener=opener)
+
+        self.assertEqual(opener.calls, 2)
+        self.assertEqual(
+            [entry.args for entry in set_cooldown.call_args_list],
+            [(document.url, 60.0), (document.url, 60.0)],
+        )
+        wait.assert_called_once_with(60.0, None)
+
+    def test_source_page_429_uses_rate_limit_policy_and_keeps_final_cooldown(self) -> None:
+        url = "https://planning.example.gov.uk/documents/ABC123"
+        request = Request(url)
+
+        class RateLimitedOpener:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def open(self, request, timeout):
+                self.calls += 1
+                raise HTTPError(request.full_url, 429, "Too Many Requests", {}, None)
+
+        opener = RateLimitedOpener()
+        with (
+            patch("lead_generator.planning.leads.sleep"),
+            patch("lead_generator.planning.leads._throttle_request"),
+            patch(
+                "lead_generator.planning.leads._wait_for_cancelable_delay",
+                return_value=True,
+            ) as wait,
+            patch("lead_generator.planning.leads._set_request_cooldown") as set_cooldown,
+        ):
+            with self.assertRaises(HTTPError):
+                _open_url_with_retry(request, timeout=30, opener=opener)
+
+        self.assertEqual(opener.calls, 4)
+        self.assertEqual(
+            [entry.args for entry in set_cooldown.call_args_list],
+            [(url, 60.0)] * 4,
+        )
+        self.assertEqual(
+            [entry.args for entry in wait.call_args_list],
+            [(60.0, None)] * 3,
+        )
+
+    def test_first_pass_source_page_429_defers_without_waiting(self) -> None:
+        source_url = "https://planning.example.gov.uk/documents/ABC123"
+        application = PlanningApplication(
+            authority="Example",
+            uid="ABC123",
+            url=source_url,
+            reference="ABC123",
+            raw={"docs_url": source_url},
+        )
+
+        class RateLimitedOpener:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def open(self, request, timeout):
+                self.calls += 1
+                raise HTTPError(
+                    request.full_url,
+                    429,
+                    "Too Many Requests",
+                    {"Retry-After": "120"},
+                    None,
+                )
+
+        opener = RateLimitedOpener()
+        with (
+            patch(
+                "lead_generator.planning.leads._build_document_opener",
+                return_value=opener,
+            ),
+            patch("lead_generator.planning.leads._REQUEST_COOLDOWN_UNTIL", {}),
+            patch("lead_generator.planning.leads._LAST_REQUEST_AT", {}),
+            patch(
+                "lead_generator.planning.leads._wait_for_cancelable_delay",
+            ) as wait,
+        ):
+            discovery = discover_application_documents(
+                application,
+                defer_rate_limit=True,
+            )
+
+        self.assertEqual(opener.calls, 1)
+        self.assertEqual(len(discovery.failed_sources), 1)
+        self.assertIn("HTTP Error 429", discovery.failed_sources[0].reason)
+        wait.assert_not_called()
+
+    def test_document_discovery_rate_limit_wait_propagates_cancellation(self) -> None:
+        source_url = "https://planning.example.gov.uk/documents/ABC123"
+        application = PlanningApplication(
+            authority="Example",
+            uid="ABC123",
+            url=source_url,
+            reference="ABC123",
+            raw={"docs_url": source_url},
+        )
+        cancel_checks = 0
+
+        def should_cancel() -> bool:
+            nonlocal cancel_checks
+            cancel_checks += 1
+            return cancel_checks >= 2
+
+        class RateLimitedOpener:
+            def open(self, request, timeout):
+                raise HTTPError(
+                    request.full_url,
+                    429,
+                    "Too Many Requests",
+                    {"Retry-After": "120"},
+                    None,
+                )
+
+        with (
+            patch(
+                "lead_generator.planning.leads._build_document_opener",
+                return_value=RateLimitedOpener(),
+            ),
+            patch("lead_generator.planning.leads._REQUEST_COOLDOWN_UNTIL", {}),
+            patch("lead_generator.planning.leads._LAST_REQUEST_AT", {}),
+            patch("lead_generator.planning.leads._throttle_request"),
+            patch(
+                "lead_generator.planning.leads._wait_for_cancelable_delay",
+                wraps=leads_module._wait_for_cancelable_delay,
+            ) as wait,
+        ):
+            with self.assertRaises(DocumentDownloadCancelledError):
+                discover_application_documents(
+                    application,
+                    should_cancel=should_cancel,
+                )
+
+        wait.assert_called_once_with(120.0, should_cancel)
+
+    def test_document_429_retry_after_is_bounded_at_120_seconds(self) -> None:
+        document = PlanningDocument(
+            title="Proposed plan.pdf",
+            url="https://planning.example.gov.uk/docs/proposed-plan.pdf",
+        )
+
+        class EventuallyAvailableOpener:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def open(self, request, timeout):
+                self.calls += 1
+                if self.calls == 1:
+                    raise HTTPError(
+                        request.full_url,
+                        429,
+                        "Too Many Requests",
+                        {"Retry-After": "999"},
+                        None,
+                    )
+                return type(
+                    "Response",
+                    (),
+                    {
+                        "headers": {"Content-Type": "application/pdf"},
+                        "__enter__": lambda self: self,
+                        "__exit__": lambda self, *args: None,
+                        "read": lambda self: b"%PDF-1.4",
+                    },
+                )()
+
+        opener = EventuallyAvailableOpener()
+        with (
+            patch("lead_generator.planning.leads._throttle_request"),
+            patch(
+                "lead_generator.planning.leads._wait_for_cancelable_delay",
+                return_value=True,
+            ) as wait,
+            patch("lead_generator.planning.leads._set_request_cooldown"),
+        ):
+            payload = download_document_file(document, opener=opener).payload
+
+        self.assertEqual(payload, b"%PDF-1.4")
+        wait.assert_called_once_with(120.0, None)
+
+    def test_final_pass_retained_cooldown_wait_is_bounded_and_cancelable(self) -> None:
+        document = PlanningDocument(
+            title="Proposed plan.pdf",
+            url="https://planning.example.gov.uk/docs/proposed-plan.pdf",
+        )
+
+        class RateLimitedOpener:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def open(self, request, timeout):
+                self.calls += 1
+                raise HTTPError(
+                    request.full_url,
+                    429,
+                    "Too Many Requests",
+                    {"Retry-After": "999"},
+                    None,
+                )
+
+        opener = RateLimitedOpener()
+        cancel_checks = 0
+
+        def should_cancel() -> bool:
+            nonlocal cancel_checks
+            cancel_checks += 1
+            return cancel_checks >= 3
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch(
+                "lead_generator.planning.leads._build_document_opener",
+                return_value=opener,
+            ),
+            patch("lead_generator.planning.leads._REQUEST_COOLDOWN_UNTIL", {}),
+            patch("lead_generator.planning.leads._LAST_REQUEST_AT", {}),
+            patch(
+                "lead_generator.planning.leads._wait_for_cancelable_delay",
+                wraps=leads_module._wait_for_cancelable_delay,
+            ) as wait,
+        ):
+            first_pass = _download_pdf_documents_once(
+                [document],
+                Path(directory),
+                defer_transient=True,
+            )
+            final_pass = _download_pdf_documents_once(
+                first_pass.transient_documents,
+                Path(directory),
+                should_cancel=should_cancel,
+                defer_transient=False,
+            )
+
+        self.assertEqual(opener.calls, 1)
+        self.assertEqual(first_pass.transient_documents, [document])
+        self.assertEqual(final_pass.downloaded_count, 0)
+        self.assertEqual(wait.call_count, 1)
+        waited_seconds, waited_callback = wait.call_args.args
+        self.assertLessEqual(waited_seconds, 120.0)
+        self.assertIs(waited_callback, should_cancel)
+
+    def test_overlapping_retry_cannot_remove_newer_host_cooldown(self) -> None:
+        document = PlanningDocument(
+            title="Proposed plan.pdf",
+            url="https://planning.example.gov.uk/docs/proposed-plan.pdf",
+        )
+        older_waiting = threading.Event()
+        release_older = threading.Event()
+        older_result: list[DownloadedFile] = []
+        older_errors: list[Exception] = []
+
+        class FakeResponse:
+            headers = {"Content-Type": "application/pdf"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return b"%PDF-1.4"
+
+        class OlderOpener:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def open(self, request, timeout):
+                self.calls += 1
+                if self.calls == 1:
+                    raise HTTPError(
+                        request.full_url,
+                        429,
+                        "Too Many Requests",
+                        {"Retry-After": "60"},
+                        None,
+                    )
+                return FakeResponse()
+
+        class NewerOpener:
+            def open(self, request, timeout):
+                raise HTTPError(
+                    request.full_url,
+                    429,
+                    "Too Many Requests",
+                    {"Retry-After": "120"},
+                    None,
+                )
+
+        def hold_older_wait(seconds: float, should_cancel) -> bool:
+            older_waiting.set()
+            return release_older.wait(timeout=2.0)
+
+        def run_older() -> None:
+            try:
+                older_result.append(
+                    _download_document_file(
+                        document,
+                        opener=OlderOpener(),
+                        defer_rate_limit=False,
+                    )
+                )
+            except Exception as exc:
+                older_errors.append(exc)
+
+        cooldowns: dict[str, float] = {}
+        with (
+            patch("lead_generator.planning.leads._REQUEST_COOLDOWN_UNTIL", cooldowns),
+            patch("lead_generator.planning.leads._LAST_REQUEST_AT", {}),
+            patch("lead_generator.planning.leads._throttle_request"),
+            patch(
+                "lead_generator.planning.leads._wait_for_cancelable_delay",
+                side_effect=hold_older_wait,
+            ),
+            patch(
+                "lead_generator.planning.leads.monotonic",
+                side_effect=[100.0, 101.0, 102.0],
+            ),
+        ):
+            older = threading.Thread(target=run_older)
+            older.start()
+            self.assertTrue(older_waiting.wait(timeout=1.0))
+            with self.assertRaises(HTTPError):
+                _download_document_file(
+                    document,
+                    opener=NewerOpener(),
+                    defer_rate_limit=True,
+                )
+            release_older.set()
+            older.join(timeout=2.0)
+
+        self.assertEqual(older_errors, [])
+        self.assertEqual(len(older_result), 1)
+        self.assertEqual(cooldowns["planning.example.gov.uk"], 221.0)
+
+    def test_browser_rate_limits_defer_host_without_first_pass_wait(self) -> None:
+        documents = [
+            PlanningDocument(
+                title=f"Browser plan {index}.pdf",
+                url=f"https://planning.example.gov.uk/index.html?fa=downloaddocument&id={index}",
+                source_url="https://planning.example.gov.uk/index.html?fa=getApplication&id=1",
+            )
+            for index in range(1, 3)
+        ]
+
+        for status in (429, 503):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                with leads_module._REQUEST_THROTTLE_LOCK:
+                    leads_module._LAST_REQUEST_AT.clear()
+                    leads_module._REQUEST_COOLDOWN_UNTIL.clear()
+
+                class RateLimitedBrowser:
+                    def __init__(self, timeout_seconds):
+                        pass
+
+                    def get(self, url):
+                        return object()
+
+                    def get_bytes(self, url):
+                        raise CouncilFetchError(f"HTTP {status} while fetching {url}")
+
+                    def close(self):
+                        pass
+
+                with (
+                    patch(
+                        "lead_generator.planning.leads.CouncilBrowserClient",
+                        RateLimitedBrowser,
+                    ),
+                    patch(
+                        "lead_generator.planning.leads._set_request_cooldown",
+                    ) as set_cooldown,
+                    patch(
+                        "lead_generator.planning.leads._wait_for_cancelable_delay",
+                    ) as wait,
+                ):
+                    result = _download_pdf_documents_once(
+                        documents,
+                        Path(directory),
+                        defer_transient=True,
+                    )
+
+                self.assertEqual(result.transient_documents, documents)
+                wait.assert_not_called()
+                if status == 429:
+                    set_cooldown.assert_called_once_with(documents[0].url, 60.0)
+                else:
+                    set_cooldown.assert_not_called()
+
+    def test_final_browser_retry_waits_for_retained_cooldown_cancelably(self) -> None:
+        document = PlanningDocument(
+            title="Browser plan.pdf",
+            url="https://planning.example.gov.uk/index.html?fa=downloaddocument&id=1",
+            source_url="https://planning.example.gov.uk/index.html?fa=getApplication&id=1",
+        )
+        browser_created = False
+
+        class UnexpectedBrowser:
+            def __init__(self, timeout_seconds):
+                nonlocal browser_created
+                browser_created = True
+
+            def close(self):
+                pass
+
+        should_cancel = lambda: False
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch(
+                "lead_generator.planning.leads.CouncilBrowserClient",
+                UnexpectedBrowser,
+            ),
+            patch(
+                "lead_generator.planning.leads._REQUEST_COOLDOWN_UNTIL",
+                {"planning.example.gov.uk": leads_module.monotonic() + 120.0},
+            ),
+            patch("lead_generator.planning.leads._LAST_REQUEST_AT", {}),
+            patch(
+                "lead_generator.planning.leads._wait_for_cancelable_delay",
+                return_value=False,
+            ) as wait,
+        ):
+            result = _download_pdf_documents_once(
+                [document],
+                Path(directory),
+                should_cancel=should_cancel,
+                defer_transient=False,
+            )
+
+        self.assertFalse(browser_created)
+        self.assertEqual(result.downloaded_count, 0)
+        wait.assert_called_once()
+        waited_seconds, waited_callback = wait.call_args.args
+        self.assertLessEqual(waited_seconds, 120.0)
+        self.assertIs(waited_callback, should_cancel)
+
+    def test_throttle_rechecks_cooldown_installed_during_spacing_wait(self) -> None:
+        url = "https://planning.example.gov.uk/docs/proposed-plan.pdf"
+        cooldowns: dict[str, float] = {}
+
+        def install_cooldown(seconds: float, should_cancel) -> bool:
+            cooldowns["planning.example.gov.uk"] = 200.0
+            return True
+
+        with (
+            patch(
+                "lead_generator.planning.leads._REQUEST_COOLDOWN_UNTIL",
+                cooldowns,
+            ),
+            patch(
+                "lead_generator.planning.leads._LAST_REQUEST_AT",
+                {"planning.example.gov.uk": 0.0},
+            ),
+            patch(
+                "lead_generator.planning.leads.monotonic",
+                side_effect=[0.0, 0.25],
+            ),
+            patch(
+                "lead_generator.planning.leads._wait_for_cancelable_delay",
+                side_effect=install_cooldown,
+            ),
+        ):
+            with self.assertRaises(leads_module._HostRateLimitDeferredError):
+                _throttle_request(url, defer_rate_limit=True)
+
+    def test_browser_source_rate_limit_cools_source_host(self) -> None:
+        document = PlanningDocument(
+            title="Browser plan.pdf",
+            url="https://files.example-cdn.test/index.html?fa=downloaddocument&id=1",
+            source_url="https://planning.example.gov.uk/index.html?fa=getApplication&id=1",
+        )
+
+        class SourceLimitedBrowser:
+            def __init__(self, timeout_seconds):
+                pass
+
+            def get(self, url):
+                raise CouncilFetchError(f"HTTP 429 while fetching {url}")
+
+            def close(self):
+                pass
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch(
+                "lead_generator.planning.leads.CouncilBrowserClient",
+                SourceLimitedBrowser,
+            ),
+            patch("lead_generator.planning.leads._throttle_request"),
+            patch(
+                "lead_generator.planning.leads._set_request_cooldown",
+            ) as set_cooldown,
+        ):
+            result = _download_pdf_documents_once(
+                [document],
+                Path(directory),
+                defer_transient=True,
+            )
+
+        self.assertEqual(result.transient_documents, [document])
+        set_cooldown.assert_called_once_with(document.source_url, 60.0)
+
+    def test_host_cooldown_wait_is_cancelable(self) -> None:
+        url = "https://planning.example.gov.uk/docs/proposed-plan.pdf"
+        with (
+            patch(
+                "lead_generator.planning.leads._REQUEST_COOLDOWN_UNTIL",
+                {"planning.example.gov.uk": 100.0},
+            ),
+            patch("lead_generator.planning.leads._LAST_REQUEST_AT", {}),
+            patch("lead_generator.planning.leads.monotonic", return_value=0.0),
+            patch(
+                "lead_generator.planning.leads._wait_for_cancelable_delay",
+                return_value=False,
+            ) as wait,
+        ):
+            with self.assertRaises(DocumentDownloadCancelledError):
+                _throttle_request(url, should_cancel=lambda: True)
+
+        wait.assert_called_once_with(100.0, unittest.mock.ANY)
 
     def test_fetch_atrium_document_list_builds_binary_document_requests(self) -> None:
         page = """
@@ -2292,6 +5338,500 @@ class LeadSearchTest(unittest.TestCase):
             "https://planning.example.gov.uk/publisher/docs/SESSION1/Document-SESSION1.pdf",
         )
 
+    def test_session_bound_publisher_candidates_refresh_for_each_opener_session(self) -> None:
+        source_url = "https://planning.example.gov.uk/publisher/mvc/listDocuments"
+        documents = [
+            PlanningDocument(
+                title=f"Proposed drawing {index}",
+                url=f"https://planning.example.gov.uk/publisher/docs/OLD/Document-{index}.pdf",
+                source_url=source_url,
+            )
+            for index in (1, 2)
+        ]
+        source_cache: dict[str, list[PlanningDocument]] = {}
+
+        class FakeResponse:
+            def __init__(self, url: str, payload: bytes, content_type: str) -> None:
+                self._url = url
+                self._payload = payload
+                self.headers = {"Content-Type": content_type}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return self._payload
+
+            def geturl(self) -> str:
+                return self._url
+
+        class FakeOpener:
+            def __init__(self, session: str) -> None:
+                self.session = session
+                self.urls: list[str] = []
+
+            def open(self, request, timeout):
+                url = request.full_url
+                self.urls.append(url)
+                if url == source_url:
+                    return FakeResponse(
+                        url,
+                        b'<script>var ctx = "/publisher"; var table = '
+                        b'{"url": "/publisher/mvc/getDocumentList"};</script>',
+                        "text/html",
+                    )
+                if "getDocumentList" in url:
+                    rows = [
+                        [
+                            "21/07/2026",
+                            "Drawing",
+                            f"Proposed drawing {index}",
+                            f"/docs/{self.session}/Document-{index}.pdf",
+                            "",
+                        ]
+                        for index in (1, 2)
+                    ]
+                    return FakeResponse(
+                        url,
+                        json.dumps({"data": rows}).encode(),
+                        "application/json",
+                    )
+                if f"/publisher/docs/{self.session}/" in url:
+                    return FakeResponse(url, b"%PDF-1.4", "application/pdf")
+                raise HTTPError(url, 404, "Expired session", {}, None)
+
+        downloaded = [
+            download_document_file(
+                document,
+                opener=FakeOpener(f"SESSION-{index}"),
+                source_cache=source_cache,
+            )
+            for index, document in enumerate(documents, start=1)
+        ]
+
+        self.assertEqual(
+            [result.final_url for result in downloaded],
+            [
+                "https://planning.example.gov.uk/publisher/docs/SESSION-1/Document-1.pdf",
+                "https://planning.example.gov.uk/publisher/docs/SESSION-2/Document-2.pdf",
+            ],
+        )
+
+    def test_session_bound_tls_fallback_rediscovers_with_replacement_opener(self) -> None:
+        source_url = "https://planning.example.gov.uk/application/ABC123"
+        session_urls = (
+            (
+                "https://planning.example.gov.uk/publisher/docs/OLD/Document.pdf",
+                "https://planning.example.gov.uk/publisher/docs/VERIFIED/Document.pdf",
+                "https://planning.example.gov.uk/publisher/docs/UNVERIFIED/Document.pdf",
+            ),
+            (
+                "https://planning.example.gov.uk/Document/Download?fileName=SitePlan.pdf&token=old",
+                "https://planning.example.gov.uk/Document/Download?fileName=SitePlan.pdf&token=verified",
+                "https://planning.example.gov.uk/Document/Download?fileName=SitePlan.pdf&token=unverified",
+            ),
+        )
+
+        class FakeResponse:
+            headers = {"Content-Type": "application/pdf"}
+
+            def __init__(self, url: str) -> None:
+                self._url = url
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return b"%PDF-1.4"
+
+            def geturl(self) -> str:
+                return self._url
+
+        for original_url, verified_url, unverified_url in session_urls:
+            with self.subTest(original_url=original_url):
+                opened: list[tuple[str, str]] = []
+                discoveries: list[str] = []
+
+                class VerifiedOpener:
+                    def open(self, request, timeout):
+                        opened.append(("verified", request.full_url))
+                        raise URLError(
+                            ssl.SSLCertVerificationError(
+                                "Missing Authority Key Identifier"
+                            )
+                        )
+
+                class UnverifiedOpener:
+                    def open(self, request, timeout):
+                        opened.append(("unverified", request.full_url))
+                        if request.full_url == unverified_url:
+                            return FakeResponse(unverified_url)
+                        raise HTTPError(request.full_url, 404, "Expired session", {}, None)
+
+                verified_opener = VerifiedOpener()
+                unverified_opener = UnverifiedOpener()
+
+                def fake_source_candidates(
+                    document,
+                    opener,
+                    *,
+                    cache=None,
+                    defer_rate_limit=False,
+                ):
+                    if opener is verified_opener:
+                        discoveries.append("verified")
+                        return [verified_url]
+                    if opener is unverified_opener:
+                        discoveries.append("unverified")
+                        return [unverified_url]
+                    raise AssertionError("unexpected opener")
+
+                document = PlanningDocument(
+                    title="Plan",
+                    url=original_url,
+                    source_url=source_url,
+                )
+                with (
+                    patch(
+                        "lead_generator.planning.leads.source_document_candidates",
+                        side_effect=fake_source_candidates,
+                    ),
+                    patch(
+                        "lead_generator.planning.leads._build_document_opener",
+                        return_value=unverified_opener,
+                    ),
+                ):
+                    downloaded = download_document_file(document, opener=verified_opener)
+
+                self.assertEqual(downloaded.final_url, unverified_url)
+                self.assertEqual(discoveries, ["verified", "unverified"])
+                self.assertNotIn(("unverified", verified_url), opened)
+
+    def test_source_document_candidate_wait_propagates_cancellation(self) -> None:
+        source_url = "https://planning.example.gov.uk/application/ABC123"
+        document = PlanningDocument(
+            title="Proposed plan.pdf",
+            url="https://planning.example.gov.uk/docs/proposed-plan.pdf",
+            source_url=source_url,
+        )
+        cancel_checks = 0
+
+        def should_cancel() -> bool:
+            nonlocal cancel_checks
+            cancel_checks += 1
+            return cancel_checks >= 2
+
+        class RateLimitedOpener:
+            def open(self, request, timeout):
+                raise HTTPError(
+                    request.full_url,
+                    429,
+                    "Too Many Requests",
+                    {"Retry-After": "120"},
+                    None,
+                )
+
+        with (
+            patch("lead_generator.planning.leads._REQUEST_COOLDOWN_UNTIL", {}),
+            patch("lead_generator.planning.leads._LAST_REQUEST_AT", {}),
+            patch("lead_generator.planning.leads._throttle_request"),
+            patch(
+                "lead_generator.planning.leads._wait_for_cancelable_delay",
+                wraps=leads_module._wait_for_cancelable_delay,
+            ) as wait,
+        ):
+            with self.assertRaises(DocumentDownloadCancelledError):
+                source_document_candidates(
+                    document,
+                    RateLimitedOpener(),
+                    should_cancel=should_cancel,
+                )
+
+        wait.assert_called_once_with(120.0, should_cancel)
+
+    def test_nested_enterprise_tls_failure_restarts_source_discovery_with_replacement_opener(self) -> None:
+        source_url = (
+            "https://planning.example.gov.uk/application/details?applicationNumber=ABC123"
+        )
+        list_path = "/documents/list"
+        stale_url = (
+            "https://planning.example.gov.uk/Document/Download?"
+            "session=stale&fileName=ApplicationForm.pdf"
+        )
+        fresh_url = (
+            "https://planning.example.gov.uk/OnlinePlanning/DisplaySearchDocument?"
+            "session=fresh&fileName=ApplicationForm.pdf"
+        )
+        source_markup = (
+            f'<div id="divDisplayDocumentsUrl" data-url="{list_path}"></div>'
+        ).encode()
+        events: list[tuple[str, str]] = []
+
+        class FakeResponse:
+            def __init__(self, url: str, payload: bytes, content_type: str) -> None:
+                self._url = url
+                self._payload = payload
+                self.headers = {"Content-Type": content_type}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return self._payload
+
+            def geturl(self) -> str:
+                return self._url
+
+        class FakeOpener:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def open(self, request, timeout):
+                url = request.full_url
+                events.append((self.name, url))
+                if url == source_url:
+                    return FakeResponse(url, source_markup, "text/html")
+                if url.startswith("https://planning.example.gov.uk/documents/list?"):
+                    if self.name == "verified":
+                        raise URLError(
+                            ssl.SSLCertVerificationError(
+                                "Missing Authority Key Identifier"
+                            )
+                        )
+                    return FakeResponse(
+                        url,
+                        (
+                            '<a href="/OnlinePlanning/DisplaySearchDocument?session=fresh&amp;'
+                            'fileName=ApplicationForm.pdf">Application Form</a>'
+                        ).encode(),
+                        "text/html",
+                    )
+                if self.name == "replacement" and url == fresh_url:
+                    return FakeResponse(url, b"%PDF-1.4", "application/pdf")
+                raise HTTPError(url, 404, "Expired session", {}, None)
+
+        verified_opener = FakeOpener("verified")
+        replacement_opener = FakeOpener("replacement")
+        document = PlanningDocument(
+            title="Application Form",
+            url=stale_url,
+            source_url=source_url,
+        )
+
+        with patch(
+            "lead_generator.planning.leads._build_document_opener",
+            return_value=replacement_opener,
+        ) as opener_factory:
+            downloaded = download_document_file(document, opener=verified_opener)
+
+        self.assertEqual(downloaded.final_url, fresh_url)
+        self.assertEqual(
+            [name for name, url in events if url == source_url],
+            ["verified", "replacement"],
+        )
+        self.assertEqual(
+            [name for name, url in events if url.startswith("https://planning.example.gov.uk/documents/list?")],
+            ["verified", "replacement"],
+        )
+        self.assertNotIn(("replacement", stale_url), events)
+        opener_factory.assert_called_once_with(verify_tls=False, tls_compat=False)
+
+    def test_generic_plan_documents_use_distinct_url_filenames(self) -> None:
+        documents = [
+            PlanningDocument(
+                title="Plan",
+                url=f"https://planning.example.gov.uk/Document/Download?fileName={filename}",
+            )
+            for filename in ("SitePlan.pdf", "FloorPlan.pdf")
+        ]
+
+        def fake_download(document, **kwargs):
+            return DownloadedFile(
+                payload=f"%PDF-{document.url}".encode(),
+                final_url=document.url,
+                content_type="application/pdf",
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory)
+            with patch(
+                "lead_generator.planning.leads.download_document_file",
+                side_effect=fake_download,
+            ):
+                result = _download_pdf_documents_once(documents, destination)
+
+            self.assertEqual(result.downloaded_count, 2)
+            self.assertEqual(
+                sorted(path.name for path in destination.iterdir()),
+                ["FloorPlan.pdf", "SitePlan.pdf"],
+            )
+
+    def test_generic_plan_fallback_matches_filename_identity(self) -> None:
+        source_url = "https://planning.example.gov.uk/application/ABC123"
+        document = PlanningDocument(
+            title="Plan",
+            url="https://planning.example.gov.uk/stale?fileName=SitePlan.pdf",
+            source_url=source_url,
+        )
+
+        class FakeResponse:
+            def __init__(self, url: str, payload: bytes, content_type: str) -> None:
+                self._url = url
+                self._payload = payload
+                self.headers = {"Content-Type": content_type}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return self._payload
+
+            def geturl(self) -> str:
+                return self._url
+
+        class FakeOpener:
+            def open(self, request, timeout):
+                url = request.full_url
+                if url == source_url:
+                    return FakeResponse(
+                        url,
+                        b"""
+                        <html><body>
+                          <a href="/current?fileName=OtherPlan.pdf">Plan</a>
+                          <a href="/current?fileName=SitePlan.pdf">Plan</a>
+                        </body></html>
+                        """,
+                        "text/html",
+                    )
+                if "/stale?" in url:
+                    raise HTTPError(url, 404, "Expired", {}, None)
+                return FakeResponse(url, b"%PDF-1.4", "application/pdf")
+
+        downloaded = download_document_file(document, opener=FakeOpener())
+
+        self.assertEqual(
+            downloaded.final_url,
+            "https://planning.example.gov.uk/current?fileName=SitePlan.pdf",
+        )
+
+    def test_source_document_candidates_prefer_exact_and_reject_ambiguous_fuzzy_matches(self) -> None:
+        source_url = "https://planning.example.gov.uk/application/ABC123"
+        wanted = PlanningDocument(
+            title="Application Form",
+            url="https://planning.example.gov.uk/files/stale.pdf",
+            source_url=source_url,
+        )
+        exact_url = "https://planning.example.gov.uk/files/application-form.pdf"
+        repeated_fuzzy_url = "https://planning.example.gov.uk/files/redacted-form.pdf"
+
+        cases = (
+            (
+                "later exact match",
+                [
+                    PlanningDocument(
+                        title="Application Form Covering Letter",
+                        url="https://planning.example.gov.uk/files/covering-letter.pdf",
+                    ),
+                    PlanningDocument(title="Application Form", url=exact_url),
+                ],
+                [exact_url],
+            ),
+            (
+                "one repeated fuzzy URL",
+                [
+                    PlanningDocument(title="Application Form Redacted", url=repeated_fuzzy_url),
+                    PlanningDocument(title="Application Form Copy", url=repeated_fuzzy_url),
+                ],
+                [repeated_fuzzy_url],
+            ),
+            (
+                "two fuzzy URLs",
+                [
+                    PlanningDocument(
+                        title="Application Form Redacted",
+                        url="https://planning.example.gov.uk/files/redacted-form.pdf",
+                    ),
+                    PlanningDocument(
+                        title="Application Form Covering Letter",
+                        url="https://planning.example.gov.uk/files/covering-letter.pdf",
+                    ),
+                ],
+                [],
+            ),
+        )
+
+        for label, candidates, expected in cases:
+            with self.subTest(label=label):
+                self.assertEqual(
+                    source_document_candidates(
+                        wanted,
+                        object(),
+                        cache={source_url: candidates},
+                    ),
+                    expected,
+                )
+
+    def test_non_generic_fallback_rejects_empty_candidate_identities(self) -> None:
+        source_url = "https://planning.example.gov.uk/Planning/Display/2024/00577/4/CD"
+        cases = (
+            (
+                "Forms",
+                "ApplicationFormRedacted.pdf",
+                "Additional Details",
+                "Material%20Schedule%20July%202026.pdf",
+            ),
+            (
+                "Additional Details",
+                "Material%20Schedule%20July%202026.pdf",
+                "Forms",
+                "ApplicationFormRedacted.pdf",
+            ),
+        )
+
+        for wanted_title, wanted_filename, other_title, other_filename in cases:
+            with self.subTest(wanted_title=wanted_title):
+                markup = f"""
+                    <html><body><table>
+                      <tr>
+                        <td><a href="/Document/Download?fileName={other_filename}">-</a></td>
+                        <td><a href="/Document/Download?fileName={other_filename}">{other_title}</a></td>
+                      </tr>
+                      <tr>
+                        <td><a href="/Document/Download?fileName={wanted_filename}">-</a></td>
+                        <td><a href="/Document/Download?fileName={wanted_filename}">{wanted_title}</a></td>
+                      </tr>
+                    </table></body></html>
+                """
+                wanted_url = (
+                    "https://planning.example.gov.uk/Document/Download?fileName="
+                    f"{wanted_filename}"
+                )
+                document = PlanningDocument(
+                    title=wanted_title,
+                    url=wanted_url,
+                    source_url=source_url,
+                )
+
+                with patch(
+                    "lead_generator.planning.leads._fetch_html_with_portal_session",
+                    return_value=(markup, source_url),
+                ):
+                    candidates = source_document_candidates(document, object())
+
+                self.assertEqual(candidates, [wanted_url])
+
     def test_document_download_retries_viewer_url_as_download_url(self) -> None:
         class FakeResponse:
             headers = {"Content-Type": "application/pdf"}
@@ -2331,9 +5871,9 @@ class LeadSearchTest(unittest.TestCase):
 
             self.assertEqual(downloaded, 1)
             self.assertTrue((Path(directory) / "Proposed plan.pdf").exists())
-            self.assertEqual(opener.urls[0], document.source_url)
-            self.assertEqual(opener.urls[1], document.url)
-            self.assertIn("documentdownload.do", opener.urls[2])
+            self.assertEqual(opener.urls[0], document.url)
+            self.assertIn("documentdownload.do", opener.urls[1])
+            self.assertNotIn(document.source_url, opener.urls)
 
     def test_document_download_warms_source_page_cookie_session(self) -> None:
         class FakeResponse:
@@ -2522,6 +6062,49 @@ class LeadSearchTest(unittest.TestCase):
             ],
         )
 
+    def test_element_backed_document_links_ignore_page_chrome(self) -> None:
+        page_url = "https://planning.example.gov.uk/application/ABC123"
+        document = html.fromstring(
+            """
+            <html><body>
+              <footer>
+                <button data-url="/files/footer-data.pdf">Footer data</button>
+                <button onclick="window.location='/files/footer-onclick.pdf'">Footer onclick</button>
+                <form method="get" action="/Document/Download">
+                  <input type="hidden" name="id" value="footer-form">
+                  <button>Footer form</button>
+                </form>
+                <iframe src="/files/footer-iframe.pdf"></iframe>
+                <embed src="/files/footer-embed.pdf">
+                <object data="/files/footer-object.pdf"></object>
+              </footer>
+              <main>
+                <button data-url="/files/main-data.pdf">Main data</button>
+                <button onclick="window.location='/files/main-onclick.pdf'">Main onclick</button>
+                <form method="get" action="/Document/Download">
+                  <input type="hidden" name="id" value="main-form">
+                  <button>Main form</button>
+                </form>
+                <iframe src="/files/main-iframe.pdf"></iframe>
+                <embed src="/files/main-embed.pdf">
+                <object data="/files/main-object.pdf"></object>
+              </main>
+            </body></html>
+            """
+        )
+
+        self.assertEqual(
+            {href for href, _title in iter_document_links(document, page_url)},
+            {
+                "/files/main-data.pdf",
+                "/files/main-onclick.pdf",
+                "https://planning.example.gov.uk/Document/Download?id=main-form",
+                "/files/main-iframe.pdf",
+                "/files/main-embed.pdf",
+                "/files/main-object.pdf",
+            },
+        )
+
     def test_fetch_publisher_document_list_reads_ajax_rows(self) -> None:
         class FakeResponse:
             def __enter__(self):
@@ -2552,6 +6135,371 @@ class LeadSearchTest(unittest.TestCase):
         self.assertEqual(documents[0].title, "APPLICATION FORM REDACTED")
         self.assertEqual(documents[0].url, "https://app.example.gov.uk/docs/A29775F9/Document-A29775F9.pdf")
         self.assertEqual(documents[0].source_url, "https://app.example.gov.uk/planningdocuments=22%2F001")
+
+    def test_fetch_publisher_document_list_propagates_endpoint_failure(self) -> None:
+        page_url = "https://app.example.test/planningdocuments=26%2F001"
+        endpoint = "https://app.example.test/publisher/mvc/getDocumentList"
+        unavailable = HTTPError(endpoint, 503, "Unavailable", {}, None)
+
+        with patch("lead_generator.planning.leads._open_url_with_retry", side_effect=unavailable):
+            with self.assertRaisesRegex(DocumentDiscoveryTransientError, "getDocumentList"):
+                fetch_publisher_document_list(
+                    '"url": "/publisher/mvc/getDocumentList"',
+                    page_url,
+                    object(),
+                )
+
+    def test_fetch_planit_documents_records_enterprise_failure_and_keeps_direct_links(self) -> None:
+        page_url = "https://planning.example.test/application?applicationNumber=26%2F001"
+        endpoint = "https://planning.example.test/documents/list"
+        page_html = f"""
+            <html><body>
+              <a href="/documents/direct-plan.pdf">Direct plan.pdf</a>
+              <div id="divDisplayDocumentsUrl" data-url="{endpoint}"></div>
+            </body></html>
+        """
+        unavailable = HTTPError(endpoint, 503, "Unavailable", {}, None)
+        discovery = DocumentDiscoveryResult()
+
+        with (
+            patch(
+                "lead_generator.planning.leads._fetch_html_document_page",
+                return_value=(page_html, page_url, object()),
+            ),
+            patch("lead_generator.planning.leads._open_url_with_retry", side_effect=unavailable),
+        ):
+            documents = fetch_planit_documents(page_url, discovery_result=discovery)
+
+        self.assertIn("Direct plan.pdf", [document.title for document in documents])
+        self.assertEqual([failure.source_url for failure in discovery.failed_sources], [endpoint])
+        self.assertIn("503", discovery.failed_sources[0].reason)
+
+    def test_fetch_planit_documents_propagates_enterprise_failure_without_collector(self) -> None:
+        page_url = "https://planning.example.test/application?applicationNumber=26%2F001"
+        endpoint = "https://planning.example.test/documents/list"
+        page_html = f'<div id="divDisplayDocumentsUrl" data-url="{endpoint}"></div>'
+        unavailable = HTTPError(endpoint, 503, "Unavailable", {}, None)
+
+        with (
+            patch(
+                "lead_generator.planning.leads._fetch_html_document_page",
+                return_value=(page_html, page_url, object()),
+            ),
+            patch("lead_generator.planning.leads._open_url_with_retry", side_effect=unavailable),
+        ):
+            with self.assertRaisesRegex(DocumentDiscoveryTransientError, "documents/list"):
+                fetch_planit_documents(page_url)
+
+    def test_fetch_enterprise_document_list_propagates_malformed_fragment(self) -> None:
+        class EmptyResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return b""
+
+        page_url = "https://planning.example.test/application?applicationNumber=26%2F001"
+        endpoint = "https://planning.example.test/documents/list"
+        page_html = f'<div id="divDisplayDocumentsUrl" data-url="{endpoint}"></div>'
+
+        with patch(
+            "lead_generator.planning.leads._open_url_with_retry",
+            return_value=EmptyResponse(),
+        ):
+            with self.assertRaisesRegex(DocumentDiscoveryTransientError, "documents/list"):
+                fetch_enterprise_document_list(page_html, page_url, object())
+
+    def test_fetch_planit_documents_selects_public_register_for_community_detail(self) -> None:
+        class FakeResponse:
+            def __init__(self, payload: dict[str, object]) -> None:
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return json.dumps(self.payload).encode()
+
+        class FakeOpener:
+            def __init__(self) -> None:
+                self.urls: list[str] = []
+
+            def open(self, request, timeout):
+                self.urls.append(request.full_url)
+                if "aura.ApexAction.execute=1" in request.full_url:
+                    return FakeResponse(
+                        {
+                            "actions": [
+                                {
+                                    "state": "SUCCESS",
+                                    "returnValue": {
+                                        "returnValue": [
+                                            {
+                                                "Id": "068PUBLIC",
+                                                "Title": "Proposed elevations",
+                                                "FileExtension": "pdf",
+                                            }
+                                        ]
+                                    },
+                                }
+                            ]
+                        }
+                    )
+                if "findContentVersionsForPlanning=1" in request.full_url:
+                    return FakeResponse({"actions": []})
+                return FakeResponse(
+                    {
+                        "actions": [
+                            {
+                                "state": "ERROR",
+                                "returnValue": None,
+                                "error": [
+                                    {
+                                        "message": "You do not have access to the Apex class named 'FilesPublicCont'."
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                )
+
+        boot = {
+            "mode": "PROD",
+            "app": "siteforce:communityApp",
+            "fwuid": "FWUID",
+            "loaded": {"APPLICATION@markup://siteforce:communityApp": "APPHASH"},
+            "pathPrefix": "/pr",
+        }
+        page_url = "https://planning.example.test/pr/s/detail/a0iABC"
+        page_html = (
+            '<a href="/documents/direct-plan.pdf">Direct plan.pdf</a>'
+            f'<script src="/pr/s/sfsites/l/{quote(json.dumps(boot, separators=(",", ":")), safe="")}/bootstrap.js"></script>'
+        )
+        discovery = DocumentDiscoveryResult()
+        opener = FakeOpener()
+
+        with patch(
+            "lead_generator.planning.leads._fetch_html_document_page",
+            return_value=(page_html, page_url, opener),
+        ):
+            documents = fetch_planit_documents(page_url, discovery_result=discovery)
+
+        self.assertEqual(
+            [document.title for document in documents],
+            ["Direct plan.pdf", "Proposed elevations.pdf"],
+        )
+        self.assertEqual(discovery.failed_sources, [])
+        self.assertEqual(len(opener.urls), 1)
+        self.assertIn("aura.ApexAction.execute=1", opener.urls[0])
+
+    def test_fetch_planit_documents_selects_salesforce_viewer_for_papplication(self) -> None:
+        boot = {
+            "mode": "PROD",
+            "app": "siteforce:napiliApp",
+            "fwuid": "FWUID",
+            "loaded": {"APPLICATION@markup://siteforce:napiliApp": "APPHASH"},
+            "pathPrefix": "",
+        }
+        page_url = "https://planning.example.test/s/papplication/a1M123/f26100751"
+        page_html = f'<script src="/s/sfsites/l/{quote(json.dumps(boot, separators=(",", ":")), safe="")}/bootstrap.js"></script>'
+        expected = PlanningDocument(
+            title="Proposed site plan.pdf",
+            url="https://planning.example.test/sfc/servlet.shepherd/version/download/068PLAN",
+            source_url=page_url,
+        )
+
+        with (
+            patch(
+                "lead_generator.planning.leads._fetch_html_document_page",
+                return_value=(page_html, page_url, object()),
+            ),
+            patch(
+                "lead_generator.planning.leads.fetch_arcus_salesforce_document_list",
+                return_value=[expected],
+            ) as salesforce,
+            patch(
+                "lead_generator.planning.leads.fetch_arcus_public_register_file_list",
+                return_value=[],
+            ) as public_register,
+            patch(
+                "lead_generator.planning.leads.fetch_arcus_files_public_document_list",
+                return_value=[],
+            ) as files_public,
+        ):
+            documents = fetch_planit_documents(page_url)
+
+        self.assertEqual(documents, [expected])
+        salesforce.assert_called_once()
+        public_register.assert_not_called()
+        files_public.assert_not_called()
+
+    def test_fetch_planit_documents_selects_files_public_for_planning_application(self) -> None:
+        boot = {
+            "mode": "PROD",
+            "app": "siteforce:napiliApp",
+            "fwuid": "FWUID",
+            "loaded": {"APPLICATION@markup://siteforce:napiliApp": "APPHASH"},
+            "pathPrefix": "/pr",
+        }
+        page_url = "https://planning.example.test/pr/s/planning-application/a0iABC/pl202600001"
+        page_html = f'<script src="/pr/s/sfsites/l/{quote(json.dumps(boot, separators=(",", ":")), safe="")}/bootstrap.js"></script>'
+        expected = PlanningDocument(
+            title="Proposed floor plans.pdf",
+            url="https://planning.example.test/pr/sfc/servlet.shepherd/version/download/068FLOOR",
+            source_url=page_url,
+        )
+
+        with (
+            patch(
+                "lead_generator.planning.leads._fetch_html_document_page",
+                return_value=(page_html, page_url, object()),
+            ),
+            patch(
+                "lead_generator.planning.leads.fetch_arcus_salesforce_document_list",
+                return_value=[],
+            ) as salesforce,
+            patch(
+                "lead_generator.planning.leads.fetch_arcus_public_register_file_list",
+                return_value=[],
+            ) as public_register,
+            patch(
+                "lead_generator.planning.leads.fetch_arcus_files_public_document_list",
+                return_value=[expected],
+            ) as files_public,
+        ):
+            documents = fetch_planit_documents(page_url)
+
+        self.assertEqual(documents, [expected])
+        salesforce.assert_not_called()
+        public_register.assert_not_called()
+        files_public.assert_called_once()
+
+    def test_fetch_planit_documents_prefers_explicit_arcus_component_metadata(self) -> None:
+        boot = {
+            "mode": "PROD",
+            "app": "siteforce:napiliApp",
+            "fwuid": "FWUID",
+            "loaded": {"APPLICATION@markup://siteforce:napiliApp": "APPHASH"},
+            "pathPrefix": "/pr",
+        }
+        page_url = "https://planning.example.test/pr/s/papplication/a0iABC/pl202600001"
+        page_html = (
+            '<div data-component="markup://arcshared:FilesPublic"></div>'
+            f'<script src="/pr/s/sfsites/l/{quote(json.dumps(boot, separators=(",", ":")), safe="")}/bootstrap.js"></script>'
+        )
+
+        with (
+            patch(
+                "lead_generator.planning.leads._fetch_html_document_page",
+                return_value=(page_html, page_url, object()),
+            ),
+            patch(
+                "lead_generator.planning.leads.fetch_arcus_salesforce_document_list",
+                return_value=[],
+            ) as salesforce,
+            patch(
+                "lead_generator.planning.leads.fetch_arcus_public_register_file_list",
+                return_value=[],
+            ) as public_register,
+            patch(
+                "lead_generator.planning.leads.fetch_arcus_files_public_document_list",
+                return_value=[],
+            ) as files_public,
+        ):
+            fetch_planit_documents(page_url)
+
+        salesforce.assert_not_called()
+        public_register.assert_not_called()
+        files_public.assert_called_once()
+
+    def test_fetch_planit_documents_does_not_guess_arcus_controller_for_unknown_route(self) -> None:
+        boot = {
+            "mode": "PROD",
+            "app": "siteforce:napiliApp",
+            "fwuid": "FWUID",
+            "loaded": {"APPLICATION@markup://siteforce:napiliApp": "APPHASH"},
+            "pathPrefix": "/pr",
+        }
+        page_url = "https://planning.example.test/pr/s/application/a0iABC"
+        page_html = f'<script src="/pr/s/sfsites/l/{quote(json.dumps(boot, separators=(",", ":")), safe="")}/bootstrap.js"></script>'
+
+        with (
+            patch(
+                "lead_generator.planning.leads._fetch_html_document_page",
+                return_value=(page_html, page_url, object()),
+            ),
+            patch("lead_generator.planning.leads.fetch_arcus_salesforce_document_list") as salesforce,
+            patch("lead_generator.planning.leads.fetch_arcus_public_register_file_list") as public_register,
+            patch("lead_generator.planning.leads.fetch_arcus_files_public_document_list") as files_public,
+        ):
+            documents = fetch_planit_documents(page_url)
+
+        self.assertEqual(documents, [])
+        salesforce.assert_not_called()
+        public_register.assert_not_called()
+        files_public.assert_not_called()
+
+    def test_arcus_document_list_fetchers_propagate_malformed_and_invalid_json(self) -> None:
+        class FakeResponse:
+            def __init__(self, payload: bytes) -> None:
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return self.payload
+
+        boot = {
+            "mode": "PROD",
+            "app": "siteforce:napiliApp",
+            "fwuid": "FWUID",
+            "loaded": {"APPLICATION@markup://siteforce:napiliApp": "APPHASH"},
+            "pathPrefix": "/pr",
+        }
+        page_html = f'<script src="/pr/s/sfsites/l/{quote(json.dumps(boot, separators=(",", ":")), safe="")}/bootstrap.js"></script>'
+        page_url = "https://planning.example.test/pr/s/planning-application/a0iABC/pl202600001"
+        fetchers = (
+            fetch_arcus_salesforce_document_list,
+            fetch_arcus_public_register_file_list,
+            fetch_arcus_files_public_document_list,
+        )
+
+        for fetcher in fetchers:
+            for payload in (b"not-json", b'{"actions": {}}'):
+                with self.subTest(fetcher=fetcher.__name__, payload=payload):
+                    with patch(
+                        "lead_generator.planning.leads._open_url_with_retry",
+                        return_value=FakeResponse(payload),
+                    ):
+                        with self.assertRaises(DocumentDiscoveryTransientError):
+                            fetcher(page_html, page_url, object())
+
+    def test_dynamic_document_fetchers_ignore_unadvertised_sources(self) -> None:
+        page_url = "https://planning.example.test/application"
+        fetchers = (
+            fetch_enterprise_document_list,
+            fetch_arcus_salesforce_document_list,
+            fetch_arcus_public_register_file_list,
+            fetch_arcus_files_public_document_list,
+        )
+
+        with patch(
+            "lead_generator.planning.leads._open_url_with_retry",
+            side_effect=AssertionError("No dynamic endpoint should be requested"),
+        ):
+            for fetcher in fetchers:
+                with self.subTest(fetcher=fetcher.__name__):
+                    self.assertEqual(fetcher("<html></html>", page_url, object()), [])
 
     def test_fetch_arcus_salesforce_document_list_reads_aura_rows(self) -> None:
         class FakeResponse:
@@ -2741,6 +6689,140 @@ class LeadSearchTest(unittest.TestCase):
         )
         self.assertEqual(documents[0].document_type, "Plans")
 
+    def test_arcus_document_download_uses_working_direct_url_before_source_page(self) -> None:
+        class FakeResponse:
+            headers = {"Content-Type": "application/pdf"}
+
+            def __init__(self, url: str) -> None:
+                self.url = url
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return b"%PDF-1.4"
+
+            def geturl(self) -> str:
+                return self.url
+
+        class FakeOpener:
+            def __init__(self) -> None:
+                self.urls: list[str] = []
+
+            def open(self, request, timeout):
+                self.urls.append(request.full_url)
+                if "/s/detail/" in request.full_url:
+                    raise AssertionError("source application page should not be requested")
+                return FakeResponse(request.full_url)
+
+        document = PlanningDocument(
+            title="Proposed elevations.pdf",
+            url="https://planning.example.test/pr/sfc/servlet.shepherd/version/download/068PLAN",
+            source_url="https://planning.example.test/pr/s/detail/a0iABC",
+        )
+        opener = FakeOpener()
+
+        downloaded = download_document_file(document, opener=opener)
+
+        self.assertEqual(downloaded.payload, b"%PDF-1.4")
+        self.assertEqual(opener.urls, [document.url])
+
+    def test_arcus_document_download_isolates_failed_fallback_and_uses_replacement(self) -> None:
+        class FakeResponse:
+            headers = {"Content-Type": "application/pdf"}
+
+            def __init__(self, url: str) -> None:
+                self.url = url
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self) -> bytes:
+                return b"%PDF-1.4"
+
+            def geturl(self) -> str:
+                return self.url
+
+        class FakeOpener:
+            def __init__(self) -> None:
+                self.urls: list[str] = []
+
+            def open(self, request, timeout):
+                self.urls.append(request.full_url)
+                if request.full_url == document.url:
+                    not_found = HTTPError(request.full_url, 404, "Not Found", {}, None)
+                    not_found.close()
+                    raise not_found
+                return FakeResponse(request.full_url)
+
+        boot = {
+            "mode": "PROD",
+            "app": "siteforce:communityApp",
+            "fwuid": "FWUID",
+            "loaded": {"APPLICATION@markup://siteforce:communityApp": "APPHASH"},
+            "pathPrefix": "/pr",
+        }
+        source_url = "https://planning.example.test/pr/s/detail/a0iABC"
+        page_html = f'<script src="/pr/s/sfsites/l/{quote(json.dumps(boot, separators=(",", ":")), safe="")}/bootstrap.js"></script>'
+        document = PlanningDocument(
+            title="Proposed elevations.pdf",
+            url="https://planning.example.test/pr/sfc/servlet.shepherd/version/download/068STALE",
+            source_url=source_url,
+        )
+        replacement = PlanningDocument(
+            title=document.title,
+            url="https://planning.example.test/pr/sfc/servlet.shepherd/version/download/068CURRENT",
+            source_url=source_url,
+        )
+        optional_failure = DocumentDiscoveryTransientError(
+            "https://planning.example.test/publisher/documents",
+            "optional source unavailable",
+        )
+        opener = FakeOpener()
+
+        try:
+            with (
+                patch(
+                    "lead_generator.planning.leads._fetch_html_with_portal_session",
+                    return_value=(page_html, source_url),
+                ),
+                patch(
+                    "lead_generator.planning.leads.fetch_publisher_document_list",
+                    side_effect=optional_failure,
+                ),
+                patch(
+                    "lead_generator.planning.leads.fetch_enterprise_document_list",
+                    return_value=[],
+                ),
+                patch(
+                    "lead_generator.planning.leads.fetch_arcus_salesforce_document_list",
+                    return_value=[],
+                ) as salesforce,
+                patch(
+                    "lead_generator.planning.leads.fetch_arcus_public_register_file_list",
+                    return_value=[replacement],
+                ) as public_register,
+                patch(
+                    "lead_generator.planning.leads.fetch_arcus_files_public_document_list",
+                    return_value=[],
+                ) as files_public,
+            ):
+                downloaded = download_document_file(document, opener=opener)
+        except DocumentDiscoveryTransientError as exc:
+            self.fail(f"optional source failure escaped fallback isolation: {exc}")
+
+        self.assertEqual(downloaded.payload, b"%PDF-1.4")
+        self.assertEqual(opener.urls, [document.url, replacement.url])
+        salesforce.assert_not_called()
+        public_register.assert_called_once()
+        files_public.assert_not_called()
+
     def test_document_download_follows_html_intermediate_page(self) -> None:
         class FakeResponse:
             def __init__(self, url: str, payload: bytes, content_type: str) -> None:
@@ -2811,6 +6893,373 @@ class LeadSearchTest(unittest.TestCase):
 
         self.assertEqual(fetch.call_count, 2)
 
+    def test_planit_pagination_rejects_lowered_and_raised_total_drift(self) -> None:
+        cases = (
+            (
+                2,
+                [{"uid": "24/00002/FUL"}],
+            ),
+            (
+                4,
+                [
+                    {"uid": "24/00002/FUL"},
+                    {"uid": "24/00003/FUL"},
+                    {"uid": "24/00004/FUL"},
+                ],
+            ),
+        )
+        for later_total, second_page_records in cases:
+            with self.subTest(later_total=later_total):
+                with patch(
+                    "lead_generator.planning.leads._fetch_json_with_retry",
+                    side_effect=[
+                        {
+                            "records": [{"uid": "24/00001/FUL"}],
+                            "total": 3,
+                        },
+                        {
+                            "records": second_page_records,
+                            "total": later_total,
+                        },
+                    ],
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "changed the advertised total",
+                    ):
+                        _discover_planit_applications_serial(
+                            "Example",
+                            date(2026, 6, 1),
+                            date(2026, 6, 30),
+                        )
+
+    def test_planit_pagination_rejects_an_omitted_later_total(self) -> None:
+        with patch(
+            "lead_generator.planning.leads._fetch_json_with_retry",
+            side_effect=[
+                {
+                    "records": [{"uid": "24/00001/FUL"}],
+                    "total": 2,
+                },
+                {
+                    "records": [{"uid": "24/00002/FUL"}],
+                },
+            ],
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "omitted the advertised total",
+            ):
+                _discover_planit_applications_serial(
+                    "Example",
+                    date(2026, 6, 1),
+                    date(2026, 6, 30),
+                )
+
+    def test_planit_pagination_uses_unique_references_through_overlapping_pages(
+        self,
+    ) -> None:
+        pages = [
+            {
+                "records": [
+                    {"uid": "24/00001/FUL"},
+                    {"uid": "24/00002/FUL"},
+                ],
+                "total": 4,
+            },
+            {
+                "records": [
+                    {"uid": "24/00002/FUL"},
+                    {"uid": "24/00003/FUL"},
+                ],
+                "total": 4,
+            },
+            {
+                "records": [{"uid": "24/00004/FUL"}],
+                "total": 4,
+            },
+        ]
+
+        with patch(
+            "lead_generator.planning.leads._fetch_json_with_retry",
+            side_effect=pages,
+        ) as fetch:
+            applications = _discover_planit_applications_serial(
+                "Example",
+                date(2026, 6, 1),
+                date(2026, 6, 30),
+            )
+
+        self.assertEqual(
+            [application.reference for application in applications],
+            [
+                "24/00001/FUL",
+                "24/00002/FUL",
+                "24/00003/FUL",
+                "24/00004/FUL",
+            ],
+        )
+        self.assertEqual(fetch.call_count, 3)
+
+    def test_planit_pagination_rejects_a_reordered_no_progress_page(self) -> None:
+        with patch(
+            "lead_generator.planning.leads._fetch_json_with_retry",
+            side_effect=[
+                {
+                    "records": [
+                        {"uid": "24/00001/FUL"},
+                        {"uid": "24/00002/FUL"},
+                    ],
+                    "total": 4,
+                },
+                {
+                    "records": [
+                        {"uid": "24/00002/FUL"},
+                        {"uid": "24/00001/FUL"},
+                    ],
+                    "total": 4,
+                },
+            ],
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "no unique-reference progress",
+            ):
+                _discover_planit_applications_serial(
+                    "Example",
+                    date(2026, 6, 1),
+                    date(2026, 6, 30),
+                )
+
+    def test_planit_pagination_rejects_a_record_without_a_usable_reference(
+        self,
+    ) -> None:
+        with patch(
+            "lead_generator.planning.leads._fetch_json_with_retry",
+            return_value={
+                "records": [{"description": "Driveway gates"}],
+                "total": 1,
+            },
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "usable application reference",
+            ):
+                _discover_planit_applications_serial(
+                    "Example",
+                    date(2026, 6, 1),
+                    date(2026, 6, 30),
+                )
+
+    def test_planit_pagination_without_a_total_runs_until_a_short_page(self) -> None:
+        with (
+            patch("lead_generator.planning.leads.PLANIT_PAGE_SIZE", 2),
+            patch(
+                "lead_generator.planning.leads._fetch_json_with_retry",
+                side_effect=[
+                    {
+                        "records": [
+                            {"uid": "24/00001/FUL"},
+                            {"uid": "24/00002/FUL"},
+                        ],
+                    },
+                    {
+                        "records": [{"uid": "24/00003/FUL"}],
+                    },
+                ],
+            ) as fetch,
+        ):
+            applications = _discover_planit_applications_serial(
+                "Example",
+                date(2026, 6, 1),
+                date(2026, 6, 30),
+            )
+
+        self.assertEqual(
+            [application.reference for application in applications],
+            ["24/00001/FUL", "24/00002/FUL", "24/00003/FUL"],
+        )
+        self.assertEqual(fetch.call_count, 2)
+
+    def test_planit_advertised_total_ignores_short_pages_until_complete(self) -> None:
+        with (
+            patch("lead_generator.planning.leads.PLANIT_PAGE_SIZE", 2),
+            patch(
+                "lead_generator.planning.leads._fetch_json_with_retry",
+                side_effect=[
+                    {
+                        "records": [
+                            {"uid": "24/00001/FUL"},
+                            {"uid": "24/00002/FUL"},
+                        ],
+                        "total": 4,
+                    },
+                    {
+                        "records": [{"uid": "24/00003/FUL"}],
+                        "total": 4,
+                    },
+                    {
+                        "records": [{"uid": "24/00004/FUL"}],
+                        "total": 4,
+                    },
+                ],
+            ) as fetch,
+        ):
+            applications = _discover_planit_applications_serial(
+                "Example",
+                date(2026, 6, 1),
+                date(2026, 6, 30),
+            )
+
+        self.assertEqual(
+            [application.reference for application in applications],
+            [
+                "24/00001/FUL",
+                "24/00002/FUL",
+                "24/00003/FUL",
+                "24/00004/FUL",
+            ],
+        )
+        self.assertEqual(fetch.call_count, 3)
+
+    def test_planit_pagination_rejects_an_empty_page_before_the_advertised_total(self) -> None:
+        first_page = {
+            "records": [{"uid": f"26/{index:05d}/FUL"} for index in range(100)],
+            "total": 150,
+        }
+        empty_second_page = {"records": [], "total": 150}
+
+        with patch(
+            "lead_generator.planning.leads._fetch_json_with_retry",
+            side_effect=[first_page, empty_second_page],
+        ):
+            with self.assertRaisesRegex(RuntimeError, "ended at 100 of 150"):
+                _discover_planit_applications_serial(
+                    "Example",
+                    date(2026, 6, 1),
+                    date(2026, 6, 30),
+                )
+
+    def test_planit_pagination_returns_later_page_records_once(self) -> None:
+        first_page = {
+            "records": [{"uid": f"26/{index:05d}/FUL"} for index in range(100)],
+            "total": 101,
+        }
+        second_page = {"records": [{"uid": "26/00100/FUL"}], "total": 101}
+
+        with patch(
+            "lead_generator.planning.leads._fetch_json_with_retry",
+            side_effect=[first_page, second_page],
+        ):
+            applications = _discover_planit_applications_serial(
+                "Example",
+                date(2026, 6, 1),
+                date(2026, 6, 30),
+            )
+
+        self.assertEqual(
+            [application.reference for application in applications],
+            [f"26/{index:05d}/FUL" for index in range(101)],
+        )
+
+    def test_planit_gate_wait_is_cancelled_between_short_acquire_attempts(
+        self,
+    ) -> None:
+        class NeverAvailableGate:
+            def __init__(self) -> None:
+                self.waits: list[float] = []
+                self.released = False
+
+            def acquire(self, *, timeout: float) -> bool:
+                self.waits.append(timeout)
+                return False
+
+            def release(self) -> None:
+                self.released = True
+
+        gate = NeverAvailableGate()
+        cancel_checks = 0
+
+        def should_cancel() -> bool:
+            nonlocal cancel_checks
+            cancel_checks += 1
+            return cancel_checks >= 2
+
+        with (
+            patch("lead_generator.planning.leads._PLANIT_CONCURRENCY_GATE", gate),
+            patch(
+                "lead_generator.planning.leads.PLANIT_GATE_WAIT_INTERVAL_SECONDS",
+                0.1,
+                create=True,
+            ),
+            patch(
+                "lead_generator.planning.leads._discover_planit_applications_serial"
+            ) as serial_discovery,
+        ):
+            with self.assertRaisesRegex(
+                CouncilSearchCancelledError,
+                "Cancelled while waiting",
+            ):
+                leads_module.discover_planit_applications(
+                    "Example",
+                    date(2026, 6, 1),
+                    date(2026, 6, 30),
+                    should_cancel=should_cancel,
+                )
+
+        self.assertEqual(gate.waits, [0.1])
+        self.assertFalse(gate.released)
+        serial_discovery.assert_not_called()
+
+    def test_planit_gate_wait_preserves_the_overall_timeout(self) -> None:
+        class TimedGate:
+            def __init__(self) -> None:
+                self.now = 0.0
+                self.waits: list[float] = []
+                self.released = False
+
+            def acquire(self, *, timeout: float) -> bool:
+                self.waits.append(timeout)
+                self.now += timeout
+                return False
+
+            def release(self) -> None:
+                self.released = True
+
+        gate = TimedGate()
+
+        with (
+            patch("lead_generator.planning.leads._PLANIT_CONCURRENCY_GATE", gate),
+            patch(
+                "lead_generator.planning.leads.PLANIT_GATE_WAIT_TIMEOUT_SECONDS",
+                0.25,
+            ),
+            patch(
+                "lead_generator.planning.leads.PLANIT_GATE_WAIT_INTERVAL_SECONDS",
+                0.1,
+                create=True,
+            ),
+            patch(
+                "lead_generator.planning.leads.monotonic",
+                side_effect=lambda: gate.now,
+            ),
+            patch(
+                "lead_generator.planning.leads._discover_planit_applications_serial"
+            ) as serial_discovery,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Timed out waiting"):
+                leads_module.discover_planit_applications(
+                    "Example",
+                    date(2026, 6, 1),
+                    date(2026, 6, 30),
+                )
+
+        self.assertEqual(len(gate.waits), 3)
+        self.assertAlmostEqual(sum(gate.waits), 0.25)
+        self.assertTrue(all(0 < wait <= 0.1 for wait in gate.waits))
+        self.assertFalse(gate.released)
+        serial_discovery.assert_not_called()
+
     def test_fetch_json_waits_and_retries_after_rate_limit(self) -> None:
         class FakeResponse:
             def __enter__(self):
@@ -2839,6 +7288,39 @@ class LeadSearchTest(unittest.TestCase):
 
         self.assertEqual(payload, {"records": []})
         sleep_mock.assert_called_once_with(3.0)
+
+    def test_fetch_json_rate_limit_wait_propagates_search_cancellation(self) -> None:
+        url = "https://www.planit.org.uk/api/applics/json"
+        cancel_checks = 0
+
+        def should_cancel() -> bool:
+            nonlocal cancel_checks
+            cancel_checks += 1
+            return cancel_checks >= 2
+
+        with (
+            patch(
+                "lead_generator.planning.leads.urlopen",
+                side_effect=HTTPError(
+                    url,
+                    429,
+                    "Too Many Requests",
+                    {"Retry-After": "120"},
+                    None,
+                ),
+            ),
+            patch("lead_generator.planning.leads._REQUEST_COOLDOWN_UNTIL", {}),
+            patch("lead_generator.planning.leads._LAST_REQUEST_AT", {}),
+            patch("lead_generator.planning.leads._throttle_request"),
+            patch(
+                "lead_generator.planning.leads._wait_for_cancelable_delay",
+                wraps=leads_module._wait_for_cancelable_delay,
+            ) as wait,
+        ):
+            with self.assertRaises(CouncilSearchCancelledError):
+                _fetch_json_with_retry(url, should_cancel=should_cancel)
+
+        wait.assert_called_once_with(120.0, should_cancel)
 
     def test_fetch_json_retries_planit_tls_verification_failure_with_compat_opener(self) -> None:
         class FakeResponse:
