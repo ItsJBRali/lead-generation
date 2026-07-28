@@ -159,6 +159,16 @@ class LeadSearchTest(unittest.TestCase):
 
         self.assertEqual(leads_module.application_reference_key(application), "ABC/1")
 
+    def test_application_reference_key_does_not_fall_back_to_uid(self) -> None:
+        application = PlanningApplication(
+            authority="A",
+            uid="uid-only",
+            url="u",
+            reference=" \t ",
+        )
+
+        self.assertEqual(leads_module.application_reference_key(application), "")
+
     def test_application_outside_or_without_received_date_is_not_in_range(self) -> None:
         for value in [None, "", "not-a-date", "2026-07-19", "2026-07-27"]:
             with self.subTest(value=value):
@@ -915,6 +925,79 @@ class LeadSearchTest(unittest.TestCase):
                 result = run_lead_search(config)
 
         self.assertEqual(result.total_applications, 2)
+
+    def test_run_lead_search_excludes_blank_reference_uid_before_totals_and_output(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_geojson, catalogue = write_search_fixture(root, ["Example Council"])
+            config = LeadSearchConfig(
+                geojson_path=user_geojson,
+                output_root=root,
+                start_date=date(2026, 7, 20),
+                end_date=date(2026, 7, 26),
+                keywords=["gates"],
+                catalogue_path=catalogue,
+                worker_count=1,
+            )
+            application = PlanningApplication(
+                authority="Example Council",
+                uid="STATMAP-INTERNAL-ID",
+                url="https://planning.example.gov.uk/application/internal-id",
+                reference="   ",
+                description="Install driveway gates",
+                date_received="2026-07-22",
+            )
+            logs: list[str] = []
+            captured_counts: list[int] = []
+
+            with (
+                patch(
+                    "lead_generator.planning.leads.discover_portal_applications",
+                    return_value=[application],
+                ),
+                patch(
+                    "lead_generator.planning.leads.application_matches",
+                    return_value=True,
+                ) as matches_keywords,
+                patch(
+                    "lead_generator.planning.leads.application_matches_search_area",
+                    return_value=True,
+                ) as matches_area,
+                patch(
+                    "lead_generator.planning.leads.discover_application_documents",
+                    return_value=DocumentDiscoveryResult(),
+                ) as discover_documents,
+                patch(
+                    "lead_generator.planning.leads.enrich_application_folder",
+                    return_value=ContactEnrichment(),
+                ) as enrich_application,
+            ):
+                result = run_lead_search(
+                    config,
+                    log=logs.append,
+                    captured=captured_counts.append,
+                )
+
+            with result.csv_path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertEqual(result.total_applications, 0)
+        self.assertEqual(result.leads_found, 0)
+        self.assertEqual(rows, [])
+        self.assertEqual(captured_counts, [])
+        matches_keywords.assert_not_called()
+        matches_area.assert_not_called()
+        discover_documents.assert_not_called()
+        enrich_application.assert_not_called()
+        self.assertTrue(
+            any(
+                "excluded 1 application(s) without a usable application reference"
+                in message
+                for message in logs
+            )
+        )
 
     def test_run_lead_search_shared_pipeline_keeps_primary_record_for_duplicate_reference(
         self,
@@ -6810,6 +6893,235 @@ class LeadSearchTest(unittest.TestCase):
 
         self.assertEqual(fetch.call_count, 2)
 
+    def test_planit_pagination_rejects_lowered_and_raised_total_drift(self) -> None:
+        cases = (
+            (
+                2,
+                [{"uid": "24/00002/FUL"}],
+            ),
+            (
+                4,
+                [
+                    {"uid": "24/00002/FUL"},
+                    {"uid": "24/00003/FUL"},
+                    {"uid": "24/00004/FUL"},
+                ],
+            ),
+        )
+        for later_total, second_page_records in cases:
+            with self.subTest(later_total=later_total):
+                with patch(
+                    "lead_generator.planning.leads._fetch_json_with_retry",
+                    side_effect=[
+                        {
+                            "records": [{"uid": "24/00001/FUL"}],
+                            "total": 3,
+                        },
+                        {
+                            "records": second_page_records,
+                            "total": later_total,
+                        },
+                    ],
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "changed the advertised total",
+                    ):
+                        _discover_planit_applications_serial(
+                            "Example",
+                            date(2026, 6, 1),
+                            date(2026, 6, 30),
+                        )
+
+    def test_planit_pagination_rejects_an_omitted_later_total(self) -> None:
+        with patch(
+            "lead_generator.planning.leads._fetch_json_with_retry",
+            side_effect=[
+                {
+                    "records": [{"uid": "24/00001/FUL"}],
+                    "total": 2,
+                },
+                {
+                    "records": [{"uid": "24/00002/FUL"}],
+                },
+            ],
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "omitted the advertised total",
+            ):
+                _discover_planit_applications_serial(
+                    "Example",
+                    date(2026, 6, 1),
+                    date(2026, 6, 30),
+                )
+
+    def test_planit_pagination_uses_unique_references_through_overlapping_pages(
+        self,
+    ) -> None:
+        pages = [
+            {
+                "records": [
+                    {"uid": "24/00001/FUL"},
+                    {"uid": "24/00002/FUL"},
+                ],
+                "total": 4,
+            },
+            {
+                "records": [
+                    {"uid": "24/00002/FUL"},
+                    {"uid": "24/00003/FUL"},
+                ],
+                "total": 4,
+            },
+            {
+                "records": [{"uid": "24/00004/FUL"}],
+                "total": 4,
+            },
+        ]
+
+        with patch(
+            "lead_generator.planning.leads._fetch_json_with_retry",
+            side_effect=pages,
+        ) as fetch:
+            applications = _discover_planit_applications_serial(
+                "Example",
+                date(2026, 6, 1),
+                date(2026, 6, 30),
+            )
+
+        self.assertEqual(
+            [application.reference for application in applications],
+            [
+                "24/00001/FUL",
+                "24/00002/FUL",
+                "24/00003/FUL",
+                "24/00004/FUL",
+            ],
+        )
+        self.assertEqual(fetch.call_count, 3)
+
+    def test_planit_pagination_rejects_a_reordered_no_progress_page(self) -> None:
+        with patch(
+            "lead_generator.planning.leads._fetch_json_with_retry",
+            side_effect=[
+                {
+                    "records": [
+                        {"uid": "24/00001/FUL"},
+                        {"uid": "24/00002/FUL"},
+                    ],
+                    "total": 4,
+                },
+                {
+                    "records": [
+                        {"uid": "24/00002/FUL"},
+                        {"uid": "24/00001/FUL"},
+                    ],
+                    "total": 4,
+                },
+            ],
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "no unique-reference progress",
+            ):
+                _discover_planit_applications_serial(
+                    "Example",
+                    date(2026, 6, 1),
+                    date(2026, 6, 30),
+                )
+
+    def test_planit_pagination_rejects_a_record_without_a_usable_reference(
+        self,
+    ) -> None:
+        with patch(
+            "lead_generator.planning.leads._fetch_json_with_retry",
+            return_value={
+                "records": [{"description": "Driveway gates"}],
+                "total": 1,
+            },
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "usable application reference",
+            ):
+                _discover_planit_applications_serial(
+                    "Example",
+                    date(2026, 6, 1),
+                    date(2026, 6, 30),
+                )
+
+    def test_planit_pagination_without_a_total_runs_until_a_short_page(self) -> None:
+        with (
+            patch("lead_generator.planning.leads.PLANIT_PAGE_SIZE", 2),
+            patch(
+                "lead_generator.planning.leads._fetch_json_with_retry",
+                side_effect=[
+                    {
+                        "records": [
+                            {"uid": "24/00001/FUL"},
+                            {"uid": "24/00002/FUL"},
+                        ],
+                    },
+                    {
+                        "records": [{"uid": "24/00003/FUL"}],
+                    },
+                ],
+            ) as fetch,
+        ):
+            applications = _discover_planit_applications_serial(
+                "Example",
+                date(2026, 6, 1),
+                date(2026, 6, 30),
+            )
+
+        self.assertEqual(
+            [application.reference for application in applications],
+            ["24/00001/FUL", "24/00002/FUL", "24/00003/FUL"],
+        )
+        self.assertEqual(fetch.call_count, 2)
+
+    def test_planit_advertised_total_ignores_short_pages_until_complete(self) -> None:
+        with (
+            patch("lead_generator.planning.leads.PLANIT_PAGE_SIZE", 2),
+            patch(
+                "lead_generator.planning.leads._fetch_json_with_retry",
+                side_effect=[
+                    {
+                        "records": [
+                            {"uid": "24/00001/FUL"},
+                            {"uid": "24/00002/FUL"},
+                        ],
+                        "total": 4,
+                    },
+                    {
+                        "records": [{"uid": "24/00003/FUL"}],
+                        "total": 4,
+                    },
+                    {
+                        "records": [{"uid": "24/00004/FUL"}],
+                        "total": 4,
+                    },
+                ],
+            ) as fetch,
+        ):
+            applications = _discover_planit_applications_serial(
+                "Example",
+                date(2026, 6, 1),
+                date(2026, 6, 30),
+            )
+
+        self.assertEqual(
+            [application.reference for application in applications],
+            [
+                "24/00001/FUL",
+                "24/00002/FUL",
+                "24/00003/FUL",
+                "24/00004/FUL",
+            ],
+        )
+        self.assertEqual(fetch.call_count, 3)
+
     def test_planit_pagination_rejects_an_empty_page_before_the_advertised_total(self) -> None:
         first_page = {
             "records": [{"uid": f"26/{index:05d}/FUL"} for index in range(100)],
@@ -6849,6 +7161,104 @@ class LeadSearchTest(unittest.TestCase):
             [application.reference for application in applications],
             [f"26/{index:05d}/FUL" for index in range(101)],
         )
+
+    def test_planit_gate_wait_is_cancelled_between_short_acquire_attempts(
+        self,
+    ) -> None:
+        class NeverAvailableGate:
+            def __init__(self) -> None:
+                self.waits: list[float] = []
+                self.released = False
+
+            def acquire(self, *, timeout: float) -> bool:
+                self.waits.append(timeout)
+                return False
+
+            def release(self) -> None:
+                self.released = True
+
+        gate = NeverAvailableGate()
+        cancel_checks = 0
+
+        def should_cancel() -> bool:
+            nonlocal cancel_checks
+            cancel_checks += 1
+            return cancel_checks >= 2
+
+        with (
+            patch("lead_generator.planning.leads._PLANIT_CONCURRENCY_GATE", gate),
+            patch(
+                "lead_generator.planning.leads.PLANIT_GATE_WAIT_INTERVAL_SECONDS",
+                0.1,
+                create=True,
+            ),
+            patch(
+                "lead_generator.planning.leads._discover_planit_applications_serial"
+            ) as serial_discovery,
+        ):
+            with self.assertRaisesRegex(
+                CouncilSearchCancelledError,
+                "Cancelled while waiting",
+            ):
+                leads_module.discover_planit_applications(
+                    "Example",
+                    date(2026, 6, 1),
+                    date(2026, 6, 30),
+                    should_cancel=should_cancel,
+                )
+
+        self.assertEqual(gate.waits, [0.1])
+        self.assertFalse(gate.released)
+        serial_discovery.assert_not_called()
+
+    def test_planit_gate_wait_preserves_the_overall_timeout(self) -> None:
+        class TimedGate:
+            def __init__(self) -> None:
+                self.now = 0.0
+                self.waits: list[float] = []
+                self.released = False
+
+            def acquire(self, *, timeout: float) -> bool:
+                self.waits.append(timeout)
+                self.now += timeout
+                return False
+
+            def release(self) -> None:
+                self.released = True
+
+        gate = TimedGate()
+
+        with (
+            patch("lead_generator.planning.leads._PLANIT_CONCURRENCY_GATE", gate),
+            patch(
+                "lead_generator.planning.leads.PLANIT_GATE_WAIT_TIMEOUT_SECONDS",
+                0.25,
+            ),
+            patch(
+                "lead_generator.planning.leads.PLANIT_GATE_WAIT_INTERVAL_SECONDS",
+                0.1,
+                create=True,
+            ),
+            patch(
+                "lead_generator.planning.leads.monotonic",
+                side_effect=lambda: gate.now,
+            ),
+            patch(
+                "lead_generator.planning.leads._discover_planit_applications_serial"
+            ) as serial_discovery,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Timed out waiting"):
+                leads_module.discover_planit_applications(
+                    "Example",
+                    date(2026, 6, 1),
+                    date(2026, 6, 30),
+                )
+
+        self.assertEqual(len(gate.waits), 3)
+        self.assertAlmostEqual(sum(gate.waits), 0.25)
+        self.assertTrue(all(0 < wait <= 0.1 for wait in gate.waits))
+        self.assertFalse(gate.released)
+        serial_discovery.assert_not_called()
 
     def test_fetch_json_waits_and_retries_after_rate_limit(self) -> None:
         class FakeResponse:

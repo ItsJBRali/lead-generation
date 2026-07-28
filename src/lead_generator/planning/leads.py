@@ -176,6 +176,7 @@ USER_AGENT = (
 PLANIT_PAGE_SIZE = 100
 PLANIT_MAX_PAGES = 100
 PLANIT_GATE_WAIT_TIMEOUT_SECONDS = 30.0
+PLANIT_GATE_WAIT_INTERVAL_SECONDS = 0.25
 DEFAULT_SEARCH_WORKER_COUNT = 4
 MAX_SEARCH_WORKER_COUNT = 8
 DEFAULT_PLATFORM_CONCURRENCY_LIMIT = 2
@@ -340,8 +341,7 @@ class CouncilDiscoveryState:
 
 
 def application_reference_key(application: PlanningApplication) -> str:
-    reference = (application.reference or "").strip()
-    return reference or application.uid.strip()
+    return (application.reference or "").strip()
 
 
 def application_is_in_date_range(
@@ -373,6 +373,7 @@ def _process_discovered_applications(
     should_cancel: CancelCallback | None = None,
 ) -> int:
     source_date_valid_references: set[str] = set()
+    excluded_without_usable_reference = 0
     excluded_without_usable_date = 0
     matched_count = 0
 
@@ -394,12 +395,15 @@ def _process_discovered_applications(
     for application in applications:
         if should_cancel and should_cancel():
             break
+        reference = application_reference_key(application)
+        if not reference:
+            excluded_without_usable_reference += 1
+            continue
         if not application_is_in_date_range(application, start_date, end_date):
             if _parse_iso_date(application.date_received) is None:
                 excluded_without_usable_date += 1
             continue
 
-        reference = application_reference_key(application)
         if reference not in source_date_valid_references:
             source_date_valid_references.add(reference)
 
@@ -431,6 +435,12 @@ def _process_discovered_applications(
         matched_count += 1
         notify_output_saved(application, reference, current)
 
+    if excluded_without_usable_reference:
+        _log(
+            log,
+            f"{target.authority}: excluded {excluded_without_usable_reference} application(s) "
+            "without a usable application reference",
+        )
     if excluded_without_usable_date:
         update_state(
             lambda: setattr(
@@ -1897,10 +1907,22 @@ def discover_planit_applications(
         raise CouncilSearchCancelledError(
             f"Cancelled while searching public planning metadata for {authority}"
         )
-    if not _PLANIT_CONCURRENCY_GATE.acquire(timeout=PLANIT_GATE_WAIT_TIMEOUT_SECONDS):
-        raise RuntimeError(
-            f"Timed out waiting {PLANIT_GATE_WAIT_TIMEOUT_SECONDS:.0f}s for the PlanIt request slot"
-        )
+    gate_deadline = monotonic() + PLANIT_GATE_WAIT_TIMEOUT_SECONDS
+    while True:
+        remaining = gate_deadline - monotonic()
+        if remaining <= 0:
+            raise RuntimeError(
+                f"Timed out waiting {PLANIT_GATE_WAIT_TIMEOUT_SECONDS:.0f}s "
+                "for the PlanIt request slot"
+            )
+        if _PLANIT_CONCURRENCY_GATE.acquire(
+            timeout=min(PLANIT_GATE_WAIT_INTERVAL_SECONDS, remaining)
+        ):
+            break
+        if should_cancel and should_cancel():
+            raise CouncilSearchCancelledError(
+                f"Cancelled while waiting for the PlanIt request slot for {authority}"
+            )
     try:
         return _discover_planit_applications_serial(
             authority,
@@ -1920,7 +1942,9 @@ def _discover_planit_applications_serial(
     should_cancel: CancelCallback | None = None,
 ) -> list[PlanningApplication]:
     records: list[dict[str, object]] = []
-    seen_pages: set[str] = set()
+    seen_pages: set[tuple[str, ...]] = set()
+    seen_references: set[str] = set()
+    expected_total: int | None = None
     page_size = PLANIT_PAGE_SIZE
     page = 1
     while True:
@@ -1937,19 +1961,86 @@ def _discover_planit_applications_serial(
         else:
             payload = _fetch_json_with_retry(url, should_cancel=should_cancel)
         batch = payload.get("records", [])
-        if not isinstance(batch, list):
+        if not isinstance(batch, list) or not all(
+            isinstance(record, dict) for record in batch
+        ):
             raise RuntimeError("PlanIt returned an invalid records collection")
-        page_signature = json.dumps(batch, sort_keys=True, default=str)
+
+        advertised_total = "total" in payload and payload.get("total") not in (
+            None,
+            "",
+        )
+        page_total: int | None = None
+        if advertised_total:
+            raw_total = payload["total"]
+            if isinstance(raw_total, bool):
+                raise RuntimeError(f"PlanIt returned an invalid total for {authority}")
+            if isinstance(raw_total, int):
+                page_total = raw_total
+            elif isinstance(raw_total, str) and raw_total.strip().isdigit():
+                page_total = int(raw_total.strip())
+            else:
+                raise RuntimeError(f"PlanIt returned an invalid total for {authority}")
+            if page_total < 0:
+                raise RuntimeError(f"PlanIt returned an invalid total for {authority}")
+
+        if expected_total is None:
+            if page_total is not None:
+                expected_total = page_total
+        elif page_total is None:
+            raise RuntimeError(
+                f"PlanIt omitted the advertised total on page {page} for {authority}"
+            )
+        elif page_total != expected_total:
+            raise RuntimeError(
+                f"PlanIt changed the advertised total from {expected_total} "
+                f"to {page_total} on page {page} for {authority}"
+            )
+
+        page_references: list[str] = []
+        for record in batch:
+            reference = _planit_application_reference(record)
+            if not reference:
+                raise RuntimeError(
+                    f"PlanIt returned a record without a usable application reference "
+                    f"on page {page} for {authority}"
+                )
+            page_references.append(reference)
+
+        page_signature = tuple(page_references)
         if batch and page_signature in seen_pages:
             raise RuntimeError(f"PlanIt repeated pagination page {page} for {authority}")
-        seen_pages.add(page_signature)
-        records.extend(batch)
-        total = int(payload.get("total") or len(records))
-        if not batch:
-            if len(records) < total:
-                raise RuntimeError(f"PlanIt pagination ended at {len(records)} of {total} for {authority}")
+        if batch:
+            seen_pages.add(page_signature)
+
+        new_reference_count = 0
+        for record, reference in zip(batch, page_references):
+            if reference in seen_references:
+                continue
+            seen_references.add(reference)
+            records.append(record)
+            new_reference_count += 1
+
+        unique_count = len(seen_references)
+        if expected_total is not None and unique_count > expected_total:
+            raise RuntimeError(
+                f"PlanIt returned {unique_count} unique application references above "
+                f"the advertised total of {expected_total} for {authority}"
+            )
+        if expected_total is not None and unique_count == expected_total:
             break
-        if len(records) >= total:
+        if not batch:
+            if expected_total is not None:
+                raise RuntimeError(
+                    f"PlanIt pagination ended at {unique_count} of "
+                    f"{expected_total} unique application references for {authority}"
+                )
+            break
+        if new_reference_count == 0:
+            raise RuntimeError(
+                f"PlanIt made no unique-reference progress on page {page} for {authority}"
+            )
+        if expected_total is None and len(batch) < page_size:
             break
         if page >= PLANIT_MAX_PAGES:
             raise RuntimeError(
@@ -4165,7 +4256,7 @@ def sanitize_path_part(value: str) -> str:
 
 def _application_from_planit_record(authority: str, record: dict[str, object]) -> PlanningApplication:
     other_fields = record.get("other_fields") if isinstance(record.get("other_fields"), dict) else {}
-    reference = _record_string(record, "uid") or _record_string(record, "reference") or _record_string(record, "name")
+    reference = _planit_application_reference(record)
     raw = {
         "source": "planit",
         "docs_url": _record_string(other_fields, "docs_url"),
@@ -4192,6 +4283,14 @@ def _application_from_planit_record(authority: str, record: dict[str, object]) -
         postcode=_record_string(record, "postcode"),
         source_url=_record_string(other_fields, "source_url"),
         raw={key: value for key, value in raw.items() if value},
+    )
+
+
+def _planit_application_reference(record: dict[str, object]) -> str | None:
+    return (
+        _record_string(record, "uid")
+        or _record_string(record, "reference")
+        or _record_string(record, "name")
     )
 
 

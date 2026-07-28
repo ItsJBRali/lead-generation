@@ -93,6 +93,69 @@ def test_document_progress_shows_application_count() -> None:
     assert label.text == "3 of 8 applications downloaded"
 
 
+def test_run_progress_ignores_out_of_order_callback_counts() -> None:
+    captured_label = FakeLabel()
+    captured_app = SimpleNamespace(captured_label=captured_label)
+    LeadGeneratorApp._set_captured(captured_app, 4)
+    LeadGeneratorApp._set_captured(captured_app, 2)
+
+    document_label = FakeLabel()
+    document_app = SimpleNamespace(enrichment_label=document_label)
+    LeadGeneratorApp._set_document_progress(
+        document_app,
+        4,
+        6,
+        requested=True,
+    )
+    LeadGeneratorApp._set_document_progress(
+        document_app,
+        2,
+        8,
+        requested=True,
+    )
+
+    enrichment_label = FakeLabel()
+    enrichment_app = SimpleNamespace(enrichment_label=enrichment_label)
+    LeadGeneratorApp._set_enrichment_progress(
+        enrichment_app,
+        5,
+        7,
+        requested=True,
+    )
+    LeadGeneratorApp._set_enrichment_progress(
+        enrichment_app,
+        3,
+        6,
+        requested=True,
+    )
+
+    assert captured_label.text == "4 relevant applications captured"
+    assert document_label.text == "4 of 8 applications downloaded"
+    assert enrichment_label.text == "5 of 7 applications enriched"
+
+
+def test_run_progress_reset_allows_zero_counts_for_a_new_run() -> None:
+    captured_label = FakeLabel()
+    progress_label = FakeLabel()
+    app = SimpleNamespace(
+        captured_label=captured_label,
+        enrichment_label=progress_label,
+    )
+    LeadGeneratorApp._set_captured(app, 4)
+    LeadGeneratorApp._set_document_progress(app, 4, 6, requested=True)
+    LeadGeneratorApp._set_enrichment_progress(app, 5, 7, requested=True)
+
+    LeadGeneratorApp._reset_run_progress_counts(app)
+    LeadGeneratorApp._set_captured(app, 0)
+    LeadGeneratorApp._set_document_progress(app, 0, 0, requested=True)
+
+    assert captured_label.text == "0 relevant applications captured"
+    assert progress_label.text == "0 of 0 applications downloaded"
+
+    LeadGeneratorApp._set_enrichment_progress(app, 0, 0, requested=True)
+    assert progress_label.text == "0 of 0 applications enriched"
+
+
 def test_enrichment_progress_explains_when_not_requested() -> None:
     label = FakeLabel()
 

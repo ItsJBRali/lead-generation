@@ -562,6 +562,7 @@ class FastwebPlanningScraper(NativeListingScraper):
 
 class CcedPlanningScraper(NativeListingScraper):
     family = "cced"
+    MAX_PAGED_RESULT_PAGES = 100
 
     def search(
         self,
@@ -589,20 +590,48 @@ class CcedPlanningScraper(NativeListingScraper):
         ) or "ctl00$ContentPlaceHolder1$btnSearch3"
         data[submit_name] = "Search"
         response = self.http.post_form(self._absolute_action(response.url, form), data)
-        applications = []
+        applications: list[PlanningApplication] = []
         seen: set[str] = set()
+        seen_page_signatures: set[tuple[str, ...]] = set()
+        processed_pages = 0
         while True:
-            for application in self.parse_results(response.text, response.url):
-                key = (application.reference or application.uid).casefold()
-                if key in seen:
+            processed_pages += 1
+            page_applications = self.parse_results(response.text, response.url)
+            page_references: list[str] = []
+            for application in page_applications:
+                reference = (application.reference or "").strip()
+                if not reference:
+                    raise PortalSearchCompletenessError(
+                        "CCED returned a record without a usable application reference"
+                    )
+                application.reference = reference
+                page_references.append(reference)
+
+            page_signature = tuple(page_references)
+            if page_signature in seen_page_signatures:
+                raise PortalSearchCompletenessError("CCED returned a repeated page")
+            seen_page_signatures.add(page_signature)
+
+            new_reference_count = 0
+            for application, reference in zip(page_applications, page_references):
+                if reference in seen:
                     continue
-                seen.add(key)
+                seen.add(reference)
                 applications.append(application)
+                new_reference_count += 1
                 if limit is not None and len(applications) >= limit:
                     return applications[:limit]
             next_target = self.next_page_target(response.text)
             if not next_target:
                 break
+            if new_reference_count == 0:
+                raise PortalSearchCompletenessError(
+                    "CCED made no unique-reference progress"
+                )
+            if processed_pages >= self.MAX_PAGED_RESULT_PAGES:
+                raise PortalSearchCompletenessError(
+                    "CCED exceeded the maximum page request limit"
+                )
             response = self.post_results_page(response.text, response.url, next_target)
         if start_date or end_date:
             applications = filter_by_date(applications, start_date, end_date)
@@ -821,10 +850,15 @@ class StatMapPlanningScraper(NativeListingScraper):
             elif total != expected_total:
                 raise PortalSearchCompletenessError("StatMap changed the result total during pagination")
 
-            page_signature = tuple(
+            page_identifiers = [
                 string_value(record.get("name") or record.get("reference") or record.get("appRef") or record.get("id")) or ""
                 for record in records
-            )
+            ]
+            if any(not identifier for identifier in page_identifiers):
+                raise PortalSearchCompletenessError(
+                    "StatMap returned a record without a stable identifier"
+                )
+            page_signature = tuple(page_identifiers)
             if page_signature in seen_page_signatures:
                 raise PortalSearchCompletenessError("StatMap returned a repeated page")
             seen_page_signatures.add(page_signature)
@@ -889,6 +923,8 @@ class StatMapPlanningScraper(NativeListingScraper):
 
 class SocrataPlanningScraper(NativeListingScraper):
     family = "socrata"
+    PAGE_SIZE = 100
+    MAX_PAGED_RESULT_PAGES = 100
 
     def search(
         self,
@@ -902,7 +938,11 @@ class SocrataPlanningScraper(NativeListingScraper):
         dataset = dataset_match.group(1) if dataset_match else "2eiu-s2cw"
         parts = urlsplit(listing_url)
         api_url = f"{parts.scheme}://{parts.netloc}/resource/{dataset}.json"
-        base_params = {"$limit": "100", "$order": "registered_date DESC"}
+        page_size = self.PAGE_SIZE
+        base_params = {
+            "$limit": str(page_size),
+            "$order": "registered_date DESC, pk DESC",
+        }
         where: list[str] = []
         if start_date:
             where.append(f"registered_date >= '{start_date.isoformat()}T00:00:00'")
@@ -913,19 +953,54 @@ class SocrataPlanningScraper(NativeListingScraper):
 
         applications: list[PlanningApplication] = []
         seen_page_signatures: set[tuple[str, ...]] = set()
+        seen_references: set[str] = set()
         offset = 0
+        processed_pages = 0
         while True:
+            if processed_pages >= self.MAX_PAGED_RESULT_PAGES:
+                raise PortalSearchCompletenessError(
+                    "Socrata exceeded the maximum page request limit"
+                )
+            processed_pages += 1
             params = {**base_params, "$offset": str(offset)}
             rows = json.loads(self.http.get(api_url, params).text)
-            page_signature = tuple(json.dumps(row, sort_keys=True, default=str) for row in rows)
+            if not isinstance(rows, list) or not all(
+                isinstance(row, dict) for row in rows
+            ):
+                raise PortalSearchCompletenessError(
+                    "Socrata returned an invalid page payload"
+                )
+            page_applications = [self._from_row(row, api_url) for row in rows]
+            page_references = [
+                (application.reference or "").strip()
+                for application in page_applications
+            ]
+            if any(not reference for reference in page_references):
+                raise PortalSearchCompletenessError(
+                    "Socrata returned a record without a usable application reference"
+                )
+            page_signature = tuple(page_references)
             if page_signature and page_signature in seen_page_signatures:
                 raise PortalSearchCompletenessError("Socrata returned a repeated page")
-            seen_page_signatures.add(page_signature)
-            applications.extend(self._from_row(row, api_url) for row in rows)
+            if page_signature:
+                seen_page_signatures.add(page_signature)
+
+            new_reference_count = 0
+            for application, reference in zip(page_applications, page_references):
+                if reference in seen_references:
+                    continue
+                seen_references.add(reference)
+                application.reference = reference
+                applications.append(application)
+                new_reference_count += 1
             if limit is not None and len(applications) >= limit:
                 return filter_by_date(applications[:limit], start_date, end_date)
-            if len(rows) < 100:
+            if len(rows) < page_size:
                 break
+            if new_reference_count == 0:
+                raise PortalSearchCompletenessError(
+                    "Socrata made no unique-reference progress on a full page"
+                )
             offset += len(rows)
         return filter_by_date(applications, start_date, end_date)
 
