@@ -292,8 +292,6 @@ class LeadGeneratorApp(ctk.CTk):
         if start_date > end_date:
             raise ValueError("Start date must be before or equal to end date.")
         keywords = parse_keywords(self.keyword_box.get("1.0", "end"))
-        if not keywords:
-            raise ValueError("Enter at least one keyword.")
         return LeadSearchConfig(
             geojson_path=geojson_path,
             output_root=output_root,

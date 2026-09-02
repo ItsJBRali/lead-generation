@@ -231,6 +231,24 @@ class LeadSearchTest(unittest.TestCase):
             )
         )
 
+    def test_application_matches_without_keyword_filter(self) -> None:
+        application = PlanningApplication(
+            authority="Example",
+            uid="1",
+            url="https://example.test",
+            description="Construction of a garden room",
+            date_received="2026-06-12",
+        )
+
+        self.assertTrue(
+            application_matches(
+                application,
+                date(2026, 6, 1),
+                date(2026, 6, 30),
+                [],
+            )
+        )
+
     def test_application_matches_excludes_admin_proposal_phrases(self) -> None:
         excluded_proposals = [
             "Variation of condition 2 to allow automated gates",

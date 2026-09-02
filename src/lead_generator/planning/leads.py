@@ -1605,7 +1605,7 @@ def application_matches(
         for value in (application.reference, application.address, application.description, raw_text)
         if value
     ).casefold()
-    return any(keyword.casefold() in haystack for keyword in keywords)
+    return not keywords or any(keyword.casefold() in haystack for keyword in keywords)
 
 
 def reference_is_excluded(reference: str | None) -> bool:

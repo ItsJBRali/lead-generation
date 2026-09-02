@@ -1,5 +1,6 @@
 from datetime import date
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from lead_generator.planning.gui import LeadGeneratorApp, previous_week_date_range
 
@@ -57,3 +58,25 @@ def test_run_log_continues_following_latest_message_when_already_at_bottom() -> 
     LeadGeneratorApp._append_log(SimpleNamespace(log_box=log_box), "Council complete")
 
     assert ("see", "end") in log_box.calls
+
+
+def test_read_config_accepts_empty_keyword_input(tmp_path) -> None:
+    geojson_path = tmp_path / "search-area.geojson"
+    geojson_path.touch()
+    app = SimpleNamespace(
+        geojson_entry=SimpleNamespace(get=lambda: str(geojson_path)),
+        output_entry=SimpleNamespace(get=lambda: str(tmp_path)),
+        start_selector=SimpleNamespace(selected_date=lambda: date(2026, 6, 1)),
+        end_selector=SimpleNamespace(selected_date=lambda: date(2026, 6, 30)),
+        keyword_box=SimpleNamespace(get=lambda *_args: "\n"),
+        download_files_var=SimpleNamespace(get=lambda: True),
+        worker_count_menu=SimpleNamespace(get=lambda: "4"),
+    )
+
+    with patch(
+        "lead_generator.planning.gui.history_csv_path",
+        return_value=tmp_path / "search_history.csv",
+    ):
+        config = LeadGeneratorApp._read_config(app)
+
+    assert config.keywords == []
