@@ -1,0 +1,78 @@
+name: Build Windows executable
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [fix/adapter-pagination]
+    paths:
+      - ".github/workflows/build-windows.yml"
+      - "src/**"
+      - "tests/**"
+      - "tools/pyinstaller_hooks/**"
+      - "pyproject.toml"
+      - "PlanningLeadGenerator.spec"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: x64
+      - name: Install application and build dependencies
+        run: python -m pip install . pytest pyinstaller
+      - name: Run tests
+        env:
+          PYTHONPATH: src
+        run: python -m pytest -q
+      - name: Build executable
+        run: python -m PyInstaller --noconfirm --clean PlanningLeadGenerator.spec
+      - name: Verify packaged GUI starts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $process = Start-Process -FilePath ".\dist\PlanningLeadGenerator.exe" -PassThru
+          try {
+            $opened = $false
+            for ($attempt = 0; $attempt -lt 30; $attempt++) {
+              Start-Sleep -Seconds 1
+              $windows = Get-Process -Name PlanningLeadGenerator -ErrorAction SilentlyContinue |
+                Where-Object { $_.MainWindowTitle -eq "Planning Lead Generator" }
+              if ($windows) {
+                $opened = $true
+                break
+              }
+              if ($process.HasExited) {
+                throw "Packaged application exited before opening its main window."
+              }
+            }
+            if (-not $opened) { throw "Packaged application did not open its main window within 30 seconds." }
+          } finally {
+            Get-Process -Name PlanningLeadGenerator -ErrorAction SilentlyContinue |
+              Stop-Process -Force -ErrorAction SilentlyContinue
+          }
+          Get-FileHash ".\dist\PlanningLeadGenerator.exe" -Algorithm SHA256
+      - name: Commit rebuilt executable
+        shell: pwsh
+        run: |
+          git add -- dist/PlanningLeadGenerator.exe
+          git diff --cached --quiet
+          if ($LASTEXITCODE -eq 0) { exit 0 }
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Rebuild Windows executable with pagination fixes"
+          if ($LASTEXITCODE -ne 0) { throw "Could not commit executable." }
+          git push origin "HEAD:$env:GITHUB_REF_NAME"
+          if ($LASTEXITCODE -ne 0) { throw "Could not push executable." }
