@@ -82,5 +82,16 @@ is made that every council exposes every record through these interfaces.
 
 To measure the effect, rerun the same 210 councils and exact dates with blank
 keywords, use equivalent history settings, compare per-council counts and inspect
-failures. If running the Windows executable, rebuild it from the changed source
-first: `dist/PlanningLeadGenerator.exe` is not rebuilt by this source change.
+failures. The Windows executable was rebuilt from the pagination-fix source on 11 September
+2026 using Python 3.12 and the existing PyInstaller spec. The Windows run passed
+224 tests and 97 subtests, and the packaged main window opened successfully.
+`dist/PlanningLeadGenerator.exe` includes these fixes.
+
+Build: https://github.com/ItsJBRali/lead-generation/actions/runs/34591203643
+
+Executable SHA-256:
+`AD6121AA33763826F8BD8F8263EF023CE5520547D3CB9025ED8079DDA6CB8F07`.
+
+The `Build Windows executable` GitHub Actions workflow also supports manual
+runs on a selected branch; it tests, builds, checks GUI startup and commits the
+rebuilt executable to that branch.
