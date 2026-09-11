@@ -8,7 +8,8 @@ from urllib.parse import parse_qs, urljoin, urlsplit
 from lxml import html
 
 from lead_generator.planning.adapters.base import PlanningScraper
-from lead_generator.planning.http import CouncilHttpClient, FetchResponse
+from lead_generator.planning.adapters.pagination import collect_listing_pages
+from lead_generator.planning.http import CouncilFetchError, CouncilHttpClient, FetchResponse
 from lead_generator.planning.models import DiscoveryResult, PlanningApplication, PlanningDocument
 from lead_generator.planning.parsing import (
     clean_text,
@@ -87,8 +88,8 @@ class OcellaPlanningScraper(PlanningScraper):
         limit: int | None = None,
         **_: object,
     ) -> DiscoveryResult:
-        response = self._fetch_listing(listing_url, start_date=start_date, end_date=end_date)
-        applications = self.parse_listing(response.text, response.url)
+        response = self._fetch_listing(listing_url, start_date=start_date, end_date=end_date, limit=limit)
+        applications = collect_listing_pages(self.http, response, self.parse_listing, limit=limit)
         if start_date:
             for application in applications:
                 if not (application.date_received or application.date_validated):
@@ -112,6 +113,7 @@ class OcellaPlanningScraper(PlanningScraper):
         *,
         start_date: date | None = None,
         end_date: date | None = None,
+        limit: int | None = None,
     ):
         response = self.http.get(listing_url)
         if not (start_date or end_date):
@@ -139,6 +141,7 @@ class OcellaPlanningScraper(PlanningScraper):
             data,
             start_date=start_date,
             end_date=end_date,
+            limit=limit,
         )
 
     def _fetch_received_date_pages(
@@ -148,15 +151,22 @@ class OcellaPlanningScraper(PlanningScraper):
         *,
         start_date: date | None,
         end_date: date | None,
+        limit: int | None = None,
     ) -> FetchResponse:
         response = self._post_received_date_search(search_url, base_data, start_date=start_date, end_date=end_date)
         cap = self._result_cap(response.text)
-        if not (cap and start_date and end_date and start_date < end_date):
+        if limit is not None and len(self.parse_listing(response.text, response.url)) >= limit:
+            return response
+        if not cap:
             return response
 
         shown, total = cap
         if total <= shown:
             return response
+        if not (start_date and end_date and start_date < end_date):
+            raise CouncilFetchError(
+                f"Ocella result cap returned {shown} of {total} applications for {self.authority}; search incomplete"
+            )
 
         midpoint = start_date + timedelta(days=(end_date - start_date).days // 2)
         next_start = midpoint + timedelta(days=1)
@@ -165,12 +175,17 @@ class OcellaPlanningScraper(PlanningScraper):
             base_data,
             start_date=start_date,
             end_date=midpoint,
+            limit=limit,
         )
+        left_count = len(self.parse_listing(left.text, left.url)) if limit is not None else 0
+        if limit is not None and left_count >= limit:
+            return left
         right = self._fetch_received_date_pages(
             search_url,
             base_data,
             start_date=next_start,
             end_date=end_date,
+            limit=None if limit is None else limit - left_count,
         )
         return FetchResponse(
             url=right.url,
@@ -195,7 +210,7 @@ class OcellaPlanningScraper(PlanningScraper):
         return self.http.post_form(search_url, data)
 
     def _result_cap(self, html_text: str) -> tuple[int, int] | None:
-        text = clean_text(" ".join(html.fromstring(html_text).xpath("//body//text()")))
+        text = clean_text(" ".join(html.fromstring(html_text).itertext()))
         if not text:
             return None
         match = re.search(

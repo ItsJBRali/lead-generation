@@ -18,6 +18,7 @@ from lead_generator.planning.adapters.legacy_forms import (
     NativeListingScraper,
     filter_by_date,
 )
+from lead_generator.planning.adapters.pagination import collect_listing_pages
 from lead_generator.planning.http import CouncilFetchError, CouncilHttpClient
 from lead_generator.planning.models import PlanningApplication
 from lead_generator.planning.parsing import clean_text, extract_postcode, parse_council_date
@@ -146,7 +147,9 @@ class ColchesterPlanningScraper(NativeListingScraper):
         applications: list[PlanningApplication] = []
         seen: set[str] = set()
         paging_cookie = ""
-        for page_number in range(1, 251):
+        page_number = 1
+        seen_pages: set[tuple[str, ...]] = set()
+        while True:
             payload = {
                 "base64SecureConfiguration": secure_configuration,
                 "sortExpression": "new_registration_date DESC,new_concatenatedaddress ASC",
@@ -179,6 +182,12 @@ class ColchesterPlanningScraper(NativeListingScraper):
             if not isinstance(records, list):
                 raise CouncilFetchError("Colchester's planning grid returned an unexpected response")
 
+            page_key = tuple(sorted(json.dumps(record, sort_keys=True) for record in records))
+            if result.get("MoreRecords") and (page_key in seen_pages or not records):
+                raise CouncilFetchError(
+                    "Colchester's planning grid did not advance while more records were advertised"
+                )
+            seen_pages.add(page_key)
             page_dates: list[date] = []
             for record in records:
                 if not isinstance(record, dict):
@@ -204,6 +213,7 @@ class ColchesterPlanningScraper(NativeListingScraper):
             if not result.get("MoreRecords") or not records:
                 break
             paging_cookie = str(result.get("NextPagePagingCookie") or "")
+            page_number += 1
         return applications
 
     def _secure_configuration(self, encoded_layouts: str) -> str:
@@ -304,7 +314,10 @@ class TelfordPlanningScraper(NativeListingScraper):
             data["ctl00$ContentPlaceHolder1$DCdateto"] = value
         data["ctl00$ContentPlaceHolder1$btnSearchPlanningDetails"] = "Search"
         result = self.http.post_form(urljoin(page.url, "default.aspx"), data, headers={"Referer": page.url})
-        result_document = html.fromstring(result.text)
+        return collect_listing_pages(self.http, result, self._parse_results)
+
+    def _parse_results(self, text: str, page_url: str) -> list[PlanningApplication]:
+        result_document = html.fromstring(text)
         applications: list[PlanningApplication] = []
         for anchor in result_document.xpath("//a[contains(translate(@href,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'pa-applicationsummary.aspx')]"):
             rows = anchor.xpath("ancestor::tr[1]")
@@ -321,13 +334,13 @@ class TelfordPlanningScraper(NativeListingScraper):
                 PlanningApplication(
                     authority=self.authority,
                     uid=reference,
-                    url=urljoin(result.url, anchor.get("href") or ""),
+                    url=urljoin(page_url, anchor.get("href") or ""),
                     reference=reference,
                     address=address,
                     description=description,
                     date_validated=valid_date,
                     postcode=extract_postcode(address),
-                    source_url=result.url,
+                    source_url=page_url,
                     raw={
                         "portal_family": self.family,
                         "detail_complete": True,
@@ -363,7 +376,10 @@ class WestDunbartonshirePlanningScraper(NativeListingScraper):
             data["vDateRcvTo"] = end_date.strftime("%d/%m/%Y")
         action = self._absolute_action(page.url, forms[0])
         result = self.http.get(action, data)
-        result_document = html.fromstring(result.text)
+        return collect_listing_pages(self.http, result, self._parse_results, limit=limit)
+
+    def _parse_results(self, text: str, page_url: str) -> list[PlanningApplication]:
+        result_document = html.fromstring(text)
         applications: list[PlanningApplication] = []
         for form in result_document.xpath("//form[.//input[@name='vUPRN']]"):
             references = form.xpath(".//input[@name='vUPRN']/@value")
@@ -376,7 +392,7 @@ class WestDunbartonshirePlanningScraper(NativeListingScraper):
             cells = rows[0].xpath("./*[self::td or self::th]") if rows else []
             address = clean_text(" ".join(cells[0].itertext())) if cells else None
             detail_data = self._form_defaults(form)
-            detail_url = f"{self._absolute_action(result.url, form)}?{urlencode(detail_data)}"
+            detail_url = f"{self._absolute_action(page_url, form)}?{urlencode(detail_data)}"
             applications.append(
                 PlanningApplication(
                     authority=self.authority,
@@ -385,12 +401,10 @@ class WestDunbartonshirePlanningScraper(NativeListingScraper):
                     reference=reference,
                     address=address,
                     postcode=extract_postcode(address),
-                    source_url=result.url,
+                    source_url=page_url,
                     raw={"portal_family": self.family, "detail_complete": False},
                 )
             )
-            if limit is not None and len(applications) >= limit:
-                break
         return applications
 
 

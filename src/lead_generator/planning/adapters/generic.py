@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, urljoin, urlsplit
 from lxml import html
 
 from lead_generator.planning.adapters.base import PlanningScraper
+from lead_generator.planning.adapters.pagination import collect_listing_pages
 from lead_generator.planning.http import CouncilHttpClient
 from lead_generator.planning.models import DiscoveryResult, PlanningApplication, PlanningDocument
 from lead_generator.planning.parsing import (
@@ -113,9 +114,10 @@ class GenericLabelledPlanningScraper(PlanningScraper):
         **_: object,
     ) -> DiscoveryResult:
         response = self._fetch_listing(listing_url, start_date=start_date, end_date=end_date)
-        applications = self.parse_listing(response.text, response.url)
-        if limit is not None:
-            applications = applications[:limit]
+        applications = collect_listing_pages(
+            self.http, response, self.parse_listing, limit=limit,
+            pagination_urls=getattr(self, "_pagination_urls", None),
+        )
         return DiscoveryResult(
             authority=self.authority,
             source_url=response.url,

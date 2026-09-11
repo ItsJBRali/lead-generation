@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
+from copy import deepcopy
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -442,7 +443,9 @@ class FakeLegacyFormsHttpClient:
         params: dict[str, str] | None = None,
         headers: dict[str, str] | None = None,
     ) -> FetchResponse:
-        self.gets.append((url, params))
+        self.gets.append((url, deepcopy(params)))
+        if params and int(params.get("$offset", "0")) > 0:
+            return FetchResponse(url=url, status_code=200, text="[]")
         key = "get:" + url
         if params:
             key = "get:results"
@@ -454,11 +457,15 @@ class FakeLegacyFormsHttpClient:
         data: dict[str, str],
         headers: dict[str, str] | None = None,
     ) -> FetchResponse:
-        self.posts.append((url, data))
+        self.posts.append((url, deepcopy(data)))
+        if int(data.get("page", "1")) > 1:
+            return FetchResponse(url=url, status_code=200, text="<html></html>")
         return FetchResponse(url=url, status_code=200, text=self.pages.get("post:" + url, self.pages.get("post", "")))
 
     def post_json(self, url: str, data: object) -> FetchResponse:
-        self.posts.append((url, data))
+        self.posts.append((url, deepcopy(data)))
+        if isinstance(data, dict) and data.get("pagination", {}).get("page", 0) > 0:
+            return FetchResponse(url=url, status_code=200, text='{"records": []}')
         return FetchResponse(url=url, status_code=200, text=self.pages.get("post:" + url, self.pages.get("post", "")))
 
 

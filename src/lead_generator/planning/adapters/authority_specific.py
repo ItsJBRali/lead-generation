@@ -36,6 +36,7 @@ from lead_generator.planning.adapters.legacy_forms import (
     filter_by_date,
     parse_header_tables,
 )
+from lead_generator.planning.adapters.pagination import collect_listing_pages
 from lead_generator.planning.adapters.wiltshire import WiltshirePlanningScraper
 from lead_generator.planning.http import CouncilFetchError
 from lead_generator.planning.models import DiscoveryResult, PlanningApplication
@@ -265,9 +266,11 @@ class TauntonDeanePlanningScraper(QueryFormPlanningScraper):
                 self._form_defaults(full_list_form),
             )
 
-        applications = self._parse_results(result.text, result.url)
-        applications = filter_by_date(applications, start_date, end_date)
-        return applications[:limit] if limit is not None else applications
+        return collect_listing_pages(
+            self.http, result,
+            lambda text, url: filter_by_date(self._parse_results(text, url), start_date, end_date),
+            limit=limit,
+        )
 
     def _parse_results(self, html_text: str, page_url: str) -> list[PlanningApplication]:
         document = html.fromstring(html_text)
@@ -352,40 +355,15 @@ class CentralBedfordshirePlanningScraper(QueryFormPlanningScraper):
         self._set_dates(data, start_date, end_date)
         result = self.http.get(self._absolute_action(response.url, form), data)
 
-        applications: list[PlanningApplication] = []
-        seen_references: set[str] = set()
-        seen_pages: set[str] = set()
-        while result.url not in seen_pages:
-            seen_pages.add(result.url)
-            page_apps = parse_header_tables(result.text, result.url, self.authority, self.family)
-            if not page_apps:
-                page_apps = HtmlListPlanningScraper(
-                    self.config,
-                    http_client=self.http,
-                ).parse_listing(result.text, result.url)
-            for application in page_apps:
-                key = (application.reference or application.uid).casefold()
-                if key in seen_references:
-                    continue
-                seen_references.add(key)
-                applications.append(application)
-                if limit is not None and len(applications) >= limit:
-                    return filter_by_date(applications, start_date, end_date)
+        def parse_page(text: str, url: str) -> list[PlanningApplication]:
+            applications = parse_header_tables(text, url, self.authority, self.family)
+            if not applications:
+                applications = HtmlListPlanningScraper(
+                    self.config, http_client=self.http,
+                ).parse_listing(text, url)
+            return filter_by_date(applications, start_date, end_date)
 
-            document = html.fromstring(result.text)
-            next_links = [
-                anchor.get("href")
-                for anchor in document.xpath("//a[@href]")
-                if (clean_text(" ".join(anchor.itertext())) or "").casefold() == "next"
-            ]
-            if not next_links:
-                break
-            next_url = urljoin(result.url, next_links[0])
-            if next_url in seen_pages:
-                break
-            result = self.http.get(next_url)
-
-        return filter_by_date(applications, start_date, end_date)
+        return collect_listing_pages(self.http, result, parse_page, limit=limit)
 
 
 class TandridgePlanningScraper(QueryFormPlanningScraper):
@@ -430,8 +408,11 @@ class TandridgePlanningScraper(QueryFormPlanningScraper):
         data[self.SEARCH_BUTTON_FIELD] = "Search"
         result = self.http.post_form(self._absolute_action(date_page.url, date_form), data)
 
-        applications = parse_header_tables(result.text, result.url, self.authority, self.family)
-        return applications[:limit] if limit is not None else applications
+        return collect_listing_pages(
+            self.http, result,
+            lambda text, url: parse_header_tables(text, url, self.authority, self.family),
+            limit=limit,
+        )
 
 
 class SurreyPlanningScraper(AtriumPlanningScraper):
@@ -530,14 +511,16 @@ class EastSussexPlanningScraper(QueryFormPlanningScraper):
         if end_date:
             params["ed"] = end_date.strftime("%d/%m/%Y")
         response = self.http.get(result_url, params)
-        applications = parse_header_tables(response.text, response.url, self.authority, self.family)
-        if not applications:
-            applications = HtmlListPlanningScraper(
-                self.config,
-                http_client=self.http,
-            ).parse_listing(response.text, response.url)
-        applications = filter_by_date(applications, start_date, end_date)
-        return applications[:limit] if limit is not None else applications
+
+        def parse_page(text: str, url: str) -> list[PlanningApplication]:
+            applications = parse_header_tables(text, url, self.authority, self.family)
+            if not applications:
+                applications = HtmlListPlanningScraper(
+                    self.config, http_client=self.http,
+                ).parse_listing(text, url)
+            return filter_by_date(applications, start_date, end_date)
+
+        return collect_listing_pages(self.http, response, parse_page, limit=limit)
 
 
 class EastleighPlanningScraper(WiltshirePlanningScraper):
@@ -714,8 +697,16 @@ class ElmbridgePlanningScraper(AstunPlanningScraper):
             raise CouncilFetchError(
                 "Elmbridge returned its documented busy-page empty result table"
             )
-        applications = filter_by_date(applications, start_date, end_date)
-        return applications[:limit] if limit is not None else applications
+
+        def parse_page(text: str, url: str) -> list[PlanningApplication]:
+            applications = parse_header_tables(text, url, self.authority, self.family)
+            if not applications and self._busy_empty_results(text):
+                raise CouncilFetchError(
+                    "Elmbridge returned its documented busy-page empty result table"
+                )
+            return filter_by_date(applications, start_date, end_date)
+
+        return collect_listing_pages(self.http, result, parse_page, limit=limit)
 
     def _explicit_no_results(self, html_text: str) -> bool:
         page_text = (clean_text(" ".join(html.fromstring(html_text).itertext())) or "").casefold()

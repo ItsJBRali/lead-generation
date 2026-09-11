@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 from lxml import html
 
 from lead_generator.planning.adapters.base import PlanningScraper
+from lead_generator.planning.adapters.pagination import MAX_LISTING_PAGES, collect_listing_pages
 from lead_generator.planning.http import (
     CouncilBrowserClient,
     CouncilFetchError,
@@ -135,6 +136,16 @@ class NativeListingScraper(PlanningScraper):
             detail_complete=True,
         )
 
+    def _collect_pages(self, response, parser, start_date, end_date, limit):
+        return collect_listing_pages(
+            self.http, response,
+            lambda text, url: filter_by_date(parser(text, url), start_date, end_date),
+            limit=limit,
+        )
+
+    def _parse_tables(self, text, url):
+        return parse_header_tables(text, url, self.authority, self.family)
+
     def _form_defaults(self, form: html.HtmlElement) -> dict[str, str]:
         data: dict[str, str] = {}
         for input_node in form.xpath(".//input[@name]"):
@@ -218,11 +229,12 @@ class TascomiPlanningScraper(NativeListingScraper):
                 data["received_date_to"] = end_date.strftime("%d-%m-%Y")
             response = self.http.post_form(self._absolute_action(response.url, form), data)
 
-        applications = parse_header_tables(response.text, response.url, self.authority, self.family)
+        applications = filter_by_date(self._parse_tables(response.text, response.url), start_date, end_date)
+        seen_pages = {response.text.strip()}
         seen = {(application.reference or application.uid).casefold() for application in applications}
         if form is not None and (limit is None or len(applications) < limit):
             action = self._absolute_action(response.url, form)
-            for page in range(2, 251):
+            for page in range(2, MAX_LISTING_PAGES + 1):
                 page_data = {key: value for key, value in data.items() if value}
                 page_data.update(
                     {
@@ -240,24 +252,32 @@ class TascomiPlanningScraper(NativeListingScraper):
                 )
                 if not page_response.text.strip():
                     break
+                fingerprint = page_response.text.strip()
+                if fingerprint in seen_pages:
+                    raise CouncilFetchError("Tascomi pagination returned a repeated page")
+                seen_pages.add(fingerprint)
                 page_applications = parse_header_tables(
                     page_response.text,
                     page_response.url,
                     self.authority,
                     self.family,
                 )
+                if not page_applications:
+                    break
                 new_applications = [
                     application
-                    for application in page_applications
+                    for application in filter_by_date(page_applications, start_date, end_date)
                     if (application.reference or application.uid).casefold() not in seen
                 ]
-                if not new_applications:
-                    break
                 for application in new_applications:
                     seen.add((application.reference or application.uid).casefold())
                 applications.extend(new_applications)
                 if limit is not None and len(applications) >= limit:
                     break
+            else:
+                raise CouncilFetchError(f"Tascomi pagination exceeded {MAX_LISTING_PAGES} pages")
+        elif form is None:
+            applications = self._collect_pages(response, self._parse_tables, start_date, end_date, limit)
 
         inferred_date = start_date or end_date
         for application in applications:
@@ -297,11 +317,12 @@ class TascomiPlanningScraper(NativeListingScraper):
             data["week"] = week_start.strftime("%d-%m-%Y")
             data["fa"] = "getReceivedWeeklyList"
             response = self.http.post_form(self._absolute_action(page.url, form), data)
-            for application in parse_header_tables(
-                response.text,
-                response.url,
-                self.authority,
-                self.family,
+            remaining = None if limit is None else limit - len(applications)
+            def parse_week(text, url):
+                return [application for application in self._parse_tables(text, url)
+                        if (application.reference or application.uid).casefold() not in seen]
+            for application in self._collect_pages(
+                response, parse_week, start_date, end_date, remaining,
             ):
                 key = (application.reference or application.uid).casefold()
                 if key in seen:
@@ -396,8 +417,7 @@ class EnterpriseStorePlanningScraper(NativeListingScraper):
             data,
             headers={"X-Requested-With": "XMLHttpRequest"},
         )
-        applications = self.parse_cards(response.text, response.url)
-        return applications[:limit] if limit is not None else applications
+        return self._collect_pages(response, self.parse_cards, start_date, end_date, limit)
 
     def parse_cards(self, html_text: str, page_url: str) -> list[PlanningApplication]:
         document = html.fromstring(html_text)
@@ -465,8 +485,7 @@ class AppSearchServPlanningScraper(NativeListingScraper):
                 data[key] = ""
         data["button"] = data.get("button") or "Search"
         response = self.http.post_form(self._absolute_action(response.url, form), data)
-        applications = parse_header_tables(response.text, response.url, self.authority, self.family)
-        return applications[:limit] if limit is not None else applications
+        return self._collect_pages(response, self._parse_tables, start_date, end_date, limit)
 
 
 class FastwebPlanningScraper(NativeListingScraper):
@@ -493,23 +512,7 @@ class FastwebPlanningScraper(NativeListingScraper):
         data["Submit"] = data.get("Submit") or "Search"
         response = self.http.post_form(self._absolute_action(response.url, form), data)
 
-        applications: list[PlanningApplication] = []
-        seen: set[str] = set()
-        next_url: str | None = response.url
-        page_text = response.text
-        page_url = response.url
-        while next_url:
-            page_apps = self.parse_results(page_text, page_url, seen)
-            applications.extend(page_apps)
-            if limit is not None and len(applications) >= limit:
-                return applications[:limit]
-            next_url = self.next_page(page_text, page_url)
-            if not next_url:
-                break
-            response = self.http.get(next_url)
-            page_text = response.text
-            page_url = response.url
-        return applications
+        return self._collect_pages(response, self.parse_results, start_date, end_date, limit)
 
     def parse_results(self, html_text: str, page_url: str, seen: set[str] | None = None) -> list[PlanningApplication]:
         document = html.fromstring(html_text)
@@ -582,24 +585,7 @@ class CcedPlanningScraper(NativeListingScraper):
         ) or "ctl00$ContentPlaceHolder1$btnSearch3"
         data[submit_name] = "Search"
         response = self.http.post_form(self._absolute_action(response.url, form), data)
-        applications = []
-        seen: set[str] = set()
-        while True:
-            for application in self.parse_results(response.text, response.url):
-                key = (application.reference or application.uid).casefold()
-                if key in seen:
-                    continue
-                seen.add(key)
-                applications.append(application)
-                if limit is not None and len(applications) >= limit:
-                    return applications[:limit]
-            next_target = self.next_page_target(response.text)
-            if not next_target:
-                break
-            response = self.post_results_page(response.text, response.url, next_target)
-        if start_date or end_date:
-            applications = filter_by_date(applications, start_date, end_date)
-        return applications[:limit] if limit is not None else applications
+        return self._collect_pages(response, self.parse_results, start_date, end_date, limit)
 
     def _accept_disclaimer(self, response):
         if "disclaimer" not in response.url.casefold() and "btnAccept" not in response.text:
@@ -618,7 +604,7 @@ class CcedPlanningScraper(NativeListingScraper):
         document = html.fromstring(html_text)
         applications: list[PlanningApplication] = []
         seen: set[str] = set()
-        body_text = clean_text(" ".join(document.xpath("//body//text()"))) or ""
+        body_text = clean_text(" ".join(document.itertext())) or ""
         pattern = re.compile(
             r"(?P<ref>P/[A-Z]+/\d{4}/\d+)\s+Location:\s*(?P<address>.*?)\s+Proposal:\s*(?P<proposal>.*?)\s+Decision:\s*(?P<decision>.*?)\s+Decision Date:\s*(?P<decision_date>.*?)(?:View this application|$)",
             re.IGNORECASE,
@@ -647,7 +633,7 @@ class CcedPlanningScraper(NativeListingScraper):
 
     def next_page_target(self, html_text: str) -> str | None:
         document = html.fromstring(html_text)
-        body_text = clean_text(" ".join(document.xpath("//body//text()"))) or ""
+        body_text = clean_text(" ".join(document.itertext())) or ""
         page_match = re.search(r"Page\s+(\d+)\s+of\s+(\d+)", body_text, re.IGNORECASE)
         if not page_match:
             return None
@@ -677,6 +663,16 @@ class CcedPlanningScraper(NativeListingScraper):
         data = self._form_defaults(form)
         data["__EVENTTARGET"] = event_target
         data["__EVENTARGUMENT"] = ""
+        page_match = re.search(r"Page\s+(\d+)\s+of\s+(\d+)", " ".join(document.itertext()), re.I)
+        wanted = str(int(page_match.group(1)) + 1) if page_match else None
+        matches = []
+        for anchor in document.xpath("//a[@href]"):
+            match = re.search(r"__doPostBack\('([^']+)'\s*,\s*'([^']*)'", anchor.get("href") or "")
+            if match and match.group(1) == event_target:
+                matches.append((clean_text(anchor.text_content()), match.group(2)))
+        if matches:
+            selected = next((argument for label, argument in matches if label == wanted), None)
+            data["__EVENTARGUMENT"] = selected if selected is not None else matches[0][1]
         return self.http.post_form(self._absolute_action(page_url, form), data)
 
 
@@ -712,10 +708,9 @@ class AstunPlanningScraper(NativeListingScraper):
         action = self._absolute_action(response.url, form)
         method = (form.get("method") or "get").lower()
         response = self.http.post_form(action, data) if method == "post" else self.http.get(action, data)
-        applications = parse_header_tables(response.text, response.url, self.authority, self.family)
-        if not applications:
-            applications = self.parse_text_results(response.text, response.url)
-        return applications[:limit] if limit is not None else applications
+        def parse_page(text, url):
+            return self._parse_tables(text, url) or self.parse_text_results(text, url)
+        return self._collect_pages(response, parse_page, start_date, end_date, limit)
 
     def parse_text_results(self, html_text: str, page_url: str) -> list[PlanningApplication]:
         body_text = clean_text(" ".join(html.fromstring(html_text).xpath("//body//text()"))) or ""
@@ -764,10 +759,34 @@ class StatMapPlanningScraper(NativeListingScraper):
                 "receivedDateTo": end_date.isoformat() if end_date else "",
             },
         }
-        response = self.http.post_json(api_url, payload)
-        records = json.loads(response.text).get("records") or []
-        applications = [self._from_record(record, base) for record in records[: limit or len(records)]]
-        return filter_by_date(applications, start_date, end_date)
+        if limit is not None and limit <= 0:
+            return []
+        applications: list[PlanningApplication] = []
+        seen: set[str] = set()
+        seen_pages: set[str] = set()
+        while True:
+            response = self.http.post_json(api_url, payload)
+            records = json.loads(response.text).get("records") or []
+            if not records:
+                return applications
+            fingerprint = json.dumps(records, sort_keys=True)
+            if fingerprint in seen_pages:
+                raise CouncilFetchError(f"{self.family} pagination returned a repeated page")
+            seen_pages.add(fingerprint)
+            for record in records:
+                application = self._from_record(record, base)
+                key = (application.reference or application.uid).casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                applications.extend(filter_by_date([application], start_date, end_date))
+                if limit is not None and len(applications) >= limit:
+                    return applications[:limit]
+            if len(seen_pages) >= MAX_LISTING_PAGES:
+                raise CouncilFetchError(f"{self.family} pagination exceeded {MAX_LISTING_PAGES} pages")
+            # Keep the requested size fixed: page indexes depend on it. A portal
+            # may cap the size, so only an empty page confirms completion.
+            payload["pagination"]["page"] += 1
 
     def _spa_base_url(self, listing_url: str) -> str:
         parts = urlsplit(listing_url)
@@ -816,7 +835,7 @@ class SocrataPlanningScraper(NativeListingScraper):
         dataset = dataset_match.group(1) if dataset_match else "2eiu-s2cw"
         parts = urlsplit(listing_url)
         api_url = f"{parts.scheme}://{parts.netloc}/resource/{dataset}.json"
-        params = {"$limit": str(limit or 100), "$order": "registered_date DESC"}
+        params = {"$limit": str(min(limit, 100) if limit else 100), "$order": "registered_date DESC, :id ASC", "$offset": "0"}
         where: list[str] = []
         if start_date:
             where.append(f"registered_date >= '{start_date.isoformat()}T00:00:00'")
@@ -824,9 +843,33 @@ class SocrataPlanningScraper(NativeListingScraper):
             where.append(f"registered_date <= '{end_date.isoformat()}T23:59:59'")
         if where:
             params["$where"] = " AND ".join(where)
-        response = self.http.get(api_url, params)
-        rows = json.loads(response.text)
-        return filter_by_date([self._from_row(row, api_url) for row in rows], start_date, end_date)
+        if limit is not None and limit <= 0:
+            return []
+        applications: list[PlanningApplication] = []
+        seen: set[str] = set()
+        seen_pages: set[str] = set()
+        while True:
+            response = self.http.get(api_url, params)
+            rows = json.loads(response.text)
+            if not rows:
+                return applications
+            fingerprint = json.dumps(rows, sort_keys=True)
+            if fingerprint in seen_pages:
+                raise CouncilFetchError(f"{self.family} pagination returned a repeated page")
+            seen_pages.add(fingerprint)
+            for row in rows:
+                application = self._from_row(row, api_url)
+                key = (application.reference or application.uid).casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                applications.extend(filter_by_date([application], start_date, end_date))
+                if limit is not None and len(applications) >= limit:
+                    return applications[:limit]
+            if len(seen_pages) >= MAX_LISTING_PAGES:
+                raise CouncilFetchError(f"{self.family} pagination exceeded {MAX_LISTING_PAGES} pages")
+            # Offset counts server rows, including duplicates and filtered rows.
+            params["$offset"] = str(int(params["$offset"]) + len(rows))
 
     def _from_row(self, row: dict[str, object], source_url: str) -> PlanningApplication:
         reference = string_value(row.get("application_number"))
@@ -866,7 +909,7 @@ class HtmlListPlanningScraper(NativeListingScraper):
         if not applications and response.url != listing_url:
             response = self.http.get(listing_url)
             applications = self.parse_listing(response.text, response.url)
-        return applications[:limit] if limit is not None else applications
+        return self._collect_pages(response, self.parse_listing, start_date, end_date, limit)
 
     def _search_url(self, listing_url: str, start_date: date | None, end_date: date | None) -> str:
         if "copeland.gov.uk/planning/application-search" in listing_url and (start_date or end_date):
@@ -929,7 +972,8 @@ class QueryFormPlanningScraper(NativeListingScraper):
         document = html.fromstring(response.text)
         form = self._pick_form(document)
         if form is None:
-            return HtmlListPlanningScraper(self.config, http_client=self.http).parse_listing(response.text, response.url)[: limit or 100]
+            parser = HtmlListPlanningScraper(self.config, http_client=self.http).parse_listing
+            return self._collect_pages(response, parser, start_date, end_date, limit)
         data = self._form_defaults(form)
         self._set_dates(data, start_date, end_date)
         submit = first(node.get("name") for node in form.xpath(".//input[@type='submit' and @name]"))
@@ -938,11 +982,10 @@ class QueryFormPlanningScraper(NativeListingScraper):
         action = self._absolute_action(response.url, form)
         method = (form.get("method") or "get").lower()
         result = self.http.post_form(action, data) if method == "post" else self.http.get(action, data)
-        applications = parse_header_tables(result.text, result.url, self.authority, self.family)
-        if not applications:
-            applications = HtmlListPlanningScraper(self.config, http_client=self.http).parse_listing(result.text, result.url)
-        applications = filter_by_date(applications, start_date, end_date)
-        return applications[:limit] if limit is not None else applications
+        fallback = HtmlListPlanningScraper(self.config, http_client=self.http).parse_listing
+        def parse_page(text, url):
+            return self._parse_tables(text, url) or fallback(text, url)
+        return self._collect_pages(result, parse_page, start_date, end_date, limit)
 
     def _pick_form(self, document: html.HtmlElement) -> html.HtmlElement | None:
         forms = document.xpath(

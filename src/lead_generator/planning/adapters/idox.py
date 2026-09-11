@@ -178,11 +178,13 @@ class IdoxPublicAccessScraper(PlanningScraper):
 
         add_page(response.text, response.url)
         while queued_urls and (limit is None or len(applications) < limit):
-            if processed_pages >= self.MAX_PAGED_RESULT_PAGES:
-                break
             page_url = queued_urls.pop(0)
             if page_url in seen_urls:
                 continue
+            if processed_pages >= self.MAX_PAGED_RESULT_PAGES:
+                raise CouncilFetchError(
+                    f"Idox pagination exceeded {self.MAX_PAGED_RESULT_PAGES} pages for {self.authority}; search incomplete"
+                )
             seen_urls.add(page_url)
             page = self.http.get(page_url)
             processed_pages += 1
