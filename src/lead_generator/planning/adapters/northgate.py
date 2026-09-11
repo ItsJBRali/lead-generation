@@ -53,6 +53,8 @@ class NorthgateCouncilConfig(GenericCouncilConfig):
 class NorthgatePlanningScraper(GenericLabelledPlanningScraper):
     """Scraper for Northgate Planning Explorer pages."""
 
+    MAX_PAGED_RESULT_PAGES = 500
+
     def discover_ids(
         self,
         *,
@@ -97,13 +99,20 @@ class NorthgatePlanningScraper(GenericLabelledPlanningScraper):
     ) -> DiscoveryResult:
         first_page = self._fetch_listing(listing_url, start_date=start_date, end_date=end_date)
         result_total = self._result_total(first_page.text)
-        pending = [first_page]
+        pending = [(first_page.url, None)]
         queued_urls = {self._canonical_url(first_page.url)}
         seen_uids: set[str] = set()
         applications: list[PlanningApplication] = []
+        processed_pages = 0
 
-        while pending and len(queued_urls) <= 500:
-            page = pending.pop(0)
+        while pending:
+            if processed_pages >= self.MAX_PAGED_RESULT_PAGES:
+                raise CouncilFetchError(
+                    f"Northgate pagination exceeded {self.MAX_PAGED_RESULT_PAGES} pages for {self.authority}; search incomplete"
+                )
+            page_url, referer = pending.pop(0)
+            page = first_page if referer is None else self.http.get(page_url, headers={"Referer": referer})
+            processed_pages += 1
             for application in self.parse_listing(page.text, page.url):
                 if application.uid in seen_uids:
                     continue
@@ -127,7 +136,7 @@ class NorthgatePlanningScraper(GenericLabelledPlanningScraper):
                 if canonical_url in queued_urls:
                     continue
                 queued_urls.add(canonical_url)
-                pending.append(self.http.get(page_url, headers={"Referer": page.url}))
+                pending.append((page_url, page.url))
 
         return DiscoveryResult(
             authority=self.authority,
@@ -191,7 +200,7 @@ class NorthgatePlanningScraper(GenericLabelledPlanningScraper):
         return "%d/%m/%Y"
 
     def _result_total(self, html_text: str) -> int | None:
-        visible_text = clean_text(" ".join(html.fromstring(html_text).xpath("//body//text()"))) or ""
+        visible_text = clean_text(" ".join(html.fromstring(html_text).itertext())) or ""
         match = re.search(r"\bRecords\s+\d+\s+to\s+\d+\s+of\s+(\d+)\b", visible_text, flags=re.IGNORECASE)
         return int(match.group(1)) if match else None
 
@@ -257,4 +266,3 @@ class NorthgatePlanningScraper(GenericLabelledPlanningScraper):
 
     def _canonical_url(self, value: str) -> str:
         return self._clean_href(value).casefold()
-

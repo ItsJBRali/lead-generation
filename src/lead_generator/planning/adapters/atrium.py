@@ -82,28 +82,7 @@ class AtriumPlanningScraper(GenericLabelledPlanningScraper):
         response = self.http.get(listing_url)
         if start_date or end_date:
             response = self._submit_date_search(response, start_date=start_date, end_date=end_date)
-        response = self._expand_results_per_page(response)
-        pages = [response.text]
-        seen = {response.url}
-        status_code = response.status_code
-        final_url = response.url
-
-        for page_url in self._pagination_urls(response.text, response.url)[:100]:
-            if page_url in seen:
-                continue
-            seen.add(page_url)
-            page = self.http.get(page_url)
-            pages.append(page.text)
-            status_code = page.status_code
-            final_url = page.url
-
-        if len(pages) == 1:
-            return response
-        return FetchResponse(
-            url=final_url,
-            status_code=status_code,
-            text="<html><body>" + "\n".join(pages) + "</body></html>",
-        )
+        return self._expand_results_per_page(response)
 
     def _expand_results_per_page(self, response: FetchResponse) -> FetchResponse:
         document = html.fromstring(response.text)
@@ -352,11 +331,16 @@ class AtriumPlanningScraper(GenericLabelledPlanningScraper):
     def _pagination_urls(self, html_text: str, page_url: str) -> list[str]:
         document = html.fromstring(html_text)
         urls: list[str] = []
+        current_match = re.search(r"/search/(?:resultspage|results)/(\d+)", urlsplit(page_url).path, re.I)
+        current_page = int(current_match.group(1)) if current_match else 1
         for anchor in document.xpath("//a[@href]"):
             href = anchor.get("href") or ""
             text = clean_text(" ".join(anchor.itertext())) or ""
             lowered = href.casefold()
             if "/search/resultspage/" not in lowered:
+                continue
+            page_match = re.search(r"/search/resultspage/(\d+)", urlsplit(href).path, re.I)
+            if page_match and int(page_match.group(1)) <= current_page:
                 continue
             if text and not (text.isdigit() or text.casefold() in {"next", "last"}):
                 continue

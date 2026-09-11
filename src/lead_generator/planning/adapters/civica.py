@@ -10,7 +10,7 @@ from lead_generator.planning.adapters.generic import (
     GenericCouncilConfig,
     GenericLabelledPlanningScraper,
 )
-from lead_generator.planning.http import CouncilHttpClient
+from lead_generator.planning.http import CouncilFetchError, CouncilHttpClient
 from lead_generator.planning.models import DiscoveryResult, PlanningApplication, PlanningDocument
 from lead_generator.planning.parsing import clean_text, extract_postcode, parse_council_date
 
@@ -102,6 +102,7 @@ class CivicaPlanningScraper(GenericLabelledPlanningScraper):
     ) -> list[PlanningApplication]:
         applications: list[PlanningApplication] = []
         seen: set[str] = set()
+        seen_pages: set[str] = set()
         page_size = min(limit or 100, 100)
         from_row = 1
         total_rows: int | None = None
@@ -122,6 +123,16 @@ class CivicaPlanningScraper(GenericLabelledPlanningScraper):
                     total_rows = int(data.get("TotalRows"))
                 except (TypeError, ValueError):
                     total_rows = None
+            if not records:
+                if total_rows is not None and from_row <= total_rows:
+                    raise CouncilFetchError(
+                        f"Civica search incomplete: empty page at row {from_row} of {total_rows}"
+                    )
+                break
+            page_signature = json.dumps(records, sort_keys=True)
+            if page_signature in seen_pages:
+                raise CouncilFetchError("Civica search repeated a results page before pagination completed")
+            seen_pages.add(page_signature)
             for record in records:
                 if not isinstance(record, dict):
                     continue
@@ -133,13 +144,11 @@ class CivicaPlanningScraper(GenericLabelledPlanningScraper):
                 applications.append(application)
                 if limit is not None and len(applications) >= limit:
                     return applications
-            if not records:
+            # The server may enforce a smaller page size than requested.
+            # TotalRows and row offsets count raw rows, including duplicates.
+            from_row += len(records)
+            if total_rows is not None and from_row > total_rows:
                 break
-            if total_rows is not None and len(applications) >= total_rows:
-                break
-            if len(records) < page_size:
-                break
-            from_row += page_size
         return applications
 
     def _fetch_keyobject_application(self, uid: str, url: str) -> PlanningApplication:

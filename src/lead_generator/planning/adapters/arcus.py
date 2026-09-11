@@ -54,6 +54,7 @@ class ArcusPlanningScraper(PlanningScraper):
             context,
             start_date=start_date,
             end_date=end_date,
+            limit=limit,
         )
         applications = [self._application_from_record(record, listing_url, fallback_date=start_date) for record in records]
         if limit is not None:
@@ -76,12 +77,14 @@ class ArcusPlanningScraper(PlanningScraper):
         *,
         start_date: date | None,
         end_date: date | None,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         return self._search_records_window(
             listing_url,
             context,
             start_date=start_date,
             end_date=end_date,
+            limit=limit,
         )
 
     def _search_records_window(
@@ -91,6 +94,7 @@ class ArcusPlanningScraper(PlanningScraper):
         *,
         start_date: date | None,
         end_date: date | None,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         records, threshold_hit = self._fetch_search_records(
             listing_url,
@@ -98,51 +102,39 @@ class ArcusPlanningScraper(PlanningScraper):
             start_date=start_date,
             end_date=end_date,
         )
-        if not (threshold_hit and start_date and end_date and start_date < end_date):
+        records = self._dedupe_records(records)
+        if limit is not None and len(records) >= limit:
+            return records[:limit]
+        if not threshold_hit:
             return records
+        if not (start_date and end_date and start_date < end_date):
+            raise CouncilFetchError(
+                "Arcus search is incomplete: result threshold reached for "
+                f"{start_date or 'unbounded'} to {end_date or 'unbounded'}; "
+                "the date window cannot be split further"
+            )
 
         midpoint = start_date + timedelta(days=(end_date - start_date).days // 2)
         next_start = midpoint + timedelta(days=1)
-        left_records, left_threshold = self._fetch_search_records(
+        # A capped child may still hide records even when this first split
+        # produces no additional IDs. Recurse until each threshold clears.
+        left_records = self._search_records_window(
             listing_url,
             context,
             start_date=start_date,
             end_date=midpoint,
+            limit=limit,
         )
-        right_records, right_threshold = self._fetch_search_records(
+        if limit is not None and len(left_records) >= limit:
+            return left_records[:limit]
+        right_records = self._search_records_window(
             listing_url,
             context,
             start_date=next_start,
             end_date=end_date,
+            limit=None if limit is None else limit - len(left_records),
         )
-        merged_split_records = self._dedupe_records([*left_records, *right_records])
-        if len(merged_split_records) <= len(self._dedupe_records(records)):
-            return records
-
-        expanded_records: list[dict[str, Any]] = []
-        if left_threshold and start_date < midpoint:
-            expanded_records.extend(
-                self._search_records_window(
-                    listing_url,
-                    context,
-                    start_date=start_date,
-                    end_date=midpoint,
-                )
-            )
-        else:
-            expanded_records.extend(left_records)
-        if right_threshold and next_start < end_date:
-            expanded_records.extend(
-                self._search_records_window(
-                    listing_url,
-                    context,
-                    start_date=next_start,
-                    end_date=end_date,
-                )
-            )
-        else:
-            expanded_records.extend(right_records)
-        return self._dedupe_records(expanded_records)
+        return self._dedupe_records([*left_records, *right_records])
 
     def _fetch_search_records(
         self,
