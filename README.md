@@ -34,7 +34,12 @@ prefers links whose title matches the intended document when a portal returns
 multiple PDFs from an intermediate page.
 Users can untick the download option to produce only the application CSV. The
 CSV includes each matched application's reference, address, application link,
-proposal, received date, and council.
+proposal, received date, and council. When files are downloaded, the app reads
+the saved PDFs after all council searches finish and appends architect/company,
+telephone, email, and company-address fields to the same row. Selectable PDF
+text is preferred and image-only pages use bundled OCR. Application forms may
+provide an agent/company name and business address, but their phone and email
+fields are deliberately ignored, and applicant/client details are excluded.
 
 ## Run Tests
 
@@ -71,7 +76,8 @@ The Windows GUI is available as `dist/PlanningLeadGenerator.exe`. It lets a user
 - choose whether to download application files as well as the CSV
 - choose how many councils to search concurrently, from 1 to 8
 - edit the default lead keywords
-- run the search with council progress, captured-lead count, and a live log
+- run the search with council progress, captured-lead count, PDF-enrichment
+  progress, and a live log
 
 The uploaded GeoJSON no longer needs council names or portal fields. The app
 bundles `planning_authorities.geojson`, a stored catalogue of planning

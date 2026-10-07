@@ -8,12 +8,13 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 
 from lxml import html
 
-from lead_generator.planning.adapters.base import PlanningScraper
+from lead_generator.planning.adapters.base import PlanningScraper, PortalSearchCompletenessError
 from lead_generator.planning.adapters.pagination import MAX_LISTING_PAGES, collect_listing_pages
 from lead_generator.planning.http import (
     CouncilBrowserClient,
     CouncilFetchError,
     CouncilHttpClient,
+    FetchResponse,
     browser_fallback_recommended,
 )
 from lead_generator.planning.models import DiscoveryResult, PlanningApplication
@@ -137,11 +138,28 @@ class NativeListingScraper(PlanningScraper):
         )
 
     def _collect_pages(self, response, parser, start_date, end_date, limit):
-        return collect_listing_pages(
+        reported_totals = []
+        seen_references = set()
+
+        def parse_page(text, url):
+            reported_total = _reported_result_total(text)
+            if reported_total is not None:
+                reported_totals.append(reported_total)
+            applications = parser(text, url)
+            seen_references.update((app.reference or app.uid).strip() for app in applications)
+            return filter_by_date(applications, start_date, end_date)
+
+        applications = collect_listing_pages(
             self.http, response,
-            lambda text, url: filter_by_date(parser(text, url), start_date, end_date),
+            parse_page,
             limit=limit,
         )
+        if (limit is None or len(applications) < limit) and reported_totals:
+            if max(reported_totals) > len(seen_references):
+                raise PortalSearchCompletenessError(
+                    "Legacy search returned fewer unique results than its displayed total"
+                )
+        return applications
 
     def _parse_tables(self, text, url):
         return parse_header_tables(text, url, self.authority, self.family)
@@ -558,6 +576,7 @@ class FastwebPlanningScraper(NativeListingScraper):
 
 class CcedPlanningScraper(NativeListingScraper):
     family = "cced"
+    MAX_PAGED_RESULT_PAGES = 100
 
     def search(
         self,
@@ -585,7 +604,52 @@ class CcedPlanningScraper(NativeListingScraper):
         ) or "ctl00$ContentPlaceHolder1$btnSearch3"
         data[submit_name] = "Search"
         response = self.http.post_form(self._absolute_action(response.url, form), data)
-        return self._collect_pages(response, self.parse_results, start_date, end_date, limit)
+        applications: list[PlanningApplication] = []
+        seen: set[str] = set()
+        seen_page_signatures: set[tuple[str, ...]] = set()
+        processed_pages = 0
+        while True:
+            processed_pages += 1
+            page_applications = self.parse_results(response.text, response.url)
+            page_references: list[str] = []
+            for application in page_applications:
+                reference = (application.reference or "").strip()
+                if not reference:
+                    raise PortalSearchCompletenessError(
+                        "CCED returned a record without a usable application reference"
+                    )
+                application.reference = reference
+                page_references.append(reference)
+
+            page_signature = tuple(page_references)
+            if page_signature in seen_page_signatures:
+                raise PortalSearchCompletenessError("CCED returned a repeated page")
+            seen_page_signatures.add(page_signature)
+
+            new_reference_count = 0
+            for application, reference in zip(page_applications, page_references):
+                if reference in seen:
+                    continue
+                seen.add(reference)
+                applications.append(application)
+                new_reference_count += 1
+                if limit is not None and len(applications) >= limit:
+                    return applications[:limit]
+            next_target = self.next_page_target(response.text)
+            if not next_target:
+                break
+            if new_reference_count == 0:
+                raise PortalSearchCompletenessError(
+                    "CCED made no unique-reference progress"
+                )
+            if processed_pages >= self.MAX_PAGED_RESULT_PAGES:
+                raise PortalSearchCompletenessError(
+                    "CCED exceeded the maximum page request limit"
+                )
+            response = self.post_results_page(response.text, response.url, next_target)
+        if start_date or end_date:
+            applications = filter_by_date(applications, start_date, end_date)
+        return applications[:limit] if limit is not None else applications
 
     def _accept_disclaimer(self, response):
         if "disclaimer" not in response.url.casefold() and "btnAccept" not in response.text:
@@ -693,6 +757,13 @@ class AstunPlanningScraper(NativeListingScraper):
         if form is None:
             return []
         data = self._form_defaults(form)
+        page_sizes = {
+            int(value)
+            for value in form.xpath(".//select[@name='pagerecs']/option/@value")
+            if value.isdigit()
+        }
+        if page_sizes:
+            data["pagerecs"] = str(max(page_sizes))
         if start_date:
             data["DATEAPRECV:FROM:DATE"] = start_date.strftime("%d/%m/%Y")
             for key in list(data):
@@ -741,6 +812,7 @@ class AstunPlanningScraper(NativeListingScraper):
 
 class StatMapPlanningScraper(NativeListingScraper):
     family = "statmap"
+    MAX_PAGED_RESULT_PAGES = 100
 
     def search(
         self,
@@ -752,41 +824,90 @@ class StatMapPlanningScraper(NativeListingScraper):
     ) -> list[PlanningApplication]:
         base = self._spa_base_url(listing_url)
         api_url = urljoin(base + "/", "api/publicportal/planningApplications/pageRequest")
-        payload = {
-            "pagination": {"page": 0, "pageSize": limit or 50},
-            "filter": {
-                "receivedDateFrom": start_date.isoformat() if start_date else "",
-                "receivedDateTo": end_date.isoformat() if end_date else "",
-            },
-        }
-        if limit is not None and limit <= 0:
-            return []
+        page_size = min(limit, 100) if limit and limit < 100 else 100
+        offset = 0
+        expected_total: int | None = None
+        seen_page_signatures: set[tuple[str, ...]] = set()
+        seen_references: set[str] = set()
         applications: list[PlanningApplication] = []
-        seen: set[str] = set()
-        seen_pages: set[str] = set()
+        processed_pages = 0
+
         while True:
-            response = self.http.post_json(api_url, payload)
-            records = json.loads(response.text).get("records") or []
-            if not records:
-                return applications
-            fingerprint = json.dumps(records, sort_keys=True)
-            if fingerprint in seen_pages:
-                raise CouncilFetchError(f"{self.family} pagination returned a repeated page")
-            seen_pages.add(fingerprint)
-            for record in records:
-                application = self._from_record(record, base)
-                key = (application.reference or application.uid).casefold()
-                if key in seen:
+            if processed_pages >= self.MAX_PAGED_RESULT_PAGES:
+                raise PortalSearchCompletenessError("StatMap exceeded the maximum page request limit")
+            processed_pages += 1
+            payload = {
+                "pageSize": page_size,
+                "offset": offset,
+                "filter": {
+                    "parts": [
+                        {
+                            "filterItems": [
+                                {"columnName": "receivedDateFrom", "value": start_date.isoformat() if start_date else "", "operator": "="},
+                                {"columnName": "receivedDateTo", "value": end_date.isoformat() if end_date else "", "operator": "="},
+                            ]
+                        }
+                    ]
+                },
+                "order": {"receivedDate": "desc"},
+                "advancedFilter": {},
+            }
+            try:
+                response_data = json.loads(self.http.post_json(api_url, payload).text)
+            except json.JSONDecodeError as error:
+                raise PortalSearchCompletenessError("StatMap returned invalid JSON") from error
+            if not isinstance(response_data, dict):
+                raise PortalSearchCompletenessError("StatMap returned an invalid page payload")
+
+            records = response_data.get("records")
+            total = response_data.get("total")
+            if not isinstance(records, list) or not all(isinstance(record, dict) for record in records):
+                raise PortalSearchCompletenessError("StatMap returned invalid records")
+            if not isinstance(total, int) or isinstance(total, bool) or total < 0:
+                raise PortalSearchCompletenessError("StatMap returned an invalid total")
+            if expected_total is None:
+                expected_total = total
+            elif total != expected_total:
+                raise PortalSearchCompletenessError("StatMap changed the result total during pagination")
+
+            page_identifiers = [
+                string_value(record.get("name") or record.get("reference") or record.get("appRef") or record.get("id")) or ""
+                for record in records
+            ]
+            if any(not identifier for identifier in page_identifiers):
+                raise PortalSearchCompletenessError(
+                    "StatMap returned a record without a stable identifier"
+                )
+            page_signature = tuple(page_identifiers)
+            if page_signature in seen_page_signatures:
+                raise PortalSearchCompletenessError("StatMap returned a repeated page")
+            seen_page_signatures.add(page_signature)
+
+            for record, reference in zip(records, page_signature):
+                if reference in seen_references:
                     continue
-                seen.add(key)
-                applications.extend(filter_by_date([application], start_date, end_date))
-                if limit is not None and len(applications) >= limit:
-                    return applications[:limit]
-            if len(seen_pages) >= MAX_LISTING_PAGES:
-                raise CouncilFetchError(f"{self.family} pagination exceeded {MAX_LISTING_PAGES} pages")
-            # Keep the requested size fixed: page indexes depend on it. A portal
-            # may cap the size, so only an empty page confirms completion.
-            payload["pagination"]["page"] += 1
+                seen_references.add(reference)
+                application = self._from_record(record, base)
+                received_date = application.date_received
+                if not received_date:
+                    continue
+                try:
+                    parsed_received_date = date.fromisoformat(received_date)
+                except ValueError:
+                    continue
+                if start_date and parsed_received_date < start_date:
+                    raise PortalSearchCompletenessError("StatMap returned a record before the requested start date")
+                if end_date and parsed_received_date > end_date:
+                    raise PortalSearchCompletenessError("StatMap returned a record after the requested end date")
+                applications.append(application)
+
+            if len(seen_references) == expected_total:
+                break
+            if not records:
+                raise PortalSearchCompletenessError("StatMap returned an empty page before the reported total")
+            offset += len(records)
+
+        return applications[:limit] if limit is not None else applications
 
     def _spa_base_url(self, listing_url: str) -> str:
         parts = urlsplit(listing_url)
@@ -822,6 +943,8 @@ class StatMapPlanningScraper(NativeListingScraper):
 
 class SocrataPlanningScraper(NativeListingScraper):
     family = "socrata"
+    PAGE_SIZE = 100
+    MAX_PAGED_RESULT_PAGES = 100
 
     def search(
         self,
@@ -835,41 +958,73 @@ class SocrataPlanningScraper(NativeListingScraper):
         dataset = dataset_match.group(1) if dataset_match else "2eiu-s2cw"
         parts = urlsplit(listing_url)
         api_url = f"{parts.scheme}://{parts.netloc}/resource/{dataset}.json"
-        params = {"$limit": str(min(limit, 100) if limit else 100), "$order": "registered_date DESC, :id ASC", "$offset": "0"}
+        if limit is not None and limit <= 0:
+            return []
+        page_size = self.PAGE_SIZE
+        base_params = {
+            "$limit": str(page_size),
+            "$order": "registered_date DESC, pk DESC",
+        }
         where: list[str] = []
         if start_date:
             where.append(f"registered_date >= '{start_date.isoformat()}T00:00:00'")
         if end_date:
             where.append(f"registered_date <= '{end_date.isoformat()}T23:59:59'")
         if where:
-            params["$where"] = " AND ".join(where)
-        if limit is not None and limit <= 0:
-            return []
+            base_params["$where"] = " AND ".join(where)
+
         applications: list[PlanningApplication] = []
-        seen: set[str] = set()
-        seen_pages: set[str] = set()
+        seen_page_signatures: set[tuple[str, ...]] = set()
+        seen_references: set[str] = set()
+        offset = 0
+        processed_pages = 0
         while True:
-            response = self.http.get(api_url, params)
-            rows = json.loads(response.text)
-            if not rows:
-                return applications
-            fingerprint = json.dumps(rows, sort_keys=True)
-            if fingerprint in seen_pages:
-                raise CouncilFetchError(f"{self.family} pagination returned a repeated page")
-            seen_pages.add(fingerprint)
-            for row in rows:
-                application = self._from_row(row, api_url)
-                key = (application.reference or application.uid).casefold()
-                if key in seen:
+            if processed_pages >= self.MAX_PAGED_RESULT_PAGES:
+                raise PortalSearchCompletenessError(
+                    "Socrata exceeded the maximum page request limit"
+                )
+            processed_pages += 1
+            params = {**base_params, "$offset": str(offset)}
+            rows = json.loads(self.http.get(api_url, params).text)
+            if not isinstance(rows, list) or not all(
+                isinstance(row, dict) for row in rows
+            ):
+                raise PortalSearchCompletenessError(
+                    "Socrata returned an invalid page payload"
+                )
+            page_applications = [self._from_row(row, api_url) for row in rows]
+            page_references = [
+                (application.reference or "").strip()
+                for application in page_applications
+            ]
+            if any(not reference for reference in page_references):
+                raise PortalSearchCompletenessError(
+                    "Socrata returned a record without a usable application reference"
+                )
+            page_signature = tuple(page_references)
+            if page_signature and page_signature in seen_page_signatures:
+                raise PortalSearchCompletenessError("Socrata returned a repeated page")
+            if page_signature:
+                seen_page_signatures.add(page_signature)
+
+            new_reference_count = 0
+            for application, reference in zip(page_applications, page_references):
+                if reference in seen_references:
                     continue
-                seen.add(key)
+                seen_references.add(reference)
+                application.reference = reference
                 applications.extend(filter_by_date([application], start_date, end_date))
-                if limit is not None and len(applications) >= limit:
-                    return applications[:limit]
-            if len(seen_pages) >= MAX_LISTING_PAGES:
-                raise CouncilFetchError(f"{self.family} pagination exceeded {MAX_LISTING_PAGES} pages")
-            # Offset counts server rows, including duplicates and filtered rows.
-            params["$offset"] = str(int(params["$offset"]) + len(rows))
+                new_reference_count += 1
+            if limit is not None and len(applications) >= limit:
+                return applications[:limit]
+            if not rows:
+                break
+            if len(rows) >= page_size and new_reference_count == 0:
+                raise PortalSearchCompletenessError(
+                    "Socrata made no unique-reference progress on a full page"
+                )
+            offset += len(rows)
+        return applications
 
     def _from_row(self, row: dict[str, object], source_url: str) -> PlanningApplication:
         reference = string_value(row.get("application_number"))
@@ -1034,6 +1189,83 @@ class NorthLincsPlanningScraper(HtmlListPlanningScraper):
         if end_date:
             params["endDate"] = end_date.isoformat()
         return f"{parts.scheme}://{parts.netloc}/search?" + urlencode(params)
+
+
+def _linked_result_pages(
+    http: CouncilHttpClient,
+    first_response: FetchResponse,
+    *,
+    max_pages: int = 100,
+) -> list[FetchResponse]:
+    pages = [first_response]
+    base_host = urlsplit(first_response.url).netloc.casefold()
+    seen_urls = {_normalized_page_url(first_response.url)}
+
+    while True:
+        next_url = _next_result_page_url(pages[-1].text, pages[-1].url, base_host)
+        if next_url is None:
+            return pages
+        if len(pages) >= max_pages:
+            raise PortalSearchCompletenessError("Legacy search exceeded the maximum linked result page limit")
+        normalized_url = _normalized_page_url(next_url)
+        if normalized_url in seen_urls:
+            raise PortalSearchCompletenessError("Legacy search returned a linked result page loop")
+        seen_urls.add(normalized_url)
+        pages.append(http.get(next_url))
+
+
+def _next_result_page_url(html_text: str, page_url: str, base_host: str) -> str | None:
+    document = html.fromstring(html_text)
+    for anchor in document.xpath("//a[@href]"):
+        rel = (anchor.get("rel") or "").casefold().split()
+        aria_label = clean_text(anchor.get("aria-label")) or ""
+        text = clean_text(" ".join(anchor.itertext())) or ""
+        if "next" not in rel and aria_label.casefold() != "next" and text not in {"Next", ">"}:
+            continue
+        target = urljoin(page_url, anchor.get("href") or "")
+        if urlsplit(target).netloc.casefold() == base_host:
+            return target
+    return None
+
+
+def _normalized_page_url(url: str) -> str:
+    parts = urlsplit(url)
+    return parts._replace(scheme=parts.scheme.casefold(), netloc=parts.netloc.casefold(), fragment="").geturl()
+
+
+def _reported_result_total(html_text: str) -> int | None:
+    text = clean_text(" ".join(html.fromstring(html_text).xpath("//text()"))) or ""
+    for pattern in (
+        r"\bshowing\s+\d[\d,]*\s*-\s*\d[\d,]*\s+of\s+(\d[\d,]*)\b",
+        r"\btotal\s+records\s*:\s*(\d[\d,]*)\b",
+        r"\b(\d[\d,]*)\s+results?\b",
+    ):
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return int(match.group(1).replace(",", ""))
+    return None
+
+
+def _merge_linked_page_applications(
+    pages: list[FetchResponse],
+    parse_page,
+) -> list[PlanningApplication]:
+    applications: list[PlanningApplication] = []
+    seen_references: set[str] = set()
+    reported_totals: list[int] = []
+    for page in pages:
+        reported_total = _reported_result_total(page.text)
+        if reported_total is not None:
+            reported_totals.append(reported_total)
+        for application in parse_page(page.text, page.url):
+            reference = (application.reference or application.uid).strip()
+            if reference in seen_references:
+                continue
+            seen_references.add(reference)
+            applications.append(application)
+    if reported_totals and max(reported_totals) > len(applications):
+        raise PortalSearchCompletenessError("Legacy search returned fewer unique results than its displayed total")
+    return applications
 
 
 def parse_header_tables(html_text: str, page_url: str, authority: str, family: str) -> list[PlanningApplication]:

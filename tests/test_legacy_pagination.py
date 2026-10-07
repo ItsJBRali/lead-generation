@@ -5,6 +5,7 @@ import json
 import unittest
 
 from lead_generator.planning.http import CouncilFetchError, FetchResponse
+from lead_generator.planning.adapters.base import PortalSearchCompletenessError
 from lead_generator.planning.adapters.legacy_forms import (
     AppSearchServPlanningScraper, AstunPlanningScraper, CcedPlanningScraper,
     EnterpriseStorePlanningScraper, FastwebPlanningScraper, HtmlListPlanningScraper,
@@ -24,19 +25,29 @@ def table(*refs):
 
 
 class ApiClient:
-    def __init__(self, pages):
+    def __init__(self, pages, *, total=None):
         self.pages = pages
         self.calls = []
+        self.total = total if total is not None else len({
+            row['id'] for rows in pages.values() for row in rows if 'id' in row
+        })
 
     def get(self, url, params=None):
         self.calls.append((url, deepcopy(params)))
         offset = int(params.get('$offset', 0))
-        return FetchResponse(url, 200, json.dumps(self.pages.get(offset, [])))
+        rows = [{
+            'application_number': row['pk'],
+            'registered_date': '2026-01-02',
+            **row,
+        } for row in self.pages.get(offset, [])]
+        return FetchResponse(url, 200, json.dumps(rows))
 
     def post_json(self, url, data):
         self.calls.append((url, deepcopy(data)))
-        page = data['pagination']['page']
-        return FetchResponse(url, 200, json.dumps({'records': self.pages.get(page, [])}))
+        offset = data['offset']
+        records = [{'receivedDate': '2026-01-02', **row}
+                   for row in self.pages.get(offset, [])]
+        return FetchResponse(url, 200, json.dumps({'total': self.total, 'records': records}))
 
 
 class LegacyApiPaginationTest(unittest.TestCase):
@@ -45,7 +56,7 @@ class LegacyApiPaginationTest(unittest.TestCase):
                             1: [{'id': '1', 'name': '26/00001/FUL'}, {'id': '2', 'name': '26/00002/FUL'}]})
         apps = StatMapPlanningScraper(CONFIG, http_client=client).discover_ids(listing_url=BASE+'/horizoNext/').applications
         self.assertEqual([app.uid for app in apps], ['1', '2'])
-        self.assertEqual([call[1]['pagination']['page'] for call in client.calls], [0, 1, 2])
+        self.assertEqual([call[1]['offset'] for call in client.calls], [0, 1])
 
     def test_socrata_offsets_count_raw_rows_and_limit_counts_retained_rows(self):
         client = ApiClient({0: [{'pk': '0', 'registered_date': '2025-01-01'}],
@@ -64,7 +75,7 @@ class LegacyApiPaginationTest(unittest.TestCase):
 
     def test_api_duplicate_only_overlap_does_not_hide_later_rows(self):
         for scraper_class, pages in (
-            (StatMapPlanningScraper, {0: [{'id': '1'}, {'id': '2'}], 1: [{'id': '2'}], 2: [{'id': '3'}]}),
+            (StatMapPlanningScraper, {0: [{'id': '1'}, {'id': '2'}], 2: [{'id': '2'}], 3: [{'id': '3'}]}),
             (SocrataPlanningScraper, {0: [{'pk': '1'}, {'pk': '2'}], 2: [{'pk': '2'}], 3: [{'pk': '3'}]}),
         ):
             with self.subTest(family=scraper_class.family):
@@ -76,8 +87,8 @@ class LegacyApiPaginationTest(unittest.TestCase):
             (StatMapPlanningScraper, {0: [{'id': '1'}], 1: [{'id': '1'}]}),
             (SocrataPlanningScraper, {0: [{'pk': '1'}], 1: [{'pk': '1'}]}),
         ):
-            with self.subTest(family=scraper_class.family), self.assertRaises(CouncilFetchError):
-                scraper_class(CONFIG, http_client=ApiClient(pages)).discover_ids(listing_url=BASE)
+            with self.subTest(family=scraper_class.family), self.assertRaises(PortalSearchCompletenessError):
+                scraper_class(CONFIG, http_client=ApiClient(pages, total=2)).discover_ids(listing_url=BASE)
 
     def test_cced_postback_preserves_event_argument_and_latest_state(self):
         class Client:
