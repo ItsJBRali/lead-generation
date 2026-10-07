@@ -47,7 +47,7 @@ def _controls(text, page_url):
             continue
         label = clean_text(' '.join(anchor.itertext())) or ''
         labels = list(filter(None, [label, anchor.get('title'), anchor.get('aria-label'), *anchor.xpath('.//img/@alt')]))
-        is_next = 'next' in (anchor.get('rel') or '').lower().split() or any(
+        is_next = label == '>' or 'next' in (anchor.get('rel') or '').lower().split() or any(
             re.fullmatch(r'[\s>»›→]*next(?:\s+(?:page|results?))?[\s>»›→]*', value, re.I)
             for value in labels
         )

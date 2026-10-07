@@ -715,8 +715,10 @@ class CcedPlanningScraper(NativeListingScraper):
             text = clean_text(" ".join(anchor.itertext())) or ""
             if text == wanted_text:
                 return target_match.group(1)
-            if text == "..." and fallback_target is None:
-                fallback_target = target_match.group(1)
+            if text in {"...", "…"} and fallback_target is None:
+                preceding = anchor.xpath("preceding-sibling::a | preceding-sibling::span")
+                if any((clean_text(node.text_content()) or "").isdigit() for node in preceding):
+                    fallback_target = target_match.group(1)
         return fallback_target
 
     def post_results_page(self, html_text: str, page_url: str, event_target: str):

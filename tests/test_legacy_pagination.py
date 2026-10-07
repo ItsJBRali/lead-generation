@@ -109,6 +109,29 @@ class LegacyApiPaginationTest(unittest.TestCase):
 
 
 class LegacyHtmlIntegrationTest(unittest.TestCase):
+    def test_cced_uses_forward_ellipsis_after_the_last_visible_page(self):
+        def page(number, pager=''):
+            return f'''<form action="/results"><input name="__VIEWSTATE" value="{number}">
+                Page {number} of 11
+                P/HOU/2026/{number:05d} Location: High Street Proposal: Gates Decision: Pending Decision Date: View this application
+                {pager}</form>'''
+
+        class Client:
+            def get(self, url):
+                return FetchResponse(url, 200, '<form action="/results"><input name="txtDateReceivedFrom"/></form>')
+
+            def post_form(self, url, data):
+                target = data.get('__EVENTTARGET')
+                if not target:
+                    pager = '''<a href="javascript:__doPostBack('back','')">...</a>
+                        <a href="javascript:__doPostBack('grid','Page$9')">9</a><span>10</span>
+                        <a href="javascript:__doPostBack('forward','')">...</a>'''
+                    return FetchResponse(url, 200, page(10, pager))
+                return FetchResponse(url, 200, page(11 if target == 'forward' else 9))
+
+        apps = CcedPlanningScraper(CONFIG, http_client=Client()).discover_ids(listing_url=BASE).applications
+        self.assertEqual([app.reference for app in apps], ['P/HOU/2026/00010', 'P/HOU/2026/00011'])
+
     def test_first_page_only_families_follow_advertised_next_links(self):
         for scraper_class in (EnterpriseStorePlanningScraper, AppSearchServPlanningScraper,
                 AstunPlanningScraper, HtmlListPlanningScraper, QueryFormPlanningScraper,
@@ -209,6 +232,14 @@ class SharedHtmlPaginationTest(unittest.TestCase):
         apps = self.collect(client, table('26/00001/FUL')+'<a rel="next" href="?page=2">Next</a>', limit=2)
         self.assertEqual([app.reference for app in apps], ['26/00001/FUL', '26/00002/FUL'])
         self.assertEqual(client.calls, [BASE+'/results?page=2'])
+
+    def test_forward_arrow_link_fetches_the_next_result_page(self):
+        class Client:
+            def get(self, url):
+                return FetchResponse(url, 200, table('26/00002/FUL'))
+
+        apps = self.collect(Client(), table('26/00001/FUL')+'<a href="?page=2">&gt;</a>')
+        self.assertEqual([app.reference for app in apps], ['26/00001/FUL', '26/00002/FUL'])
 
     def test_postback_uses_rotating_state_and_arguments(self):
         def page(number):
