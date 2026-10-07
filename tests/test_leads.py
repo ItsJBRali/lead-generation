@@ -5034,6 +5034,7 @@ class LeadSearchTest(unittest.TestCase):
             ),
             patch("lead_generator.planning.leads._REQUEST_COOLDOWN_UNTIL", {}),
             patch("lead_generator.planning.leads._LAST_REQUEST_AT", {}),
+            patch("lead_generator.planning.leads.monotonic", return_value=100.3),
             patch(
                 "lead_generator.planning.leads._wait_for_cancelable_delay",
                 wraps=leads_module._wait_for_cancelable_delay,
@@ -5056,7 +5057,8 @@ class LeadSearchTest(unittest.TestCase):
         self.assertEqual(final_pass.downloaded_count, 0)
         self.assertEqual(wait.call_count, 1)
         waited_seconds, waited_callback = wait.call_args.args
-        self.assertLessEqual(waited_seconds, 120.0)
+        # Adding and subtracting a clock timestamp may round at the cap.
+        self.assertLessEqual(waited_seconds, 120.0 + 1e-9)
         self.assertIs(waited_callback, should_cancel)
 
     def test_overlapping_retry_cannot_remove_newer_host_cooldown(self) -> None:
