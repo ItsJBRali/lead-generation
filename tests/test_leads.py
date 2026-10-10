@@ -1750,9 +1750,9 @@ class LeadSearchTest(unittest.TestCase):
                 "primary_records": [],
                 "secondary_error": None,
                 "secondary_records": [],
-                "failed": [],
-                "no_applications": ["Test Council"],
-                "completion": "Completed",
+                "failed": ["Test Council"],
+                "no_applications": [],
+                "completion": "Partial",
             },
             {
                 "name": "primary_failure_secondary_success_records",
@@ -1760,9 +1760,9 @@ class LeadSearchTest(unittest.TestCase):
                 "primary_records": [],
                 "secondary_error": None,
                 "secondary_records": ["SECONDARY/1"],
-                "failed": [],
+                "failed": ["Test Council"],
                 "no_applications": [],
-                "completion": "Completed",
+                "completion": "Partial",
             },
             {
                 "name": "primary_failure_secondary_failure",
@@ -1987,19 +1987,20 @@ class LeadSearchTest(unittest.TestCase):
             date_received="2026-07-22",
             raw={"location": {"type": "Point", "coordinates": [0.5, 0.5]}},
         )
-        total_references: set[str] = set()
-        reserved_references: set[str] = set()
+        total_references: set[tuple[str, str]] = set()
+        reserved_references: set[tuple[str, str]] = set()
         emitted: list[PlanningApplication] = []
         captured_counts: list[int] = []
 
-        def reserve_reference(reference: str) -> bool:
-            if reference in reserved_references:
+        def reserve_reference(authority: str, reference: str) -> bool:
+            key = (authority.casefold(), reference)
+            if key in reserved_references:
                 return False
-            reserved_references.add(reference)
+            reserved_references.add(key)
             return True
 
-        def release_reference(reference: str) -> None:
-            reserved_references.discard(reference)
+        def release_reference(authority: str, reference: str) -> None:
+            reserved_references.discard((authority.casefold(), reference))
 
         def prepare_output(application, reference):
             def commit_output():
@@ -2042,7 +2043,7 @@ class LeadSearchTest(unittest.TestCase):
         self.assertEqual(state.primary_date_valid_count, 1)
         self.assertEqual(state.secondary_date_valid_count, 1)
         self.assertEqual(state.date_valid_references, {"ABC/1"})
-        self.assertEqual(total_references, {"ABC/1"})
+        self.assertEqual(total_references, {(target.authority.casefold(), "ABC/1")})
         self.assertEqual(captured_counts, [1])
         self.assertEqual([application.url for application in emitted], [primary.url])
 
@@ -2698,6 +2699,171 @@ class LeadSearchTest(unittest.TestCase):
             self.assertEqual(rows[0]["Reference"], "24/01234/FUL")
             self.assertEqual(rows[0]["application link"], "https://planning.example.gov.uk/detail/ABC123")
 
+    def test_same_reference_from_two_councils_keeps_both_leads(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_geojson, catalogue = write_search_fixture(root, ["Council A", "Council B"])
+            config = LeadSearchConfig(
+                geojson_path=user_geojson,
+                output_root=root,
+                start_date=date(2026, 7, 1),
+                end_date=date(2026, 7, 31),
+                keywords=["extension"],
+                catalogue_path=catalogue,
+                worker_count=1,
+                download_application_files=False,
+            )
+
+            def discover(target, *args, **kwargs):
+                return [PlanningApplication(
+                    authority=target.authority,
+                    uid=target.authority,
+                    url=target.base_url + "/detail",
+                    reference="26/00123/FUL",
+                    address=target.authority + " High Street",
+                    description="New extension",
+                    date_received="2026-07-15",
+                )]
+
+            with patch("lead_generator.planning.leads.discover_portal_applications", side_effect=discover):
+                result = run_lead_search(config)
+            with result.csv_path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertEqual(result.total_applications, 2)
+        self.assertEqual(result.leads_found, 2)
+        self.assertEqual({row["council"] for row in rows}, {"Council A", "Council B"})
+
+    def test_enrichment_batches_atomic_csv_checkpoints(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            area, catalogue = write_search_fixture(root, ["Council"])
+            config = LeadSearchConfig(
+                geojson_path=area,
+                output_root=root,
+                start_date=date(2026, 7, 1),
+                end_date=date(2026, 7, 31),
+                keywords=[],
+                catalogue_path=catalogue,
+                worker_count=1,
+                download_application_files=True,
+            )
+            applications = [PlanningApplication(
+                authority="Council", uid=str(index), url=f"https://example.test/{index}",
+                reference=f"26/{index}", description="Extension", date_received="2026-07-15",
+            ) for index in range(3)]
+            with (
+                patch("lead_generator.planning.leads.discover_portal_applications", return_value=applications),
+                patch("lead_generator.planning.leads.discover_application_documents", return_value=DocumentDiscoveryResult()),
+                patch("lead_generator.planning.leads.enrich_application_folder", return_value=ContactEnrichment()),
+                patch("lead_generator.planning.leads.write_csv", wraps=leads_module.write_csv) as write,
+            ):
+                result = run_lead_search(config)
+            with result.csv_path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(write.call_count, 1)
+
+    def test_pipeline_enriches_first_council_while_second_search_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            area, catalogue = write_search_fixture(root, ["Council A", "Council B"])
+            config = LeadSearchConfig(
+                geojson_path=area, output_root=root,
+                start_date=date(2026, 7, 1), end_date=date(2026, 7, 31),
+                keywords=[], catalogue_path=catalogue, worker_count=1,
+                download_application_files=True, pipelined=True,
+            )
+            first_enriched = threading.Event()
+            overlap_seen = []
+
+            def primary(target, *args, **kwargs):
+                if target.authority == "Council B":
+                    overlap_seen.append(first_enriched.wait(1.0))
+                return [PlanningApplication(
+                    authority=target.authority, uid=target.authority,
+                    url=target.base_url + "/detail",
+                    reference="26/00123/FUL",
+                    description="Extension", date_received="2026-07-15",
+                )]
+
+            def enrich(*args, **kwargs):
+                first_enriched.set()
+                return ContactEnrichment()
+
+            with (
+                patch("lead_generator.planning.leads.discover_portal_applications", side_effect=primary),
+                patch("lead_generator.planning.leads.discover_application_documents", return_value=DocumentDiscoveryResult()),
+                patch("lead_generator.planning.leads.enrich_application_folder", side_effect=enrich),
+            ):
+                result = run_lead_search(config)
+
+        self.assertEqual(overlap_seen, [True])
+        self.assertEqual(result.leads_found, 2)
+        self.assertEqual(result.completion, "Completed")
+
+    def test_pipeline_keeps_primary_record_when_planit_repeats_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            area, catalogue = write_search_fixture(root, ["Council"])
+            config = LeadSearchConfig(
+                geojson_path=area, output_root=root,
+                start_date=date(2026, 7, 1), end_date=date(2026, 7, 31),
+                keywords=[], catalogue_path=catalogue, worker_count=1,
+                download_application_files=False, pipelined=True,
+            )
+            primary = PlanningApplication(
+                authority="Council", uid="A", url="https://council.test/primary",
+                reference="26/001", date_received="2026-07-15",
+            )
+            secondary = PlanningApplication(
+                authority="Council", uid="B", url="https://planit.test/secondary",
+                reference="26/001", date_received="2026-07-15",
+            )
+            with (
+                patch("lead_generator.planning.leads.discover_portal_applications", return_value=[primary]),
+                patch("lead_generator.planning.leads.discover_planit_reconciliation_applications", return_value=[secondary]),
+            ):
+                result = run_lead_search(config)
+            with result.csv_path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertEqual(result.leads_found, 1)
+        self.assertEqual(rows[0]["application link"], primary.url)
+
+    def test_pipeline_cancellation_after_enrichment_preserves_csv(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            area, catalogue = write_search_fixture(root, ["Council"])
+            config = LeadSearchConfig(
+                geojson_path=area, output_root=root,
+                start_date=date(2026, 7, 1), end_date=date(2026, 7, 31),
+                keywords=[], catalogue_path=catalogue, worker_count=1,
+                download_application_files=True, pipelined=True,
+            )
+            cancelled = threading.Event()
+            application = PlanningApplication(
+                authority="Council", uid="A", url="https://council.test/primary",
+                reference="26/001", date_received="2026-07-15",
+            )
+
+            def enrich(*args, **kwargs):
+                cancelled.set()
+                return ContactEnrichment()
+
+            with (
+                patch("lead_generator.planning.leads.discover_portal_applications", return_value=[application]),
+                patch("lead_generator.planning.leads.discover_application_documents", return_value=DocumentDiscoveryResult()),
+                patch("lead_generator.planning.leads.enrich_application_folder", side_effect=enrich),
+            ):
+                result = run_lead_search(config, should_cancel=cancelled.is_set)
+            with result.csv_path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertEqual(result.completion, "Cancelled")
+        self.assertEqual(len(rows), 1)
+
     def test_run_lead_search_updates_output_csv_when_cancelled(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2896,12 +3062,12 @@ class LeadSearchTest(unittest.TestCase):
             ), patch("lead_generator.planning.leads.PLATFORM_BLOCKED_COOLDOWN_SECONDS", 0):
                 result = run_lead_search(config)
 
-            self.assertEqual(result.failed_councils, [])
+            self.assertEqual(result.failed_councils, ["Responsive Council"])
             self.assertEqual(
                 result.no_application_councils,
-                ["Responsive Council"],
+                [],
             )
-            self.assertEqual(result.completion, "Completed")
+            self.assertEqual(result.completion, "Partial")
             with result.failure_csv_path.open(newline="", encoding="utf-8") as handle:
                 failures = list(csv.DictReader(handle))
             self.assertEqual(len(failures), 1)
@@ -7502,3 +7668,4 @@ class LeadSearchTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

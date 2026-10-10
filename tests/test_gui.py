@@ -78,6 +78,7 @@ def test_read_config_accepts_empty_keyword_input(tmp_path) -> None:
         end_selector=SimpleNamespace(selected_date=lambda: date(2026, 6, 30)),
         keyword_box=SimpleNamespace(get=lambda *_args: "\n"),
         download_files_var=SimpleNamespace(get=lambda: True),
+        pipeline_var=SimpleNamespace(get=lambda: True),
         worker_count_menu=SimpleNamespace(get=lambda: "4"),
     )
 
@@ -88,6 +89,7 @@ def test_read_config_accepts_empty_keyword_input(tmp_path) -> None:
         config = LeadGeneratorApp._read_config(app)
 
     assert config.keywords == []
+    assert config.pipelined is True
 
 def test_enrichment_progress_shows_application_count() -> None:
     label = FakeLabel()
@@ -189,3 +191,4 @@ def test_enrichment_progress_explains_when_not_requested() -> None:
     )
 
     assert label.text == "PDF enrichment not requested"
+

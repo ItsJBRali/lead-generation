@@ -65,6 +65,7 @@ class LeadGeneratorApp(ctk.CTk):
         self.cancel_requested = False
         self._reset_run_progress_counts()
         self.download_files_var = BooleanVar(value=True)
+        self.pipeline_var = BooleanVar(value=True)
         self.worker_count_values = [str(value) for value in range(1, MAX_SEARCH_WORKER_COUNT + 1)]
 
         self._build_layout()
@@ -132,6 +133,14 @@ class LeadGeneratorApp(ctk.CTk):
             text_color="#e5e7eb",
         )
         self.download_files_checkbox.grid(row=1, column=0, padx=16, pady=(0, 16), sticky="w")
+        ctk.CTkCheckBox(
+            controls,
+            text="Process results as they arrive",
+            variable=self.pipeline_var,
+            onvalue=True,
+            offvalue=False,
+            text_color="#e5e7eb",
+        ).grid(row=2, column=0, columnspan=2, padx=16, pady=(0, 16), sticky="w")
         worker_count_row = ctk.CTkFrame(controls, fg_color="transparent")
         worker_count_row.grid(row=1, column=1, padx=16, pady=(0, 16), sticky="e")
         ctk.CTkLabel(
@@ -311,6 +320,7 @@ class LeadGeneratorApp(ctk.CTk):
             end_date=end_date,
             keywords=keywords,
             download_application_files=bool(self.download_files_var.get()),
+            pipelined=bool(self.pipeline_var.get()),
             worker_count=int(self.worker_count_menu.get()),
             history_csv_path=history_csv_path(),
         )
@@ -363,7 +373,13 @@ class LeadGeneratorApp(ctk.CTk):
                 self._append_log(f"Output folder: {payload.output_dir}")
                 if payload.history_csv_path:
                     self._append_log(f"Search history: {payload.history_csv_path}")
-                messagebox.showinfo("Search complete", f"Saved {payload.leads_found} leads.")
+                if payload.completion == "Completed":
+                    messagebox.showinfo("Search complete", f"Saved {payload.leads_found} leads.")
+                else:
+                    messagebox.showwarning(
+                        f"Search {payload.completion.lower()}",
+                        f"Saved {payload.leads_found} leads. Check search_failures.csv for councils with incomplete results.",
+                    )
             elif kind == "error":
                 self._finish_run()
                 messagebox.showerror("Search failed", str(payload))
@@ -466,3 +482,4 @@ def history_csv_path() -> Path:
 
 if __name__ == "__main__":
     main()
+
