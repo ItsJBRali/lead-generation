@@ -78,6 +78,8 @@ The Windows GUI is available as `dist/PlanningLeadGenerator.exe`. It lets a user
 - process council searches, reconciliation, document downloads, and PDF
   enrichment as results arrive; the checkbox can be cleared to use staged
   processing
+- resume a saved search from its run folder, restoring its dates, keywords,
+  boundary and download settings
 - edit the default lead keywords
 - run the search with council progress, captured-lead count, PDF-enrichment
   progress, and a live log
@@ -100,6 +102,33 @@ so past searches remain available across output folders.
 If a council portal search fails but PlanIt returns a response, the run is
 labelled `Partial` and the council appears in `search_failures.csv`. An empty
 PlanIt response does not establish that the council itself had no applications.
+
+Each search saves into a separate `<date>/<time>-<run-id>` folder. Earlier runs
+are preserved. Received and validated dates are equivalent for matching: a valid
+received date takes priority, with a valid validated date as fallback. Failed
+application detail requests are retried once; unresolved essential details are
+reported as partial coverage.
+
+`run.sqlite3` checkpoints source results, saved leads, documents and enrichment.
+Use **Resume saved search** to continue an interrupted run. Resume validates the
+boundary, councils and settings before rewriting exports. Missing or changed
+document files and failed extraction work are retried. The `.planning-cache`
+folder beside date folders caches PDF text by content hash and extraction
+version. Public document downloads with HTTP validators use conditional requests;
+cached bytes are reused only when the server replies Not Modified.
+
+`search_metrics.csv` records per-council stage durations, requests, retries,
+downloads, OCR pages and cache hits. Measurements accumulate when a run resumes.
+
+Live completeness checks can be repeated without downloading application files:
+
+```powershell
+python -m lead_generator.planning.completeness_audit --councils "New Forest (Park)" Wiltshire --end 2026-10-10 --output audit.json
+```
+
+The audit compares small, large, partitioned and historical windows and records
+response fingerprints and advertised totals. Insufficient evidence is reported
+as Unknown. See `docs/live-completeness-audit-2026-10-11.md` for observed limits.
 
 To run from source:
 

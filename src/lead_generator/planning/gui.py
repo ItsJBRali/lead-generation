@@ -3,11 +3,13 @@ from __future__ import annotations
 import queue
 import sys
 import threading
+from dataclasses import replace
 from datetime import date, timedelta
 from pathlib import Path
 from tkinter import BooleanVar, filedialog, messagebox
 
 import customtkinter as ctk
+from lead_generator.planning.run_storage import read_run_settings
 
 from lead_generator.planning.leads import DEFAULT_KEYWORDS, DEFAULT_SEARCH_WORKER_COUNT, MAX_SEARCH_WORKER_COUNT, LeadSearchConfig, parse_keywords, run_lead_search
 
@@ -140,7 +142,9 @@ class LeadGeneratorApp(ctk.CTk):
             onvalue=True,
             offvalue=False,
             text_color="#e5e7eb",
-        ).grid(row=2, column=0, columnspan=2, padx=16, pady=(0, 16), sticky="w")
+        ).grid(row=2, column=0, padx=16, pady=(0, 16), sticky="w")
+        self.resume_button = ctk.CTkButton(controls, text="Resume saved search", command=self._resume_run)
+        self.resume_button.grid(row=2, column=1, padx=16, pady=(0, 16), sticky="e")
         worker_count_row = ctk.CTkFrame(controls, fg_color="transparent")
         worker_count_row.grid(row=1, column=1, padx=16, pady=(0, 16), sticky="e")
         ctk.CTkLabel(
@@ -278,15 +282,38 @@ class LeadGeneratorApp(ctk.CTk):
         entry.delete(0, "end")
         entry.insert(0, value)
 
-    def _start_run(self) -> None:
+    def _resume_run(self) -> None:
+        selected = filedialog.askdirectory(title="Choose the saved search folder")
+        if not selected:
+            return
+        try:
+            saved = read_run_settings(Path(selected))
+            self._set_entry(self.geojson_entry, saved["geojson_path"])
+            self._set_entry(self.output_entry, saved["output_root"])
+            for selector, value in ((self.start_selector, saved["start"]), (self.end_selector, saved["end"])):
+                selected_date = date.fromisoformat(value)
+                selector.year.set(str(selected_date.year))
+                selector.month.set(f"{selected_date.month:02d}")
+                selector.day.set(f"{selected_date.day:02d}")
+            self.keyword_box.delete("1.0", "end")
+            self.keyword_box.insert("1.0", "\n".join(saved["keywords"]))
+            self.download_files_var.set(saved["downloads"])
+            self._start_run(resume_from=Path(selected))
+        except ValueError as exc:
+            messagebox.showerror("Could not resume search", str(exc))
+
+    def _start_run(self, resume_from: Path | None = None) -> None:
         try:
             config = self._read_config()
+            if resume_from:
+                config = replace(config, resume_from=resume_from)
         except ValueError as exc:
             messagebox.showerror("Check inputs", str(exc))
             return
 
         self.cancel_requested = False
         self.run_button.configure(state="disabled")
+        self.resume_button.configure(state="disabled")
         self.cancel_button.configure(state="normal")
         self.progress_bar.set(0)
         self._reset_run_progress_counts()
@@ -370,6 +397,7 @@ class LeadGeneratorApp(ctk.CTk):
                 self._set_enrichment_progress(int(completed), int(total), requested=True)
             elif kind == "done":
                 self._finish_run()
+                self.resume_button.configure(state="normal")
                 self._append_log(f"Output folder: {payload.output_dir}")
                 if payload.history_csv_path:
                     self._append_log(f"Search history: {payload.history_csv_path}")
@@ -382,6 +410,7 @@ class LeadGeneratorApp(ctk.CTk):
                     )
             elif kind == "error":
                 self._finish_run()
+                self.resume_button.configure(state="normal")
                 messagebox.showerror("Search failed", str(payload))
                 self._append_log(f"Error: {payload}")
         self.after(100, self._poll_messages)

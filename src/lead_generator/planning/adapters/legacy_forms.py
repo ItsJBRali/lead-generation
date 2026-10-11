@@ -18,7 +18,7 @@ from lead_generator.planning.http import (
     browser_fallback_recommended,
 )
 from lead_generator.planning.models import DiscoveryResult, PlanningApplication
-from lead_generator.planning.parsing import clean_text, extract_postcode, normalize_label, parse_council_date
+from lead_generator.planning.parsing import clean_text, extract_postcode, normalize_label, parse_council_date, usable_application_date
 
 
 @dataclass(frozen=True, slots=True)
@@ -1505,13 +1505,8 @@ def filter_by_date(
         return applications
     filtered: list[PlanningApplication] = []
     for application in applications:
-        value = application.date_received or application.date_validated
-        if not value:
-            filtered.append(application)
-            continue
-        try:
-            parsed = date.fromisoformat(value)
-        except ValueError:
+        parsed = usable_application_date(application.date_received, application.date_validated)
+        if parsed is None:
             filtered.append(application)
             continue
         if start_date and parsed < start_date:
@@ -1520,3 +1515,4 @@ def filter_by_date(
             continue
         filtered.append(application)
     return filtered
+

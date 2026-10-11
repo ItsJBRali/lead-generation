@@ -1,12 +1,32 @@
 from datetime import date
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from lead_generator.planning.gui import LeadGeneratorApp, previous_week_date_range
 
 
 def test_previous_week_date_range_from_midweek() -> None:
     assert previous_week_date_range(date(2026, 7, 15)) == (date(2026, 7, 6), date(2026, 7, 12))
+
+
+def test_resume_restores_saved_settings_before_starting(tmp_path) -> None:
+    app = SimpleNamespace(
+        geojson_entry=Mock(), output_entry=Mock(),
+        start_selector=SimpleNamespace(year=Mock(), month=Mock(), day=Mock()),
+        end_selector=SimpleNamespace(year=Mock(), month=Mock(), day=Mock()),
+        keyword_box=Mock(), download_files_var=Mock(),
+        _set_entry=Mock(), _start_run=Mock(),
+    )
+    saved = {'geojson_path': str(tmp_path / 'area.geojson'), 'output_root': str(tmp_path),
+             'start': '2026-07-01', 'end': '2026-07-31', 'keywords': ['gates'], 'downloads': True}
+    with patch('lead_generator.planning.gui.filedialog.askdirectory', return_value=str(tmp_path)), patch('lead_generator.planning.gui.read_run_settings', return_value=saved):
+        LeadGeneratorApp._resume_run(app)
+    app._set_entry.assert_any_call(app.geojson_entry, saved['geojson_path'])
+    app.start_selector.day.set.assert_called_once_with('01')
+    app.end_selector.day.set.assert_called_once_with('31')
+    app.keyword_box.insert.assert_called_once_with('1.0', 'gates')
+    app.download_files_var.set.assert_called_once_with(True)
+    app._start_run.assert_called_once_with(resume_from=tmp_path)
 
 
 def test_previous_week_date_range_from_monday() -> None:

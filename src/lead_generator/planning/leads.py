@@ -19,6 +19,7 @@ from pathlib import Path
 from queue import Empty, Queue
 from time import monotonic, sleep
 from typing import Callable, Iterable
+from uuid import uuid4
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlsplit, urlunsplit
 from urllib.request import HTTPSHandler, HTTPCookieProcessor, Request, build_opener, urlopen
@@ -76,7 +77,10 @@ from lead_generator.planning.http import (
     CouncilFetchError,
     monitor_council_requests,
 )
-from lead_generator.planning.parsing import clean_text
+from lead_generator.planning.parsing import clean_text, usable_application_date
+from lead_generator.planning.run_storage import RunStorage, application_from_dict
+from lead_generator.planning.metrics import RunMetrics, metric_event
+from lead_generator.planning.document_cache import document_cache_directory, revalidation, store_document
 from lead_generator.planning.scheduler import (
     PlatformAwareScheduler,
     ScheduledTask,
@@ -341,6 +345,7 @@ class CouncilDiscoveryState:
     secondary_date_valid_count: int = 0
     undated_count: int = 0
     date_valid_references: set[str] = field(default_factory=set)
+    detail_errors: dict[str, str] = field(default_factory=dict)
 
 
 def application_reference_key(application: PlanningApplication) -> str:
@@ -356,7 +361,7 @@ def application_is_in_date_range(
     start_date: date,
     end_date: date,
 ) -> bool:
-    received = _parse_iso_date(application.date_received)
+    received = usable_application_date(application.date_received, application.date_validated)
     return received is not None and start_date <= received <= end_date
 
 
@@ -406,10 +411,16 @@ def _process_discovered_applications(
         if not reference:
             excluded_without_usable_reference += 1
             continue
+        detail_error = (application.raw or {}).get("detail_fetch_error")
+        if detail_error and (usable_application_date(application.date_received, application.date_validated) is None or (keywords and not application.description)):
+            update_state(lambda: state.detail_errors.update({reference: str(detail_error)}))
         if not application_is_in_date_range(application, start_date, end_date):
-            if _parse_iso_date(application.date_received) is None:
+            if usable_application_date(application.date_received, application.date_validated) is None:
                 excluded_without_usable_date += 1
             continue
+
+        if not detail_error and (not keywords or application.description):
+            update_state(lambda: state.detail_errors.pop(reference, None))
 
         if reference not in source_date_valid_references:
             source_date_valid_references.add(reference)
@@ -563,6 +574,8 @@ class LeadSearchConfig:
     pipelined: bool = False
     worker_count: int = DEFAULT_SEARCH_WORKER_COUNT
     history_csv_path: Path | None = None
+    resume_from: Path | None = None
+    cache_root: Path | None = None
 
 
 @dataclass(slots=True)
@@ -699,6 +712,7 @@ def discover_portal_applications_with_deadline(
     heartbeat_seconds: float = COUNCIL_SEARCH_HEARTBEAT_SECONDS,
     log: LogCallback | None = None,
     should_cancel: CancelCallback | None = None,
+    metrics: RunMetrics | None = None,
 ) -> list[PlanningApplication]:
     """Run one council search without allowing a stuck adapter to block the queue."""
 
@@ -718,7 +732,7 @@ def discover_portal_applications_with_deadline(
 
     def discover() -> None:
         try:
-            with monitor_council_requests(
+            with (metrics.bind(target.authority, "primary") if metrics else nullcontext()), monitor_council_requests(
                 record_activity,
                 should_cancel=attempt_cancellation_requested,
             ):
@@ -795,6 +809,22 @@ def discover_portal_applications_with_deadline(
 
 
 def run_lead_search(
+    config: LeadSearchConfig, *, log: LogCallback | None = None,
+    progress: ProgressCallback | None = None, captured: CapturedCallback | None = None,
+    document_progress: DocumentProgressCallback | None = None,
+    enrichment_progress: ProgressCallback | None = None, should_cancel: CancelCallback | None = None,
+) -> LeadSearchResult:
+    resources = {}
+    try:
+        return _run_lead_search(config, log=log, progress=progress, captured=captured,
+                                document_progress=document_progress, enrichment_progress=enrichment_progress,
+                                should_cancel=should_cancel, _resources=resources)
+    finally:
+        if resources.get("storage"):
+            resources["storage"].close()
+
+
+def _run_lead_search(
     config: LeadSearchConfig,
     *,
     log: LogCallback | None = None,
@@ -803,13 +833,33 @@ def run_lead_search(
     document_progress: DocumentProgressCallback | None = None,
     enrichment_progress: EnrichmentProgressCallback | None = None,
     should_cancel: CancelCallback | None = None,
+    _resources: dict | None = None,
 ) -> LeadSearchResult:
     started_at = datetime.now()
     user_geojson = load_geojson(config.geojson_path)
     catalogue = load_authority_catalogue(config.catalogue_path)
     targets = select_overlapping_authorities(user_geojson, catalogue)
-    output_dir = config.output_root / date.today().isoformat()
+    if not targets:
+        raise ValueError("No planning authorities overlap the supplied GeoJSON boundary.")
+    output_dir = config.resume_from or (config.output_root / date.today().isoformat() / f"{started_at:%H%M%S-%f}-{uuid4().hex[:8]}")
+    if config.resume_from and not output_dir.is_dir():
+        raise ValueError("Choose an existing saved search folder to resume.")
     output_dir.mkdir(parents=True, exist_ok=True)
+    settings = {
+        "schema": 1, "boundary": sha256(config.geojson_path.read_bytes()).hexdigest(),
+        "start": config.start_date.isoformat(), "end": config.end_date.isoformat(),
+        "keywords": sorted(config.keywords), "downloads": config.download_application_files,
+        "catalogue": sha256(councils_to_geojson(targets).encode()).hexdigest(),
+        "councils": [(t.authority, t.base_url, t.listing_url, t.scraper_type) for t in targets],
+    }
+    # JSON normalisation keeps tuple/list representations identical on resume.
+    settings = json.loads(json.dumps(settings))
+    storage = RunStorage(output_dir / "run.sqlite3", settings, resume=bool(config.resume_from))
+    if _resources is not None:
+        _resources["storage"] = storage
+    storage.set("ui", "run", {"geojson_path": str(config.geojson_path.resolve()), "output_root": str(config.output_root.resolve())})
+    metrics = RunMetrics(storage.items("metrics"), persist=lambda council, stage, row: storage.set("metrics", json.dumps([council, stage]), row) if not storage.closed else None)
+    cache_root = config.cache_root or config.output_root / ".planning-cache"
     csv_path = output_dir / "applications.csv"
     failure_csv_path = output_dir / "search_failures.csv"
     selected_path = output_dir / "selected_councils.geojson"
@@ -846,6 +896,7 @@ def run_lead_search(
     total_application_references: set[tuple[str, str]] = set()
     captured_document_references: set[tuple[str, str]] = set()
     completed_document_references: set[tuple[str, str]] = set()
+    enriched_keys: set[tuple[str, str]] = set()
     deferred_tasks: list[ScheduledTask[CouncilTarget]] = []
     deferred_document_jobs: list[DocumentDownloadJob] = []
     scheduler = PlatformAwareScheduler[CouncilTarget](
@@ -860,6 +911,7 @@ def run_lead_search(
     reconciliation_queue: Queue[CouncilTarget | None] = Queue(maxsize=max(len(targets), 1))
     pipeline_document_queue: Queue[DocumentDownloadJob | None] = Queue(maxsize=256)
     pipeline_enrichment_queue: Queue[EnrichmentJob | None] = Queue(maxsize=256)
+    pipeline_enrichment_queued: set[tuple[str, str]] = set()
     enrichment_by_key: dict[tuple[str, str], EnrichmentJob] = {}
     pipeline_host_locks: dict[str, threading.Lock] = {}
     pipeline_host_locks_guard = threading.Lock()
@@ -903,8 +955,12 @@ def run_lead_search(
         row: dict[str, str],
         enrichment_job: EnrichmentJob | None = None,
         document_job: DocumentDownloadJob | None = None,
+        application: PlanningApplication | None = None,
     ) -> int:
         with lock:
+            if application is not None:
+                storage.set("leads", json.dumps(council_application_key(row["council"], row["Reference"])),
+                            {"row": row, "application": application.to_dict()})
             append_csv_row(csv_path, APPLICATION_CSV_FIELDS, row)
             rows.append(row)
             if document_job:
@@ -929,7 +985,8 @@ def run_lead_search(
             "address": application.address or "",
             "application link": application_link(application),
             "proposal": application.description or "",
-            "date received": application.date_received or application.date_validated or "",
+            "date received": (usable_application_date(application.date_received, application.date_validated).isoformat()
+                              if usable_application_date(application.date_received, application.date_validated) else ""),
             "council": target.authority,
             **empty_enrichment_row(requested=config.download_application_files),
         }
@@ -954,7 +1011,7 @@ def run_lead_search(
             )
 
         def commit_output() -> int:
-            return save_row(row, enrichment_job, document_job)
+            return save_row(row, enrichment_job, document_job, application)
 
         return commit_output
 
@@ -982,6 +1039,35 @@ def run_lead_search(
         applications: list[PlanningApplication],
         source: str,
     ) -> int:
+        nonlocal documents_completed
+        if source == "primary" and config.resume_from:
+            for application in applications:
+                reference = application_reference_key(application)
+                identity = council_application_key(target.authority, reference)
+                if identity not in saved_references or not application_matches(application, config.start_date, config.end_date, config.keywords) or not application_matches_search_area(application, user_geojson):
+                    continue
+                key = json.dumps(identity)
+                previous = storage.get("leads", key)
+                if previous and previous["application"].get("raw", {}).get("source") == "planit_reconciliation":
+                    with lock:
+                        row = next(row for row in rows if council_application_key(row["council"], row["Reference"]) == identity)
+                        row.update({"address": application.address or "", "application link": application_link(application),
+                                    "proposal": application.description or "", "date received": usable_application_date(application.date_received, application.date_validated).isoformat()})
+                        row.update(empty_enrichment_row(requested=config.download_application_files))
+                        storage.set("leads", key, {"row": row, "application": application.to_dict()})
+                        storage.set("enrichment", key, False)
+                        enriched_keys.discard(identity)
+                        if identity in completed_document_references:
+                            completed_document_references.remove(identity)
+                            documents_completed -= 1
+                        for job in document_jobs:
+                            if council_application_key(job.council, job.reference) == identity:
+                                job.application = application
+                                job.rediscovery_required = True
+                                checkpoint_document_job(job)
+                        for job in enrichment_jobs:
+                            if council_application_key(job.row["council"], job.reference) == identity:
+                                job.applicant_name, job.agent_name, job.site_address = application.applicant_name, application.agent_name, application.address
         return _process_discovered_applications(
             target,
             applications,
@@ -1029,10 +1115,39 @@ def run_lead_search(
             documents_completed += 1
             current = documents_completed
         _document_progress(document_progress, current, total)
+        checkpoint_document_job(job, complete=not (job.rediscovery_required or job.pending_documents))
         if config.pipelined:
             enrichment_job = enrichment_by_key.get(key)
             if enrichment_job is not None:
-                pipeline_enrichment_queue.put(enrichment_job)
+                enqueue_enrichment_once(enrichment_job)
+
+    def enqueue_enrichment_once(job: EnrichmentJob):
+        key = council_application_key(job.row["council"], job.reference)
+        with lock:
+            if key in pipeline_enrichment_queued:
+                return
+            pipeline_enrichment_queued.add(key)
+        pipeline_enrichment_queue.put(job)
+
+    def checkpoint_document_job(job: DocumentDownloadJob, *, complete: bool = False):
+        storage.set("documents", json.dumps(council_application_key(job.council, job.reference)), {
+            "complete": complete, "downloaded_count": job.downloaded_count,
+            "rediscovery_required": job.rediscovery_required,
+            "pending_documents": [d.to_dict() for d in job.pending_documents],
+            "processed_document_urls": sorted(job.processed_document_urls),
+            "successful_sources": sorted(job.successful_document_sources),
+            "failed_sources": [{"source_url": f.source_url, "reason": f.reason} for f in job.document_source_failures],
+            "files": {p.name: sha256(p.read_bytes()).hexdigest() for p in job.folder.iterdir() if p.is_file()},
+        })
+
+    def checkpoint_enrichment(job: EnrichmentJob, *, complete: bool = True):
+        key = json.dumps(council_application_key(job.row["council"], job.reference))
+        record = storage.get("leads", key)
+        record["row"] = job.row
+        storage.set("leads", key, record)
+        storage.set("enrichment", key, complete)
+        if complete:
+            enriched_keys.add(council_application_key(job.row["council"], job.reference))
 
     def save_failure(
         target: CouncilTarget,
@@ -1093,8 +1208,9 @@ def run_lead_search(
             applications: list[PlanningApplication] = []
             attempt_error: Exception | None = None
             try:
-                with pipeline_host_slot(task.host):
-                    applications = discover_portal_applications_with_deadline(
+                with pipeline_host_slot(task.host), metrics.stage(target.authority, "primary"):
+                    cached = storage.get("primary", target.authority)
+                    applications = [application_from_dict(a) for a in cached] if cached is not None else discover_portal_applications_with_deadline(
                         target,
                         config.start_date,
                         config.end_date,
@@ -1103,12 +1219,15 @@ def run_lead_search(
                         heartbeat_seconds=COUNCIL_SEARCH_HEARTBEAT_SECONDS,
                         log=log,
                         should_cancel=cancellation_requested,
+                        metrics=metrics,
                     )
                     process_discovered_applications(target, applications, source="primary")
                 with lock:
                     state = council_states[target.authority]
                     state.primary_succeeded = True
                     state.primary_error = None
+                if not state.detail_errors and not cancellation_requested():
+                    storage.set("primary", target.authority, [a.to_dict() for a in applications])
             except Exception as exc:  # pragma: no cover - live-site resilience
                 attempt_error = exc
                 with lock:
@@ -1230,15 +1349,18 @@ def run_lead_search(
                 )
                 job.pending_documents = list(result.transient_documents)
                 job.downloaded_count += result.downloaded_count
+                metric_event("downloaded_documents", result.downloaded_count)
                 if job.downloaded_count:
                     add_captured_document_application(job.council, job.reference)
                 if cancellation_requested():
+                    checkpoint_document_job(job)
                     return
 
             needs_retry = bool(job.pending_documents) or job.rediscovery_required
             if needs_retry and not final_attempt:
                 with lock:
                     deferred_document_jobs.append(job)
+                checkpoint_document_job(job)
                 _log(
                     log,
                     f"{job.reference}: document discovery deferred for final retry",
@@ -1256,11 +1378,13 @@ def run_lead_search(
                     f"{job.reference}: partial document capture; one or more sources remain unavailable",
                 )
         except DocumentDownloadCancelledError:
+            checkpoint_document_job(job)
             return
         except Exception as exc:  # pragma: no cover - live document portals vary
             if not final_attempt and not cancellation_requested():
                 with lock:
                     deferred_document_jobs.append(job)
+                checkpoint_document_job(job)
                 _log(
                     log,
                     f"{job.reference}: document discovery deferred until the end of the "
@@ -1295,11 +1419,12 @@ def run_lead_search(
                 try:
                     action = "retrying" if final_attempt else "downloading"
                     _log(log, f"{name}: {action} documents for {job.reference}")
-                    process_document_job(
-                        job,
-                        final_attempt=final_attempt,
-                        total=total,
-                    )
+                    with metrics.stage(job.council, "documents"), document_cache_directory(cache_root):
+                        process_document_job(
+                            job,
+                            final_attempt=final_attempt,
+                            total=total,
+                        )
                 finally:
                     pending.task_done()
 
@@ -1350,12 +1475,14 @@ def run_lead_search(
         _log(log, f"Reconciliation {index} of {len(targets)}: checking {target.authority}")
         state = council_states[target.authority]
         try:
-            secondary = discover_planit_reconciliation_applications(
-                target,
-                config.start_date,
-                config.end_date,
-                should_cancel=cancellation_requested,
-            )
+            cached = storage.get("reconciliation", target.authority)
+            with metrics.stage(target.authority, "reconciliation"):
+                secondary = [application_from_dict(a) for a in cached] if cached is not None else discover_planit_reconciliation_applications(
+                    target,
+                    config.start_date,
+                    config.end_date,
+                    should_cancel=cancellation_requested,
+                )
             before = len(state.date_valid_references)
             secondary_valid = process_discovered_applications(
                 target, secondary, source="PlanIt",
@@ -1366,6 +1493,7 @@ def run_lead_search(
             added = len(state.date_valid_references) - before
             state.reconciliation_succeeded = True
             state.reconciliation_error = None
+            storage.set("reconciliation", target.authority, [a.to_dict() for a in secondary])
             _log(
                 log,
                 f"{target.authority}: reconciliation primary={state.primary_date_valid_count} "
@@ -1383,11 +1511,16 @@ def run_lead_search(
                 return
         if config.pipelined and config.download_application_files:
             with lock:
-                council_jobs = [job for job in document_jobs if job.council == target.authority]
+                council_jobs = [job for job in document_jobs if job.council == target.authority
+                                and council_application_key(job.council, job.reference) not in completed_document_references]
             for job in council_jobs:
                 if cancellation_requested():
                     break
                 pipeline_document_queue.put(job)
+            for job in enrichment_jobs:
+                identity = council_application_key(job.row["council"], job.reference)
+                if job.row["council"] == target.authority and identity in completed_document_references and identity not in enriched_keys:
+                    enqueue_enrichment_once(job)
 
     def reconciliation_worker() -> None:
         index = 0
@@ -1409,7 +1542,7 @@ def run_lead_search(
                     return
                 if not cancellation_requested():
                     host = urlsplit(job.application.url).netloc.casefold() or job.council.casefold()
-                    with pipeline_host_slot(host):
+                    with pipeline_host_slot(host), metrics.stage(job.council, "documents"), document_cache_directory(cache_root):
                         with lock:
                             total = len(document_jobs)
                         process_document_job(job, final_attempt=False, total=total)
@@ -1428,16 +1561,19 @@ def run_lead_search(
                 if cancellation_requested():
                     continue
                 try:
-                    enrichment = enrich_application_folder(
-                        job.folder,
-                        applicant_name=job.applicant_name,
-                        agent_name=job.agent_name,
-                        site_address=job.site_address,
-                        log=lambda message, reference=job.reference: _log(log, f"{reference}: {message}"),
-                    )
+                    with metrics.stage(job.row["council"], "enrichment"):
+                        enrichment = enrich_application_folder(
+                            job.folder,
+                            applicant_name=job.applicant_name,
+                            agent_name=job.agent_name,
+                            site_address=job.site_address,
+                            log=lambda message, reference=job.reference: _log(log, f"{reference}: {message}"),
+                            cache_root=cache_root,
+                        )
                     enrichment_row = enrichment.to_csv_row()
                     with lock:
                         job.row.update(enrichment_row)
+                        checkpoint_enrichment(job, complete=not (enrichment.unreadable_documents or any(reason.startswith("read failed:") for reason in enrichment.rejected_documents.values())))
                         pipeline_enriched_count += 1
                         if pipeline_enriched_count % ENRICHMENT_CSV_CHECKPOINT_EVERY == 0:
                             write_csv(csv_path, rows)
@@ -1452,6 +1588,34 @@ def run_lead_search(
     pipeline_reconciliation_thread = None
     pipeline_document_workers: list[threading.Thread] = []
     pipeline_enrichment_thread = None
+    if config.resume_from:
+        for key, record in storage.items("leads"):
+            application = application_from_dict(record["application"])
+            row = record["row"]
+            identity = council_application_key(row["council"], row["Reference"])
+            saved_references.add(identity)
+            total_application_references.add(identity)
+            folder = create_lead_folder(output_dir, row["council"], application) if config.download_application_files else None
+            doc_job = DocumentDownloadJob(row["Reference"], row["council"], application, folder, row) if folder else None
+            enrich_job = EnrichmentJob(row["Reference"], folder, row, application.applicant_name, application.agent_name, application.address) if folder else None
+            save_row(row, enrich_job, doc_job)
+            saved_docs = storage.get("documents", key)
+            files_valid = bool(saved_docs) and all((folder / name).is_file() and sha256((folder / name).read_bytes()).hexdigest() == digest for name, digest in saved_docs["files"].items()) if folder else False
+            if doc_job and files_valid:
+                doc_job.downloaded_count = saved_docs["downloaded_count"]
+                doc_job.rediscovery_required = saved_docs["rediscovery_required"]
+                doc_job.pending_documents = [PlanningDocument(**d) for d in saved_docs["pending_documents"]]
+                doc_job.processed_document_urls.update(saved_docs["processed_document_urls"])
+                doc_job.successful_document_sources.update(saved_docs["successful_sources"])
+                doc_job.document_source_failures = [DocumentSourceFailure(**failure) for failure in saved_docs.get("failed_sources", [])]
+                if doc_job.downloaded_count:
+                    add_captured_document_application(doc_job.council, doc_job.reference)
+                if saved_docs["complete"]:
+                    completed_document_references.add(identity)
+                    documents_completed += 1
+                if storage.get("enrichment", key):
+                    enriched_keys.add(identity)
+        _captured(captured, len(rows))
     if config.pipelined:
         pipeline_reconciliation_thread = threading.Thread(target=reconciliation_worker, daemon=True)
         pipeline_reconciliation_thread.start()
@@ -1523,6 +1687,14 @@ def run_lead_search(
             partial_councils.append(state.target.authority)
             failed_councils.append(state.target.authority)
 
+        if state.detail_errors:
+            if state.target.authority not in partial_councils:
+                partial_councils.append(state.target.authority)
+            if state.target.authority not in failed_councils:
+                failed_councils.append(state.target.authority)
+            for reference, reason in state.detail_errors.items():
+                save_failure(state.target, f"Application {reference}: essential details unavailable after retry: {reason}")
+
         if state.date_valid_references:
             if state.primary_error:
                 save_failure(state.target, state.primary_error)
@@ -1541,7 +1713,7 @@ def run_lead_search(
                 state.target,
                 f"PlanIt reconciliation warning: {state.reconciliation_error}",
             )
-        if not state.primary_error:
+        if not state.primary_error and not state.detail_errors:
             no_application_councils.append(state.target.authority)
 
     if config.download_application_files:
@@ -1555,7 +1727,7 @@ def run_lead_search(
                 f"{total_document_jobs} captured applications",
             )
             run_document_phase(
-                list(document_jobs),
+                [job for job in document_jobs if council_application_key(job.council, job.reference) not in completed_document_references],
                 final_attempt=False,
                 total=total_document_jobs,
             )
@@ -1589,24 +1761,29 @@ def run_lead_search(
                 _log(log, f"Starting PDF enrichment for {total_enrichment_jobs} captured applications")
             enriched_count = 0
             for job in enrichment_jobs:
+                if council_application_key(job.row["council"], job.reference) in enriched_keys:
+                    continue
                 if should_cancel and should_cancel():
                     cancelled = True
                     _log(log, "PDF enrichment cancelled; remaining rows retain Failed enrichment values")
                     break
                 try:
                     _log(log, f"Enriching {job.reference} from downloaded PDFs")
-                    enrichment = enrich_application_folder(
-                        job.folder,
-                        applicant_name=job.applicant_name,
-                        agent_name=job.agent_name,
-                        site_address=job.site_address,
-                        log=lambda message, reference=job.reference: _log(
-                            log,
-                            f"{reference}: {message}",
-                        ),
-                    )
+                    with metrics.stage(job.row["council"], "enrichment"):
+                        enrichment = enrich_application_folder(
+                            job.folder,
+                            applicant_name=job.applicant_name,
+                            agent_name=job.agent_name,
+                            site_address=job.site_address,
+                            cache_root=cache_root,
+                            log=lambda message, reference=job.reference: _log(
+                                log,
+                                f"{reference}: {message}",
+                            ),
+                        )
                     enrichment_row = enrichment.to_csv_row()
                     job.row.update(enrichment_row)
+                    checkpoint_enrichment(job, complete=not (enrichment.unreadable_documents or any(reason.startswith("read failed:") for reason in enrichment.rejected_documents.values())))
                     populated_fields = sum(
                         value != FAILED_ENRICHMENT_VALUE for value in enrichment_row.values()
                     )
@@ -1623,6 +1800,8 @@ def run_lead_search(
             if enriched_count % ENRICHMENT_CSV_CHECKPOINT_EVERY or not enrichment_jobs:
                 write_csv(csv_path, rows)
 
+    if not config.download_application_files:
+        write_csv(csv_path, rows)
     cancellation_requested()
     if cancelled:
         completion = "Cancelled"
@@ -1656,6 +1835,9 @@ def run_lead_search(
             _log(log, f"Saved search history to {config.history_csv_path}")
         except Exception as exc:  # pragma: no cover - history should not break a completed scrape
             _log(log, f"Could not save search history: {exc}")
+    metrics.export(output_dir / "search_metrics.csv")
+    storage.set("result", "completion", completion)
+    storage.close()
     return result
 
 
@@ -1774,19 +1956,27 @@ def discover_portal_applications(
     try:
         for stub in discovery.applications:
             application = stub
-            if not (stub.raw or {}).get("detail_complete") or _parse_iso_date(stub.date_received) is None:
-                try:
-                    application = scraper.fetch_application(stub.uid, stub.url, include_documents=False)
-                except Exception as exc:
-                    stub.raw = {**(stub.raw or {}), "detail_fetch_error": str(exc)}
+            if not (stub.raw or {}).get("detail_complete") or usable_application_date(stub.date_received, stub.date_validated) is None:
+                for attempt in range(2):
+                    if should_cancel and should_cancel():
+                        raise CouncilSearchCancelledError(f"Cancelled while fetching details for {target.authority}")
+                    try:
+                        application = scraper.fetch_application(stub.uid, stub.url, include_documents=False)
+                        stub.raw.pop("detail_fetch_error", None)
+                        break
+                    except Exception as exc:
+                        if attempt == 1:
+                            stub.raw = {**(stub.raw or {}), "detail_fetch_error": str(exc)}
+                        else:
+                            metric_event("retries")
             application = with_portal_metadata(application, stub, target, discovery.source_url)
             key = application.reference or application.uid or application.url
             if key in seen:
                 continue
             seen.add(key)
-            application_date = application.date_received or application.date_validated
+            application_date = usable_application_date(application.date_received, application.date_validated)
             if application_date and not (application.raw or {}).get("date_range_filtered"):
-                received = _parse_iso_date(application_date)
+                received = application_date
                 if received is not None and (received < start_date or received > end_date):
                     continue
             applications.append(application)
@@ -2687,7 +2877,7 @@ def application_matches(
     end_date: date,
     keywords: list[str],
 ) -> bool:
-    received = _parse_iso_date(application.date_received or application.date_validated)
+    received = usable_application_date(application.date_received, application.date_validated)
     if received is None or received < start_date or received > end_date:
         return False
     if reference_is_excluded(application.reference or application.uid):
@@ -3162,6 +3352,9 @@ def _download_document_file(
             headers["Referer"] = document.source_url
         request = _document_request(url, headers)
         for attempt in range(DOCUMENT_DOWNLOAD_ATTEMPTS):
+            if attempt:
+                metric_event("retries")
+            cached_file = revalidation(request, cacheable=not _is_session_bound_document_url(url))
             if should_cancel and should_cancel():
                 raise DocumentDownloadCancelledError("Document download cancelled")
             try:
@@ -3172,6 +3365,7 @@ def _download_document_file(
                     defer_rate_limit=defer_rate_limit,
                 )
                 waited_cooldown_through = None
+                metric_event("requests")
                 with opener.open(request, timeout=30) as response:
                     payload = response.read()
                     content_type = response.headers.get("Content-Type", "").lower()
@@ -3181,18 +3375,23 @@ def _download_document_file(
                         payload = base64.b64decode(encoded)
                         content_type = _content_type_from_name(document.title)
                     if _is_downloaded_file(payload, content_type, final_url):
-                        return DownloadedFile(
+                        downloaded = DownloadedFile(
                             payload=payload,
                             final_url=final_url,
                             content_type=content_type,
                             filename=_filename_from_headers(response.headers),
                         )
+                        store_document(url, downloaded, response.headers, cacheable=not _is_session_bound_document_url(url))
+                        return downloaded
                     if _looks_like_html(payload, content_type):
                         pending.extend(_document_links_from_html(payload, final_url))
                         break
                     raise ValueError(f"{url} did not return a downloadable file")
             except HTTPError as exc:
                 last_error = exc
+                if exc.code == 304 and cached_file:
+                    metric_event("document_cache_hits")
+                    return DownloadedFile(cached_file["payload"], cached_file["final_url"], cached_file["content_type"], cached_file["filename"])
                 if exc.code == 404:
                     break
                 if exc.code not in RATE_LIMIT_HTTP_CODES:
@@ -4477,6 +4676,8 @@ def _open_url_with_retry(
 ):
     waited_cooldown_through: float | None = None
     for attempt in range(4):
+        if attempt:
+            metric_event("retries")
         if should_cancel and should_cancel():
             raise DocumentDownloadCancelledError("Document download cancelled")
         try:
@@ -4488,7 +4689,9 @@ def _open_url_with_retry(
             )
             waited_cooldown_through = None
             if opener is not None:
+                metric_event("requests")
                 return opener.open(request, timeout=timeout)
+            metric_event("requests")
             return urlopen(request, timeout=timeout)
         except HTTPError as exc:
             if exc.code not in RATE_LIMIT_HTTP_CODES:
@@ -4668,6 +4871,8 @@ def _fetch_json_with_retry(
     tls_compat_opener = None
     waited_cooldown_through: float | None = None
     for attempt in range(attempts):
+        if attempt:
+            metric_event("retries")
         request = Request(url, headers={"User-Agent": USER_AGENT})
         if should_cancel and should_cancel():
             raise CouncilSearchCancelledError(
@@ -4685,6 +4890,7 @@ def _fetch_json_with_retry(
                 raise CouncilSearchCancelledError(
                     "Cancelled while fetching public planning metadata"
                 ) from exc
+            metric_event("requests")
             if tls_compat_opener is not None:
                 response_context = tls_compat_opener.open(request, timeout=DEFAULT_REQUEST_TIMEOUT_SECONDS)
             else:

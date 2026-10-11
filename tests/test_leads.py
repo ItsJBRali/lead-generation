@@ -894,7 +894,7 @@ class LeadSearchTest(unittest.TestCase):
         self.assertEqual([application.reference for application in applications], ["26/00001/FUL"])
 
     def test_run_lead_search_recovers_received_date_from_complete_listing_details(self) -> None:
-        for received_date, expected_count in (("2026-07-22", 1), (None, 0)):
+        for received_date, expected_count in (("2026-07-22", 1), (None, 1)):
             with self.subTest(received_date=received_date), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 user_geojson, catalogue = write_search_fixture(root, ["Telford and Wrekin"])
@@ -941,7 +941,7 @@ class LeadSearchTest(unittest.TestCase):
                 self.assertEqual(result.total_applications, expected_count)
                 with result.csv_path.open(newline="", encoding="utf-8-sig") as stream:
                     self.assertEqual(len(list(csv.DictReader(stream))), expected_count)
-                self.assertEqual(fetched, ["TWC/2026/0001"])
+                self.assertEqual(fetched, [])
 
     def test_run_lead_search_excludes_thousands_of_undated_records_from_total(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1917,6 +1917,7 @@ class LeadSearchTest(unittest.TestCase):
                 agent_name=None,
                 site_address=None,
                 log=None,
+                cache_root=None,
             ):
                 enrichment_references.append(applicant_name)
                 return ContactEnrichment()

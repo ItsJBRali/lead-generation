@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from pypdf import PdfReader
+from lead_generator.planning.pdf_cache import pdf_cache_directory, cache_path, load_cached_text, save_cached_text
+from lead_generator.planning.metrics import metric_event
 
 from lead_generator.planning.drawing_sources import (
     classify_drawing_source,
@@ -327,6 +329,8 @@ class _PdfReadCache:
     page_text: dict[int, str] = field(default_factory=dict)
     ocr_attempted: set[int] = field(default_factory=set)
     reader_error: Exception | None = None
+    source_path: Path | None = None
+    persistent_path: Path | None = None
 
 
 @dataclass(slots=True)
@@ -485,6 +489,16 @@ def empty_enrichment_row(*, requested: bool) -> dict[str, str]:
 
 
 def enrich_application_folder(
+    folder: Path, *, applicant_name: str | None = None, agent_name: str | None = None,
+    site_address: str | None = None, log: Callable[[str], None] | None = None,
+    cache_root: Path | None = None,
+) -> ContactEnrichment:
+    with pdf_cache_directory(cache_root):
+        return _enrich_application_folder(folder, applicant_name=applicant_name,
+                                         agent_name=agent_name, site_address=site_address, log=log)
+
+
+def _enrich_application_folder(
     folder: Path,
     *,
     applicant_name: str | None = None,
@@ -735,6 +749,11 @@ def extract_pdf_text(
 
 
 def _open_pdf_cache(path: Path) -> _PdfReadCache:
+    persistent = cache_path(path, (MAX_OCR_PAGES_PER_DOCUMENT, OCR_RENDER_SCALE, APPLICATION_FORM_EXCLUSION_PAGE_LIMIT))
+    cached = load_cached_text(persistent)
+    if cached:
+        metric_event("pdf_cache_hits")
+        return _PdfReadCache(reader=None, source_path=path, persistent_path=persistent, **cached)
     reader: object | None = None
     page_count = 0
     reader_error: Exception | None = None
@@ -762,10 +781,23 @@ def _open_pdf_cache(path: Path) -> _PdfReadCache:
         reader=reader,
         page_count=page_count,
         reader_error=reader_error,
+        source_path=path,
+        persistent_path=persistent,
     )
 
 
 def _read_selectable_pages(cache: _PdfReadCache, page_indexes: Iterable[int]) -> None:
+    page_indexes = list(page_indexes)
+    if all(index in cache.page_text for index in page_indexes):
+        return
+    if cache.reader is None and cache.source_path:
+        try:
+            cache.reader = PdfReader(cache.source_path, strict=False)
+            if cache.reader.is_encrypted:
+                cache.reader.decrypt("")
+        except Exception as exc:
+            cache.reader_error = exc
+            return
     if cache.reader is None:
         return
     for page_index in page_indexes:
@@ -792,6 +824,7 @@ def _ocr_cached_pages(
     if not candidates:
         return
     cache.ocr_attempted.update(candidates)
+    metric_event("ocr_pages", len(candidates))
     ocr_text = _ocr_pdf_pages(path, candidates)
     for index, text in ocr_text.items():
         if _meaningful_text(text):
@@ -829,6 +862,7 @@ def _close_pdf_cache(document: _PdfText | None) -> None:
 
 
 def _close_pdf_read_cache(cache: _PdfReadCache) -> None:
+    save_cached_text(cache.persistent_path, cache.page_count, cache.page_text, cache.ocr_attempted)
     if cache.reader is None:
         return
     reader = cache.reader
@@ -1816,3 +1850,4 @@ def _unique_values(values: Iterable[str]) -> list[str]:
 
 def _joined_or_failed(values: list[str]) -> str:
     return "; ".join(values) if values else FAILED_ENRICHMENT_VALUE
+

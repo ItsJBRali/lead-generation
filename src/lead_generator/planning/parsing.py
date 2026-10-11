@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import date, datetime
 from html import unescape
 
 WHITESPACE_RE = re.compile(r"\s+")
@@ -59,3 +59,20 @@ def extract_postcode(*values: str | None) -> str | None:
             compact = WHITESPACE_RE.sub("", match.group(1)).upper()
             return f"{compact[:-3]} {compact[-3:]}"
     return None
+
+
+def usable_application_date(received: str | None, validated: str | None) -> date | None:
+    """Received and validated are interchangeable; prefer a valid received date."""
+    for value in (received, validated):
+        if not value:
+            continue
+        text = parse_council_date(value) or value
+        try:
+            return date.fromisoformat(text)
+        except ValueError:
+            try:
+                return datetime.fromisoformat(text.replace('Z', '+00:00')).date()
+            except ValueError:
+                continue
+    return None
+

@@ -19,6 +19,7 @@ from urllib.request import (
     Request,
     build_opener,
 )
+from lead_generator.planning.metrics import metric_event
 
 try:
     from selenium.common.exceptions import WebDriverException
@@ -262,6 +263,8 @@ class CouncilHttpClient:
     def _send_raw(self, request: Request, url: str) -> _RawFetchResponse:
         last_error: Exception | None = None
         for attempt in range(self.retries + 1):
+            if attempt:
+                metric_event("retries")
             _raise_if_request_cancelled()
             _report_request_activity()
             try:
@@ -270,6 +273,7 @@ class CouncilHttpClient:
                     self._wait_for_turn(url)
                     _raise_if_request_cancelled()
                     _report_request_activity()
+                    metric_event("requests")
                     with self._opener().open(request, timeout=self.timeout_seconds) as response:
                         charset = response.headers.get_content_charset() or "utf-8"
                         body = response.read()
