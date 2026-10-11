@@ -416,6 +416,7 @@ class CouncilBrowserClient:
         driver = self._ensure_driver()
         try:
             _report_request_activity()
+            metric_event("browser_operations")
             driver.get(url)
             self._wait_for_usable_page()
             return self._response()
@@ -433,6 +434,7 @@ class CouncilBrowserClient:
         driver = self._ensure_driver()
         try:
             _report_request_activity()
+            metric_event("browser_operations")
             if str(data.get("ajax", "")).casefold() == "true" or (
                 headers and headers.get("X-Requested-With", "").casefold() == "xmlhttprequest"
             ):
@@ -494,6 +496,7 @@ class CouncilBrowserClient:
             url = f"{url}{separator}{urlencode(params)}"
         driver = self._ensure_driver()
         try:
+            metric_event("browser_operations")
             result = driver.execute_async_script(
                 """
                 const done = arguments[arguments.length - 1];

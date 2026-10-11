@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import os
 from contextlib import closing
 from pathlib import Path
 
@@ -34,10 +35,29 @@ class RunStorage:
             raise ValueError('Choose a search folder containing run.sqlite3 to resume.')
         self.lock = threading.RLock()
         self.closed = False
-        self.connection = sqlite3.connect(path, check_same_thread=False)
-        self.connection.execute('PRAGMA journal_mode=WAL')
-        self.connection.execute('CREATE TABLE IF NOT EXISTS records (kind TEXT, key TEXT, value TEXT, PRIMARY KEY (kind, key))')
-        self.connection.commit()
+        self.ownership = path.with_suffix('.lock').open('a+b')
+        try:
+            if os.fstat(self.ownership.fileno()).st_size == 0:
+                self.ownership.write(b'\0')
+                self.ownership.flush()
+            self.ownership.seek(0)
+            if os.name == 'nt':
+                import msvcrt
+                msvcrt.locking(self.ownership.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self.ownership.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            self.ownership.close()
+            raise ValueError('This saved search is already running in another window. Wait for it to finish before resuming.') from exc
+        try:
+            self.connection = sqlite3.connect(path, check_same_thread=False)
+            self.connection.execute('PRAGMA journal_mode=WAL')
+            self.connection.execute('CREATE TABLE IF NOT EXISTS records (kind TEXT, key TEXT, value TEXT, PRIMARY KEY (kind, key))')
+            self.connection.commit()
+        except Exception:
+            self.ownership.close()
+            raise
         previous = self.get('settings', 'run')
         if resume and previous != settings:
             self.close()
@@ -62,4 +82,5 @@ class RunStorage:
         with self.lock:
             if not self.closed:
                 self.connection.close()
+                self.ownership.close()
                 self.closed = True

@@ -410,16 +410,20 @@ def _process_discovered_applications(
         reference = application_reference_key(application)
         if not reference:
             excluded_without_usable_reference += 1
+            update_state(lambda: state.detail_errors.update({application.uid or application.url: "No usable application reference"}))
             continue
         detail_error = (application.raw or {}).get("detail_fetch_error")
-        if detail_error and (usable_application_date(application.date_received, application.date_validated) is None or (keywords and not application.description)):
-            update_state(lambda: state.detail_errors.update({reference: str(detail_error)}))
+        selected_date = usable_application_date(application.date_received, application.date_validated)
+        if selected_date is None:
+            update_state(lambda: state.detail_errors.update({reference: str(detail_error or "No usable received or validated date")}))
         if not application_is_in_date_range(application, start_date, end_date):
             if usable_application_date(application.date_received, application.date_validated) is None:
                 excluded_without_usable_date += 1
             continue
 
-        if not detail_error and (not keywords or application.description):
+        if keywords and not application.description:
+            update_state(lambda: state.detail_errors.update({reference: str(detail_error or "Proposal unavailable for keyword filtering")}))
+        else:
             update_state(lambda: state.detail_errors.pop(reference, None))
 
         if reference not in source_date_valid_references:
@@ -1613,7 +1617,7 @@ def _run_lead_search(
                 if saved_docs["complete"]:
                     completed_document_references.add(identity)
                     documents_completed += 1
-                if storage.get("enrichment", key):
+                if saved_docs["complete"] and storage.get("enrichment", key):
                     enriched_keys.add(identity)
         _captured(captured, len(rows))
     if config.pipelined:
@@ -1963,6 +1967,9 @@ def discover_portal_applications(
                     try:
                         application = scraper.fetch_application(stub.uid, stub.url, include_documents=False)
                         stub.raw.pop("detail_fetch_error", None)
+                        if usable_application_date(application.date_received, application.date_validated) is None and attempt == 0:
+                            metric_event("retries")
+                            continue
                         break
                     except Exception as exc:
                         if attempt == 1:
@@ -3069,8 +3076,9 @@ def _download_pdf_documents_once(
 
     with _DOCUMENT_DOWNLOAD_GATE:
         try:
-            for index, document in ready_documents:
+            for position, (index, document) in enumerate(ready_documents):
                 if should_cancel and should_cancel():
+                    result.transient_documents.extend(d for _, d in ready_documents[position:])
                     break
                 if defer_transient and _document_has_active_rate_limit_cooldown(
                     document
@@ -3079,9 +3087,8 @@ def _download_pdf_documents_once(
                     continue
                 document_host = urlsplit(document.source_url or document.url).netloc.casefold()
                 if document_host and document_host in blocked_hosts:
-                    if defer_transient:
-                        result.transient_documents.append(document)
-                    else:
+                    result.transient_documents.append(document)
+                    if not defer_transient:
                         result.failures.append(
                             DocumentDownloadFailure(
                                 document,
@@ -3097,6 +3104,7 @@ def _download_pdf_documents_once(
                     download_one(index, document)
                 except Exception as exc:  # pragma: no cover - live network failures vary
                     if isinstance(exc, DocumentDownloadCancelledError):
+                        result.transient_documents.extend(d for _, d in ready_documents[position:])
                         break
                     browser_status = _council_fetch_http_status(exc)
                     error_url = str(getattr(exc, "url", "") or "")
@@ -3106,13 +3114,14 @@ def _download_pdf_documents_once(
                             RATE_LIMIT_DEFAULT_RETRY_DELAY_SECONDS,
                         )
                     if _is_transient_document_error(exc):
+                        if defer_transient or not (isinstance(exc, HTTPError) and exc.code == 404):
+                            result.transient_documents.append(document)
                         error_host = urlsplit(error_url).netloc.casefold()
                         if not (isinstance(exc, HTTPError) and exc.code == 404):
                             blocked_hosts.update(
                                 host for host in (document_host, error_host) if host
                             )
                         if defer_transient:
-                            result.transient_documents.append(document)
                             continue
                     if isinstance(exc, HTTPError) and exc.code == 404:
                         reason = "HTTP 404"
@@ -3351,10 +3360,11 @@ def _download_document_file(
         if document.source_url:
             headers["Referer"] = document.source_url
         request = _document_request(url, headers)
+        use_cached_validator = True
         for attempt in range(DOCUMENT_DOWNLOAD_ATTEMPTS):
             if attempt:
                 metric_event("retries")
-            cached_file = revalidation(request, cacheable=not _is_session_bound_document_url(url))
+            cached_file = revalidation(request, cacheable=use_cached_validator and request.get_method() == "GET" and not _is_session_bound_document_url(url))
             if should_cancel and should_cancel():
                 raise DocumentDownloadCancelledError("Document download cancelled")
             try:
@@ -3381,7 +3391,7 @@ def _download_document_file(
                             content_type=content_type,
                             filename=_filename_from_headers(response.headers),
                         )
-                        store_document(url, downloaded, response.headers, cacheable=not _is_session_bound_document_url(url))
+                        store_document(url, downloaded, response.headers, cacheable=request.get_method() == "GET" and not _is_session_bound_document_url(url))
                         return downloaded
                     if _looks_like_html(payload, content_type):
                         pending.extend(_document_links_from_html(payload, final_url))
@@ -3390,6 +3400,14 @@ def _download_document_file(
             except HTTPError as exc:
                 last_error = exc
                 if exc.code == 304 and cached_file:
+                    if normalize_url(exc.geturl()) != normalize_url(cached_file["final_url"]):
+                        # Redirects may forward validators to a different URI,
+                        # where an identical ETag does not identify the same file.
+                        for name in list(request.headers):
+                            if name.casefold() in {"if-none-match", "if-modified-since"}:
+                                request.remove_header(name)
+                        use_cached_validator = False
+                        continue
                     metric_event("document_cache_hits")
                     return DownloadedFile(cached_file["payload"], cached_file["final_url"], cached_file["content_type"], cached_file["filename"])
                 if exc.code == 404:

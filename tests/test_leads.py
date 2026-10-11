@@ -4839,7 +4839,7 @@ class LeadSearchTest(unittest.TestCase):
                 )
 
         self.assertEqual(download_file.call_count, 2)
-        self.assertEqual(result.transient_documents, [])
+        self.assertEqual(result.transient_documents, documents[1:])
         self.assertEqual(
             [(failure.document, failure.reason) for failure in result.failures],
             [

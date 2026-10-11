@@ -31,7 +31,7 @@ def cache_path(path: Path, settings: tuple) -> Path | None:
             versions.append(version(package))
         except PackageNotFoundError:
             versions.append('unavailable')
-    fingerprint = sha256(path.read_bytes() + json.dumps([1, settings, versions]).encode()).hexdigest()
+    fingerprint = sha256(path.read_bytes() + json.dumps([2, settings, versions]).encode()).hexdigest()
     return Path(root) / 'pdf-text' / f'{fingerprint}.json'
 
 

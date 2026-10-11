@@ -50,7 +50,7 @@ class RunMetrics:
             self.add(council, stage, 'attempts', 1)
 
     def export(self, path: Path):
-        fields = ['council', 'stage', 'seconds', 'attempts', 'requests', 'retries', 'downloaded_documents', 'ocr_pages', 'pdf_cache_hits', 'document_cache_hits']
+        fields = ['council', 'stage', 'seconds', 'attempts', 'requests', 'browser_operations', 'retries', 'downloaded_documents', 'ocr_pages', 'pdf_cache_hits', 'document_cache_hits']
         with self.lock:
             rows = [dict(row) for _, row in sorted(self.rows.items())]
         with path.open('w', newline='', encoding='utf-8') as handle:

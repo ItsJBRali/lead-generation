@@ -118,7 +118,9 @@ version. Public document downloads with HTTP validators use conditional requests
 cached bytes are reused only when the server replies Not Modified.
 
 `search_metrics.csv` records per-council stage durations, requests, retries,
-downloads, OCR pages and cache hits. Measurements accumulate when a run resumes.
+browser operations, downloads, OCR pages and cache hits. Browser operations count
+navigation, submission and file-fetch actions; background browser resources are
+not counted. Measurements accumulate when a run resumes.
 
 Live completeness checks can be repeated without downloading application files:
 

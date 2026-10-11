@@ -160,6 +160,8 @@ class SearchReliabilityTest(unittest.TestCase):
         self.assertEqual(classify_completeness(2, [complete], family='agile'), 'Complete against advertised total')
         incomplete = response_evidence({'results': [{}], 'totalCount': 2})
         self.assertTrue(classify_completeness(1, [incomplete], family='agile').startswith('Incomplete'))
+        consumed = [{'totals': [2], 'continuation_advertised': True}, {'totals': [2], 'continuation_advertised': False}]
+        self.assertEqual(classify_completeness(2, consumed, family='agile'), 'Complete against advertised total')
 
     def test_wiltshire_live_empty_response_is_valid(self):
         import json
@@ -182,6 +184,17 @@ class SearchReliabilityTest(unittest.TestCase):
         self.assertEqual(fetch.call_count, 2)
         self.assertEqual(result, [full])
         self.assertNotIn('detail_fetch_error', full.raw)
+
+    def test_missing_dates_without_network_error_still_report_partial(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            area, catalogue = write_search_fixture(root, ['Council'])
+            config = leads.LeadSearchConfig(area, root, date(2026, 7, 1), date(2026, 7, 31), [], catalogue_path=catalogue, download_application_files=False)
+            app = PlanningApplication('Council', 'A', 'https://example.test/A', reference='A')
+            with patch.object(leads, 'discover_portal_applications', return_value=[app]), patch.object(leads, 'discover_planit_reconciliation_applications', return_value=[]):
+                result = leads.run_lead_search(config)
+            self.assertEqual(result.completion, 'Partial')
+            self.assertEqual(result.no_application_councils, [])
 
     def test_resume_retries_failed_extraction(self):
         from lead_generator.planning.enrichment import ContactEnrichment
@@ -214,6 +227,113 @@ class SearchReliabilityTest(unittest.TestCase):
             self.assertEqual(result.completion, 'Completed')
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]['application link'], primary.url)
+
+    def test_resume_downloads_documents_not_attempted_before_cancel(self):
+        from lead_generator.planning.models import PlanningDocument
+        from lead_generator.planning.enrichment import ContactEnrichment
+        for pipeline in (False, True):
+            with self.subTest(pipeline=pipeline), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                area, catalogue = write_search_fixture(root, ['Council'])
+                config = leads.LeadSearchConfig(area, root, date(2026, 7, 1), date(2026, 7, 31), [], catalogue_path=catalogue, pipelined=pipeline)
+                app = PlanningApplication('Council', 'A', 'https://example.test/A', reference='A', date_received='2026-07-15')
+                documents = [PlanningDocument(f'Proposed drawing {i}', f'https://example.test/{i}.pdf') for i in range(3)]
+                cancelled = threading.Event()
+                def download(document, **kwargs):
+                    cancelled.set()
+                    return leads.DownloadedFile(b'%PDF-1.7 ' + document.url.encode(), document.url, 'application/pdf')
+                with patch.object(leads, 'DOCUMENT_DOWNLOAD_DELAY_SECONDS', 0), patch.object(leads, 'discover_portal_applications', return_value=[app]), patch.object(leads, 'discover_planit_reconciliation_applications', return_value=[]), patch.object(leads, 'discover_application_documents', return_value=leads.DocumentDiscoveryResult(documents=documents)), patch.object(leads, 'download_document_file', side_effect=download) as first_download, patch.object(leads, 'enrich_application_folder', return_value=ContactEnrichment()):
+                    first = leads.run_lead_search(config, should_cancel=cancelled.is_set)
+                self.assertEqual(first_download.call_count, 1)
+                self.assertEqual(first.completion, 'Cancelled')
+                def remaining(document, **kwargs):
+                    return leads.DownloadedFile(b'%PDF-1.7 ' + document.url.encode(), document.url, 'application/pdf')
+                with patch.object(leads, 'DOCUMENT_DOWNLOAD_DELAY_SECONDS', 0), patch.object(leads, 'discover_portal_applications', side_effect=AssertionError('Use checkpoint')), patch.object(leads, 'discover_planit_reconciliation_applications', side_effect=AssertionError('Use checkpoint')), patch.object(leads, 'discover_application_documents', side_effect=AssertionError('Use pending documents')), patch.object(leads, 'download_document_file', side_effect=remaining) as resumed_download, patch.object(leads, 'enrich_application_folder', return_value=ContactEnrichment()):
+                    resumed = leads.run_lead_search(replace(config, resume_from=first.output_dir))
+                self.assertEqual(resumed.completion, 'Completed')
+                self.assertEqual(resumed_download.call_count, 2)
+                self.assertEqual({call.args[0].url for call in resumed_download.call_args_list}, {d.url for d in documents[1:]})
+
+    def test_failed_ocr_is_retried_on_next_run(self):
+        from types import SimpleNamespace
+        from lead_generator.planning import enrichment
+        from lead_generator.planning.pdf_cache import pdf_cache_directory
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pdf = root / 'drawing.pdf'
+            pdf.write_bytes(b'unchanged bytes')
+            reader = SimpleNamespace(is_encrypted=False, pages=[SimpleNamespace(extract_text=lambda: 'Drawing')])
+            with pdf_cache_directory(root / 'cache'), patch.object(enrichment, 'PdfReader', return_value=reader), patch.object(enrichment, '_ocr_pdf_pages', side_effect=[{}, {0: 'Architect company and professional contact details ' * 6}]) as ocr:
+                first = enrichment.extract_pdf_text(pdf)
+                enrichment._close_pdf_cache(first)
+                second = enrichment.extract_pdf_text(pdf)
+                enrichment._close_pdf_cache(second)
+                self.assertEqual(ocr.call_count, 2)
+                self.assertIn('Architect company', second.text)
+
+    def test_final_transient_download_failure_is_retried_on_resume(self):
+        from email.message import Message
+        from urllib.error import HTTPError
+        from lead_generator.planning.models import PlanningDocument
+        from lead_generator.planning.enrichment import ContactEnrichment
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            area, catalogue = write_search_fixture(root, ['Council'])
+            config = leads.LeadSearchConfig(area, root, date(2026, 7, 1), date(2026, 7, 31), [], catalogue_path=catalogue)
+            app = PlanningApplication('Council', 'A', 'https://example.test/A', reference='A', date_received='2026-07-15')
+            doc = PlanningDocument('Proposed drawing', 'https://example.test/plans.pdf')
+            with patch.object(leads, 'discover_portal_applications', return_value=[app]), patch.object(leads, 'discover_planit_reconciliation_applications', return_value=[]), patch.object(leads, 'discover_application_documents', return_value=leads.DocumentDiscoveryResult(documents=[doc])), patch.object(leads, '_wait_for_document_retry_cooldown', return_value=True), patch.object(leads, 'download_document_file', side_effect=HTTPError(doc.url, 503, 'Unavailable', Message(), None)), patch.object(leads, 'enrich_application_folder', return_value=ContactEnrichment()):
+                first = leads.run_lead_search(config)
+            with patch.object(leads, 'DOCUMENT_DOWNLOAD_DELAY_SECONDS', 0), patch.object(leads, 'discover_portal_applications', side_effect=AssertionError('Use saved primary')), patch.object(leads, 'discover_planit_reconciliation_applications', side_effect=AssertionError('Use saved reconciliation')), patch.object(leads, 'discover_application_documents', side_effect=AssertionError('Use pending document')), patch.object(leads, 'download_document_file', return_value=leads.DownloadedFile(b'%PDF-1.7 recovered', doc.url, 'application/pdf')) as download, patch.object(leads, 'enrich_application_folder', return_value=ContactEnrichment()) as enrich:
+                result = leads.run_lead_search(replace(config, resume_from=first.output_dir))
+            self.assertEqual(result.captured_documents, 1)
+            self.assertEqual(download.call_count, 1)
+            self.assertEqual(enrich.call_count, 1)
+
+    def test_changed_redirect_target_is_downloaded_without_old_validator(self):
+        from email.message import Message
+        from urllib.error import HTTPError
+        from types import SimpleNamespace
+        from lead_generator.planning.models import PlanningDocument
+        from lead_generator.planning.document_cache import document_cache_directory
+        class Response:
+            headers = Message()
+            headers['Content-Type'] = 'application/pdf'
+            headers['ETag'] = '"same-etag"'
+            def __init__(self, version): self.version = version
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def read(self): return b'%PDF-1.7 version ' + str(self.version).encode()
+            def geturl(self): return f'https://example.test/v{self.version}.pdf'
+        count = []
+        def open_request(request, timeout):
+            count.append(True)
+            if len(count) == 1: return Response(1)
+            if len(count) == 2:
+                self.assertEqual(request.get_header('If-none-match'), '"same-etag"')
+                raise HTTPError('https://example.test/v2.pdf', 304, 'Not Modified', Message(), None)
+            self.assertIsNone(request.get_header('If-none-match'))
+            return Response(2)
+        doc = PlanningDocument('Drawing', 'https://example.test/document.pdf')
+        with tempfile.TemporaryDirectory() as directory, document_cache_directory(Path(directory)), patch.object(leads, '_throttle_request'):
+            opener = SimpleNamespace(open=open_request)
+            first = leads.download_document_file(doc, opener=opener)
+            second = leads.download_document_file(doc, opener=opener)
+            self.assertNotEqual(first.payload, second.payload)
+            self.assertEqual(second.final_url, 'https://example.test/v2.pdf')
+
+    def test_saved_run_has_exclusive_ownership(self):
+        from lead_generator.planning.run_storage import RunStorage
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'run.sqlite3'
+            first = RunStorage(path, {'schema': 1})
+            try:
+                with self.assertRaisesRegex(ValueError, 'already running'):
+                    RunStorage(path, {'schema': 1}, resume=True)
+            finally:
+                first.close()
+            resumed = RunStorage(path, {'schema': 1}, resume=True)
+            resumed.close()
 
 
 if __name__ == '__main__':

@@ -331,6 +331,7 @@ class _PdfReadCache:
     reader_error: Exception | None = None
     source_path: Path | None = None
     persistent_path: Path | None = None
+    ocr_succeeded: set[int] = field(default_factory=set)
 
 
 @dataclass(slots=True)
@@ -753,6 +754,7 @@ def _open_pdf_cache(path: Path) -> _PdfReadCache:
     cached = load_cached_text(persistent)
     if cached:
         metric_event("pdf_cache_hits")
+        cached["ocr_succeeded"] = set(cached["ocr_attempted"])
         return _PdfReadCache(reader=None, source_path=path, persistent_path=persistent, **cached)
     reader: object | None = None
     page_count = 0
@@ -828,6 +830,7 @@ def _ocr_cached_pages(
     ocr_text = _ocr_pdf_pages(path, candidates)
     for index, text in ocr_text.items():
         if _meaningful_text(text):
+            cache.ocr_succeeded.add(index)
             cache.page_text[index] = "\n".join(
                 value for value in (cache.page_text.get(index, ""), text) if value
             )
@@ -862,7 +865,7 @@ def _close_pdf_cache(document: _PdfText | None) -> None:
 
 
 def _close_pdf_read_cache(cache: _PdfReadCache) -> None:
-    save_cached_text(cache.persistent_path, cache.page_count, cache.page_text, cache.ocr_attempted)
+    save_cached_text(cache.persistent_path, cache.page_count, cache.page_text, cache.ocr_succeeded)
     if cache.reader is None:
         return
     reader = cache.reader

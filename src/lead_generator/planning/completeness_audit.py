@@ -60,7 +60,7 @@ class AuditClient(CouncilHttpClient):
 
 
 def classify_completeness(count, evidence, *, family):
-    if any(item['continuation_advertised'] for item in evidence):
+    if evidence and evidence[-1]['continuation_advertised']:
         return 'Incomplete: response advertises further results'
     totals = [total for item in evidence for total in item['totals']]
     if totals and any(total > count for total in totals):
