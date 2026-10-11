@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import date
 from functools import cached_property
 from typing import Any
@@ -98,10 +98,9 @@ class AchieveFormsPlanningScraper(PlanningScraper):
         include_documents: bool = False,
     ) -> PlanningApplication:
         metadata = self._last_metadata or self._metadata(url or self.config.base_url)
-        application = self._fetch_application_with_metadata(uid, metadata)
-        if include_documents:
-            application.documents = self._fetch_documents(uid, metadata)
-        return application
+        return self._fetch_application_with_metadata(
+            uid, metadata, include_documents=include_documents,
+        )
 
     def _metadata(self, listing_url: str) -> AchieveFormsMetadata:
         if listing_url in self._metadata_by_url:
@@ -186,6 +185,8 @@ class AchieveFormsPlanningScraper(PlanningScraper):
         self,
         reference: str,
         metadata: AchieveFormsMetadata,
+        *,
+        include_documents: bool = False,
     ) -> PlanningApplication:
         rows = self._lookup_rows(metadata, metadata.detail_lookup_id, {"applicationReferenc": reference})
         if not rows:
@@ -193,7 +194,7 @@ class AchieveFormsPlanningScraper(PlanningScraper):
         row = rows[0]
         app_reference = self._first_value(row, "referenceNumber") or reference
         address = self._first_value(row, "location")
-        documents = self._fetch_documents(app_reference, metadata)
+        documents = self._fetch_documents(app_reference, metadata) if include_documents else []
         return PlanningApplication(
             authority=self.authority,
             uid=app_reference,
@@ -215,6 +216,7 @@ class AchieveFormsPlanningScraper(PlanningScraper):
                 "portal_family": "achieveforms",
                 "detail_complete": True,
                 "lookup_row": row,
+                "achieveforms_metadata": asdict(metadata),
             },
         )
 
@@ -388,3 +390,27 @@ class AchieveFormsPlanningScraper(PlanningScraper):
             return json.loads(text)
         except json.JSONDecodeError as exc:
             raise CouncilFetchError(f"Invalid JSON from AchieveForms API at {url}") from exc
+
+
+def fetch_achieveforms_documents(
+    application: PlanningApplication,
+    *,
+    http_client: CouncilHttpClient | None = None,
+) -> list[PlanningDocument]:
+    metadata_fields = (application.raw or {}).get("achieveforms_metadata")
+    if not isinstance(metadata_fields, dict):
+        raise CouncilFetchError("AchieveForms document lookup metadata is missing")
+    metadata = AchieveFormsMetadata(**metadata_fields)
+    parts = urlsplit(metadata.listing_url)
+    scraper = AchieveFormsPlanningScraper(
+        AchieveFormsCouncilConfig(
+            authority=application.authority,
+            base_url=f"{parts.scheme}://{parts.netloc}",
+        ),
+        http_client=http_client,
+    )
+    try:
+        return scraper._fetch_documents(application.reference or application.uid, metadata)
+    finally:
+        scraper.close()
+

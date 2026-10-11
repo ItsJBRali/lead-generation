@@ -10,7 +10,8 @@ from unittest.mock import patch
 
 from lead_generator.planning.adapters.base import PortalSearchCompletenessError
 from lead_generator.planning.http import FetchResponse
-from lead_generator.planning.adapters.achieveforms import AchieveFormsCouncilConfig, AchieveFormsPlanningScraper
+from lead_generator.planning.adapters.achieveforms import AchieveFormsCouncilConfig, AchieveFormsPlanningScraper, fetch_achieveforms_documents
+from lead_generator.planning.leads import discover_application_documents
 from lead_generator.planning.adapters.agile import AgileCouncilConfig, AgilePlanningScraper
 from lead_generator.planning.adapters.atrium import AtriumCouncilConfig, AtriumPlanningScraper
 from lead_generator.planning.adapters.civica import (
@@ -619,6 +620,25 @@ class FakeLegacyFormsHttpClient:
 
 
 class NonIdoxScraperTest(unittest.TestCase):
+    def test_achieveforms_documents_are_fetched_for_selected_application(self) -> None:
+        http = FakeAchieveFormsHttpClient()
+        scraper = AchieveFormsPlanningScraper(
+            AchieveFormsCouncilConfig("Council", "https://customer.example.gov.uk"),
+            http_client=http,
+        )
+        application = scraper.discover_ids(
+            listing_url="https://customer.example.gov.uk/en/AchieveForms/?form_uri=sandbox-publish%3A%2F%2Fdefinition.json",
+        ).applications[0]
+        with (
+            patch("lead_generator.planning.leads.fetch_achieveforms_documents", side_effect=lambda app: fetch_achieveforms_documents(app, http_client=http)),
+            patch("lead_generator.planning.leads.fetch_planit_documents", side_effect=AssertionError("redundant page request")) as generic_fetch,
+        ):
+            result = discover_application_documents(application)
+
+        self.assertEqual([doc.url for doc in result.documents], ["https://customer.example.gov.uk/documents/041761.pdf"])
+        self.assertEqual(result.failed_sources, [])
+        generic_fetch.assert_not_called()
+
     def test_achieveforms_weekly_lookup_fetches_application_details(self) -> None:
         http = FakeAchieveFormsHttpClient()
         scraper = AchieveFormsPlanningScraper(
@@ -638,9 +658,14 @@ class NonIdoxScraperTest(unittest.TestCase):
         self.assertEqual(application.description, "Application for approval of details reserved by condition.")
         self.assertEqual(application.postcode, "CV10 7PW")
         self.assertTrue(application.raw["detail_complete"])
-        self.assertEqual(application.documents[0].url, "https://customer.example.gov.uk/documents/041761.pdf")
+        self.assertEqual(application.documents, [])
         self.assertIn("id=weekly-lookup", http.lookups[0][0])
         self.assertIn("id=detail-lookup", http.lookups[1][0])
+        self.assertEqual(len(http.lookups), 2)
+
+        detailed = scraper.fetch_application(application.uid, application.url, include_documents=True)
+        self.assertEqual(detailed.documents[0].url, "https://customer.example.gov.uk/documents/041761.pdf")
+        self.assertEqual(sum("id=docs-lookup" in url for url, _ in http.lookups), 1)
 
     def test_atrium_search_uses_received_dates_and_follows_pages(self) -> None:
         http = FakeAtriumHttpClient()
@@ -2037,3 +2062,4 @@ class NonIdoxScraperTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

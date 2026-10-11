@@ -318,6 +318,7 @@ class CouncilHttpClient:
         with self._rate_limit_lock:
             now = monotonic()
             next_allowed = max(
+                now,
                 self._shared_last_request_at.get(key, 0.0) + self.min_delay_seconds,
                 self._blocked_until.get(key, 0.0),
             )
@@ -773,3 +774,4 @@ def _disclaimer_accept_url(response: FetchResponse) -> str | None:
     if not match:
         return None
     return urljoin(response.url, match.group(1))
+

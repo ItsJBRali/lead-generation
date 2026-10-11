@@ -75,6 +75,9 @@ The Windows GUI is available as `dist/PlanningLeadGenerator.exe`. It lets a user
 - select a received-date range
 - choose whether to download application files as well as the CSV
 - choose how many councils to search concurrently, from 1 to 8
+- process council searches, reconciliation, document downloads, and PDF
+  enrichment as results arrive; the checkbox can be cleared to use staged
+  processing
 - edit the default lead keywords
 - run the search with council progress, captured-lead count, PDF-enrichment
   progress, and a live log
@@ -94,6 +97,9 @@ used as the location filter.
 
 Each GUI run appends a summary row to `search_history.csv` beside the executable
 so past searches remain available across output folders.
+If a council portal search fails but PlanIt returns a response, the run is
+labelled `Partial` and the council appears in `search_failures.csv`. An empty
+PlanIt response does not establish that the council itself had no applications.
 
 To run from source:
 
@@ -107,3 +113,4 @@ To rebuild the executable:
 ```powershell
 & ".\.venv\Scripts\python.exe" -m PyInstaller --noconfirm --clean PlanningLeadGenerator.spec
 ```
+

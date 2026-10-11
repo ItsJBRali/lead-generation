@@ -22,6 +22,31 @@ class Pages:
 
 
 class HtmlPaginationTest(unittest.TestCase):
+    def test_legacy_agile_date_form_traverses_later_startindex_pages(self):
+        base = 'https://planning.example.gov.uk/apas/run/'
+        search = base + 'wphappcriteria.display'
+        first = base + 'wphappsearchres.displayResultsURL'
+        second = first + '?StartIndex=10'
+        third = first + '?StartIndex=20'
+
+        class LegacyPages(Pages):
+            def post_form(self, url, data):
+                self.visited.append(url)
+                return FetchResponse(url=first, status_code=200, text=self.pages[first])
+
+        http = LegacyPages({
+            search: '<form action="wphappsearchres.displayResultsURL"><input name="REGFROMDATE.1"><input name="REGTODATE.1"></form>',
+            first: '<a href="wphappdetail.displayURL?theApnID=A">26/001</a><a rel="next" href="' + second + '">Next</a>',
+            second: '<a href="wphappdetail.displayURL?theApnID=B">26/002</a><div class="results"><a href="' + third + '">3</a></div>',
+            third: '<a href="wphappdetail.displayURL?theApnID=C">26/003</a>',
+        })
+        scraper = AgilePlanningScraper(AgileCouncilConfig('Council', base), http_client=http)
+        result = scraper.discover_ids(listing_url=search, start_date=date(2026, 7, 1), end_date=date(2026, 7, 31))
+
+        self.assertEqual([app.uid for app in result.applications], ['A', 'B', 'C'])
+        self.assertEqual(http.visited.count(second), 1)
+        self.assertEqual(http.visited.count(third), 1)
+
     def test_inherited_and_ocella_html_searches_follow_next_on_every_page(self):
         for scraper_type, config_type, detail in [
             (AgilePlanningScraper, AgileCouncilConfig, 'appdetail?appID='),
@@ -137,3 +162,4 @@ class HtmlPaginationTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

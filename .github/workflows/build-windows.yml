@@ -3,7 +3,7 @@ name: Build Windows executable
 on:
   workflow_dispatch:
   push:
-    branches: [main, fix/adapter-pagination, codex/merge-all-to-main]
+    branches: [main, fix/adapter-pagination, codex/merge-all-to-main, codex/lead-generation-improvements-2026-10-11]
     paths:
       - ".github/workflows/build-windows.yml"
       - "src/**"
@@ -77,3 +77,4 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Could not commit executable." }
           git push origin "HEAD:$env:GITHUB_REF_NAME"
           if ($LASTEXITCODE -ne 0) { throw "Could not push executable." }
+

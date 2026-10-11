@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import json
-import http.client
-import ssl
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from typing import Any
@@ -15,6 +13,7 @@ from lead_generator.planning.adapters.generic import (
     GenericCouncilConfig,
     GenericLabelledPlanningScraper,
 )
+from lead_generator.planning.adapters.pagination import _controls
 from lead_generator.planning.http import CouncilFetchError, CouncilHttpClient, FetchResponse
 from lead_generator.planning.models import DiscoveryResult, PlanningApplication, PlanningDocument
 from lead_generator.planning.parsing import clean_text, extract_postcode, parse_council_date
@@ -183,8 +182,7 @@ class AgilePlanningScraper(GenericLabelledPlanningScraper):
         if submit_name:
             data[submit_name] = submit_value or "Search"
         action = form.get("action") or listing_url
-        search_response = self.http.post_form(urljoin(response.url, action), data)
-        return self._with_legacy_apas_pages(search_response)
+        return self.http.post_form(urljoin(response.url, action), data)
 
     def _lookup_client_code(self, slug: str) -> str:
         if self._client_code and self._client_slug == slug:
@@ -244,36 +242,17 @@ class AgilePlanningScraper(GenericLabelledPlanningScraper):
             return anchor_text
         return super()._extract_reference(anchor, row_text)
 
-    def _with_legacy_apas_pages(self, response: FetchResponse) -> FetchResponse:
-        document = html.fromstring(response.text)
-        page_urls: list[str] = []
-        seen = {response.url}
+    def _pagination_urls(self, html_text: str, page_url: str) -> list[str]:
+        if "/apas/run/" not in page_url.casefold():
+            return [url for url, data, _ in _controls(html_text, page_url) if data is None]
+        document = html.fromstring(html_text)
+        urls = []
         for anchor in document.xpath("//a[@href]"):
             href = anchor.get("href") or ""
             lowered = href.casefold()
-            if "wphappsearchres.displayresultsurl" not in lowered or "startindex=" not in lowered:
-                continue
-            page_url = urljoin(response.url, href)
-            if page_url in seen:
-                continue
-            seen.add(page_url)
-            page_urls.append(page_url)
-
-        pages = [response.text]
-        status_code = response.status_code
-        final_url = response.url
-        for page_url in page_urls[:50]:
-            page = self.http.get(page_url)
-            pages.append(page.text)
-            status_code = page.status_code
-            final_url = page.url
-        if len(pages) == 1:
-            return response
-        return FetchResponse(
-            url=final_url,
-            status_code=status_code,
-            text="<html><body>" + "\n".join(pages) + "</body></html>",
-        )
+            if "wphappsearchres.displayresultsurl" in lowered and "startindex=" in lowered:
+                urls.append(urljoin(page_url, href))
+        return urls
 
     def _api_get(self, path: str, params: dict[str, str], client_code: str) -> tuple[str, str]:
         if not isinstance(self.http, CouncilHttpClient):
@@ -281,37 +260,13 @@ class AgilePlanningScraper(GenericLabelledPlanningScraper):
             return response.text, response.url
 
         base = urlsplit(self.API_URL)
+        response_url = f"{base.scheme}://{base.netloc}{base.path.rstrip('/')}/{path.lstrip('/')}"
+        # Preserve the API's existing request target while using shared controls.
         query = urlencode(params, safe=":")
-        request_path = f"{base.path.rstrip('/')}/{path.lstrip('/')}"
         if query:
-            request_path = f"{request_path}?{query}"
-        response_url = f"{base.scheme}://{base.netloc}{request_path}"
-
-        verify_options = (self.http.verify_tls, False) if self.http.verify_tls else (False,)
-        for verify_tls in verify_options:
-            context = ssl.create_default_context() if verify_tls else ssl._create_unverified_context()
-            connection = http.client.HTTPSConnection(
-                base.netloc,
-                timeout=self.http.timeout_seconds,
-                context=context,
-            )
-            try:
-                connection.putrequest("GET", request_path, skip_accept_encoding=True)
-                for key, value in self._api_headers(client_code).items():
-                    connection.putheader(key, value)
-                connection.endheaders()
-                response = connection.getresponse()
-                body = response.read()
-                text = body.decode(response.headers.get_content_charset() or "utf-8", errors="replace")
-                if response.status >= 400:
-                    raise CouncilFetchError(f"HTTP {response.status} while fetching {response_url}")
-                return text, response_url
-            except ssl.SSLCertVerificationError:
-                if not verify_tls:
-                    raise
-            finally:
-                connection.close()
-        raise CouncilFetchError(f"Could not establish a secure connection to {response_url}")
+            response_url = f"{response_url}?{query}"
+        response = self.http.get(response_url, headers=self._api_headers(client_code))
+        return response.text, response.url
 
     def _application_from_record(
         self,
@@ -397,3 +352,4 @@ class AgilePlanningScraper(GenericLabelledPlanningScraper):
             if host_part and host_part not in {"www", "planning"}:
                 return host_part
         raise ValueError(f"Could not determine Agile council slug from {url}")
+
