@@ -1501,21 +1501,6 @@ def run_lead_search(
         if not reconciliation_completed:
             continue
 
-        if state.primary_error and state.reconciliation_succeeded:
-            partial_councils.append(state.target.authority)
-            failed_councils.append(state.target.authority)
-
-        if state.date_valid_references:
-            if state.primary_error:
-                save_failure(state.target, state.primary_error)
-            if state.reconciliation_error:
-                save_failure(
-                    state.target,
-                    f"PlanIt reconciliation warning: "
-                    f"{state.reconciliation_error}",
-                )
-            continue
-
         any_source_succeeded = (
             state.primary_succeeded or state.reconciliation_succeeded
         )
@@ -1532,6 +1517,21 @@ def run_lead_search(
                 f"Primary search failed: {primary_reason}; "
                 f"PlanIt reconciliation failed: {reconciliation_reason}",
             )
+            continue
+
+        if state.primary_error and state.reconciliation_succeeded:
+            partial_councils.append(state.target.authority)
+            failed_councils.append(state.target.authority)
+
+        if state.date_valid_references:
+            if state.primary_error:
+                save_failure(state.target, state.primary_error)
+            if state.reconciliation_error:
+                save_failure(
+                    state.target,
+                    f"PlanIt reconciliation warning: "
+                    f"{state.reconciliation_error}",
+                )
             continue
 
         if state.primary_error:
@@ -2228,6 +2228,23 @@ def discover_application_documents(
     result = DocumentDiscoveryResult()
     seen: set[str] = set()
 
+    def fetch_adapter_documents(fetch: Callable[[], list[PlanningDocument]]) -> list[PlanningDocument]:
+        if should_cancel and should_cancel():
+            raise DocumentDownloadCancelledError("Document discovery cancelled")
+        try:
+            # Adapter HTTP clients use a thread-local monitor, so install the
+            # document worker's cancellation callback around their requests.
+            with (monitor_council_requests(None, should_cancel=should_cancel)
+                  if should_cancel else nullcontext()):
+                documents = fetch()
+        except CouncilFetchError as exc:
+            if should_cancel and should_cancel():
+                raise DocumentDownloadCancelledError("Document discovery cancelled") from exc
+            raise
+        if should_cancel and should_cancel():
+            raise DocumentDownloadCancelledError("Document discovery cancelled")
+        return documents
+
     def merge(documents: Iterable[PlanningDocument]) -> None:
         for document in documents:
             normalized_url = normalize_url(document.url)
@@ -2244,7 +2261,7 @@ def discover_application_documents(
         merge(_record_document_source(
             result,
             application.url,
-            lambda: fetch_achieveforms_documents(application),
+            lambda: fetch_adapter_documents(lambda: fetch_achieveforms_documents(application)),
         ))
         return result
 
@@ -2264,7 +2281,9 @@ def discover_application_documents(
                 document.source_url = application.url
             return agile_documents
 
-        merge(_record_document_source(result, application.url, fetch_agile_documents))
+        merge(_record_document_source(
+            result, application.url, lambda: fetch_adapter_documents(fetch_agile_documents),
+        ))
 
     civica_documents = fetch_civica_documents_from_raw(application.raw or {}, source_url=application.url)
     merge(civica_documents)

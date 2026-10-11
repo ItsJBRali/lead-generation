@@ -261,7 +261,11 @@ class AgilePlanningScraper(GenericLabelledPlanningScraper):
 
         base = urlsplit(self.API_URL)
         response_url = f"{base.scheme}://{base.netloc}{base.path.rstrip('/')}/{path.lstrip('/')}"
-        response = self.http.get(response_url, params=params, headers=self._api_headers(client_code))
+        # Preserve the API's existing request target while using shared controls.
+        query = urlencode(params, safe=":")
+        if query:
+            response_url = f"{response_url}?{query}"
+        response = self.http.get(response_url, headers=self._api_headers(client_code))
         return response.text, response.url
 
     def _application_from_record(
