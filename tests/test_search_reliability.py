@@ -322,6 +322,90 @@ class SearchReliabilityTest(unittest.TestCase):
             self.assertNotEqual(first.payload, second.payload)
             self.assertEqual(second.final_url, 'https://example.test/v2.pdf')
 
+    def test_detail_retry_recovers_a_missing_proposal(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        stub = PlanningApplication('Council', 'A', 'https://example.test/A', reference='A')
+        incomplete = PlanningApplication('Council', 'A', stub.url, reference='A', date_received='2026-07-15')
+        complete = PlanningApplication('Council', 'A', stub.url, reference='A', date_received='2026-07-15', description='Extension')
+        fetch = Mock(side_effect=[incomplete, complete])
+        scraper = SimpleNamespace(fetch_application=fetch, close=lambda: None)
+        target = leads.CouncilTarget('Council', 'idox', 'idox', 'https://example.test', 'https://example.test/search', {})
+        with patch.object(leads, '_discover_portal_listing', return_value=(DiscoveryResult('Council', stub.url, [stub]), scraper)):
+            applications = leads.discover_portal_applications(target, date(2026, 7, 1), date(2026, 7, 31))
+        self.assertEqual([app.description for app in applications], ['Extension'])
+
+    def test_agile_prefers_received_date_and_skips_invalid_aliases(self):
+        from lead_generator.planning.adapters.agile import AgilePlanningScraper, AgileCouncilConfig
+        scraper = AgilePlanningScraper(AgileCouncilConfig('Council', 'https://example.test'))
+        cases = [
+            ({'receivedDate': '2026-07-10', 'registrationDate': '2026-07-12', 'validDate': '2026-07-14'}, '2026-07-10'),
+            ({'receivedDate': 'unavailable', 'registrationDate': '2026-07-12', 'validDate': '2026-07-14'}, '2026-07-12'),
+            ({'receivedDate': '2026-07-10Tinvalid', 'validDate': '2026-07-14'}, '2026-07-14'),
+        ]
+        try:
+            for dates, expected in cases:
+                with self.subTest(dates=dates):
+                    app = scraper._application_from_record({'id': '1', 'reference': 'A', **dates}, 'https://example.test', 'council', 'CC')
+                    self.assertEqual(leads.usable_application_date(app.date_received, app.date_validated).isoformat(), expected)
+        finally:
+            scraper.close()
+
+    def test_statmap_uses_validated_date_when_received_is_unusable(self):
+        import json
+        from types import SimpleNamespace
+        from lead_generator.planning.adapters.legacy_forms import StatMapPlanningScraper, LegacyFormsCouncilConfig
+        records = [
+            {'id': '1', 'name': 'MO/1', 'receivedDate': None, 'validatedDate': '2026-07-15'},
+            {'id': '2', 'name': 'MO/2', 'receivedDate': 'unavailable', 'validatedDate': '2026-07-16'},
+            {'id': '3', 'name': 'MO/3', 'receivedDate': '2026-07-17', 'validatedDate': '2026-08-01'},
+        ]
+        client = SimpleNamespace(post_json=lambda *a, **k: SimpleNamespace(text=json.dumps({'total': 3, 'records': records})))
+        scraper = StatMapPlanningScraper(LegacyFormsCouncilConfig('Council', 'https://example.test'), http_client=client)
+        result = scraper.discover_ids(listing_url='https://example.test/horizoNext/', start_date=date(2026, 7, 1), end_date=date(2026, 7, 31))
+        self.assertEqual([app.reference for app in result.applications], ['MO/1', 'MO/2', 'MO/3'])
+
+    def test_resume_recovers_ocr_when_another_page_was_readable(self):
+        import sqlite3
+        from contextlib import closing
+        from types import SimpleNamespace
+        from lead_generator.planning import enrichment
+        from lead_generator.planning.models import PlanningDocument
+        for pipeline, legacy_checkpoint in ((False, False), (True, False), (False, True), (True, True)):
+            with self.subTest(pipeline=pipeline, legacy_checkpoint=legacy_checkpoint), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                area, catalogue = write_search_fixture(root, ['Council'])
+                config = leads.LeadSearchConfig(area, root, date(2026, 7, 1), date(2026, 7, 31), [], catalogue_path=catalogue, pipelined=pipeline)
+                app = PlanningApplication('Council', 'A', 'https://example.test/A', reference='A', date_received='2026-07-15')
+                doc = PlanningDocument('Proposed floor plan', 'https://example.test/plan.pdf')
+                reader = SimpleNamespace(is_encrypted=False, pages=[
+                    SimpleNamespace(extract_text=lambda: 'Proposed extension floor plan with dimension annotation and notes for the residential design ' * 4),
+                    SimpleNamespace(extract_text=lambda: ''),
+                ])
+                with patch.object(leads, 'DOCUMENT_DOWNLOAD_DELAY_SECONDS', 0), patch.object(leads, 'discover_portal_applications', return_value=[app]), patch.object(leads, 'discover_planit_reconciliation_applications', return_value=[]), patch.object(leads, 'discover_application_documents', return_value=leads.DocumentDiscoveryResult(documents=[doc])), patch.object(leads, 'download_document_file', return_value=leads.DownloadedFile(b'%PDF-1.7 placeholder', doc.url, 'application/pdf')), patch.object(enrichment, 'PdfReader', return_value=reader), patch.object(enrichment, '_ocr_pdf_pages', return_value={}):
+                    first = leads.run_lead_search(config)
+                if legacy_checkpoint:
+                    with closing(sqlite3.connect(first.output_dir / 'run.sqlite3')) as connection:
+                        connection.execute("UPDATE records SET value='true' WHERE kind='enrichment'")
+                        connection.commit()
+                recovered = 'Example Architecture Ltd\nEmail: hello@examplearchitects.com\nProposed extension floor plan with design notes and dimensions. ' * 4
+                with patch.object(leads, 'discover_portal_applications', side_effect=AssertionError('Use saved source')), patch.object(leads, 'discover_planit_reconciliation_applications', side_effect=AssertionError('Use saved source')), patch.object(enrichment, 'PdfReader', return_value=reader), patch.object(enrichment, '_ocr_pdf_pages', return_value={1: recovered}):
+                    resumed = leads.run_lead_search(replace(config, resume_from=first.output_dir))
+                with resumed.csv_path.open(newline='', encoding='utf-8') as handle:
+                    row = next(csv.DictReader(handle))
+                self.assertIn('hello@examplearchitects.com', row['Email Address'])
+
+    def test_failed_application_form_ocr_keeps_exclusions_retryable(self):
+        from types import SimpleNamespace
+        from lead_generator.planning import enrichment
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'ApplicationForm.pdf').write_bytes(b'%PDF-1.7 placeholder')
+            reader = SimpleNamespace(is_encrypted=False, pages=[SimpleNamespace(extract_text=lambda: '')])
+            with patch.object(enrichment, 'PdfReader', return_value=reader), patch.object(enrichment, '_ocr_pdf_pages', return_value={}):
+                result = enrichment.enrich_application_folder(root)
+            self.assertTrue(result.retry_required)
+
     def test_saved_run_has_exclusive_ownership(self):
         from lead_generator.planning.run_storage import RunStorage
         with tempfile.TemporaryDirectory() as directory:

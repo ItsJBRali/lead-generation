@@ -1149,7 +1149,7 @@ def _run_lead_search(
         record = storage.get("leads", key)
         record["row"] = job.row
         storage.set("leads", key, record)
-        storage.set("enrichment", key, complete)
+        storage.set("enrichment", key, {"schema": 1, "complete": complete})
         if complete:
             enriched_keys.add(council_application_key(job.row["council"], job.reference))
 
@@ -1577,7 +1577,7 @@ def _run_lead_search(
                     enrichment_row = enrichment.to_csv_row()
                     with lock:
                         job.row.update(enrichment_row)
-                        checkpoint_enrichment(job, complete=not (enrichment.unreadable_documents or any(reason.startswith("read failed:") for reason in enrichment.rejected_documents.values())))
+                        checkpoint_enrichment(job, complete=not enrichment.retry_required)
                         pipeline_enriched_count += 1
                         if pipeline_enriched_count % ENRICHMENT_CSV_CHECKPOINT_EVERY == 0:
                             write_csv(csv_path, rows)
@@ -1617,7 +1617,7 @@ def _run_lead_search(
                 if saved_docs["complete"]:
                     completed_document_references.add(identity)
                     documents_completed += 1
-                if saved_docs["complete"] and storage.get("enrichment", key):
+                if saved_docs["complete"] and storage.get("enrichment", key) == {"schema": 1, "complete": True}:
                     enriched_keys.add(identity)
         _captured(captured, len(rows))
     if config.pipelined:
@@ -1787,7 +1787,7 @@ def _run_lead_search(
                         )
                     enrichment_row = enrichment.to_csv_row()
                     job.row.update(enrichment_row)
-                    checkpoint_enrichment(job, complete=not (enrichment.unreadable_documents or any(reason.startswith("read failed:") for reason in enrichment.rejected_documents.values())))
+                    checkpoint_enrichment(job, complete=not enrichment.retry_required)
                     populated_fields = sum(
                         value != FAILED_ENRICHMENT_VALUE for value in enrichment_row.values()
                     )
@@ -1967,7 +1967,10 @@ def discover_portal_applications(
                     try:
                         application = scraper.fetch_application(stub.uid, stub.url, include_documents=False)
                         stub.raw.pop("detail_fetch_error", None)
-                        if usable_application_date(application.date_received, application.date_validated) is None and attempt == 0:
+                        if attempt == 0 and (
+                            usable_application_date(application.date_received, application.date_validated) is None
+                            or not clean_text(application.description or stub.description)
+                        ):
                             metric_event("retries")
                             continue
                         break

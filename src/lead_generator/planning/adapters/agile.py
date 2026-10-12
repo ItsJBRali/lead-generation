@@ -16,7 +16,7 @@ from lead_generator.planning.adapters.generic import (
 from lead_generator.planning.adapters.pagination import _controls
 from lead_generator.planning.http import CouncilFetchError, CouncilHttpClient, FetchResponse
 from lead_generator.planning.models import DiscoveryResult, PlanningApplication, PlanningDocument
-from lead_generator.planning.parsing import clean_text, extract_postcode, parse_council_date
+from lead_generator.planning.parsing import clean_text, extract_postcode, parse_council_date, usable_application_date
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,7 +283,7 @@ class AgilePlanningScraper(GenericLabelledPlanningScraper):
             raise ValueError("Could not determine Agile application uid")
 
         address = self._first_value(record, "location", "address", "siteAddress")
-        date_received = self._date_value(record, "registrationDate", "receivedDate", "applicationDate")
+        date_received = self._date_value(record, "receivedDate", "registrationDate", "applicationDate")
         date_validated = self._date_value(record, "validDate")
         decision = self._first_value(record, "decisionText", "decision")
         status = self._first_value(record, "status", "statusText")
@@ -318,10 +318,11 @@ class AgilePlanningScraper(GenericLabelledPlanningScraper):
         )
 
     def _date_value(self, record: dict[str, Any], *keys: str) -> str | None:
-        value = self._first_value(record, *keys)
-        if not value:
-            return None
-        return parse_council_date(value.split("T", 1)[0]) or value
+        for key in keys:
+            parsed = usable_application_date(self._first_value(record, key), None)
+            if parsed is not None:
+                return parsed.isoformat()
+        return None
 
     def _first_value(self, record: dict[str, Any], *keys: str) -> str | None:
         for key in keys:

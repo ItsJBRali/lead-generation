@@ -890,12 +890,8 @@ class StatMapPlanningScraper(NativeListingScraper):
                     continue
                 seen_references.add(reference)
                 application = self._from_record(record, base)
-                received_date = application.date_received
-                if not received_date:
-                    continue
-                try:
-                    parsed_received_date = date.fromisoformat(received_date)
-                except ValueError:
+                parsed_received_date = usable_application_date(application.date_received, application.date_validated)
+                if parsed_received_date is None:
                     continue
                 if start_date and parsed_received_date < start_date:
                     raise PortalSearchCompletenessError("StatMap returned a record before the requested start date")

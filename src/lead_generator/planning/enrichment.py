@@ -283,7 +283,14 @@ class ContactEnrichment:
     field_sources: dict[str, list[str]] = field(default_factory=dict)
     eligible_documents: list[str] = field(default_factory=list)
     unreadable_documents: list[str] = field(default_factory=list)
+    incomplete_documents: list[str] = field(default_factory=list)
     rejected_documents: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def retry_required(self) -> bool:
+        return bool(self.unreadable_documents or self.incomplete_documents or any(
+            reason.startswith("read failed:") for reason in self.rejected_documents.values()
+        ))
 
     def to_csv_row(self) -> dict[str, str]:
         return {
@@ -627,6 +634,10 @@ def _enrich_application_folder(
             if log:
                 log(f"Could not read {path.name} for enrichment: {exc}")
         finally:
+            if first_page and first_page.cache:
+                cache = first_page.cache
+                if cache.ocr_attempted - cache.ocr_succeeded:
+                    _append_unique(accumulator.result.incomplete_documents, path.name)
             _close_pdf_cache(first_page)
 
     return accumulator.result
@@ -1037,9 +1048,14 @@ def _add_application_form_path_exclusions(
         exclusions.add_email(applicant.email)
         accumulator.discard_excluded_values()
     except Exception as exc:
+        _append_unique(accumulator.result.incomplete_documents, path.name)
         if log:
             log(f"Could not read {path.name} for applicant exclusions: {exc}")
     finally:
+        if document and document.cache:
+            cache = document.cache
+            if cache.ocr_attempted - cache.ocr_succeeded:
+                _append_unique(accumulator.result.incomplete_documents, path.name)
         _close_pdf_cache(document)
 
 
