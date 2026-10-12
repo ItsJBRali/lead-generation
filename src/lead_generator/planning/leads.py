@@ -840,8 +840,10 @@ def _run_lead_search(
     _resources: dict | None = None,
 ) -> LeadSearchResult:
     started_at = datetime.now()
+    _log(log, "Reading search boundary and council catalogue...")
     user_geojson = load_geojson(config.geojson_path)
     catalogue = load_authority_catalogue(config.catalogue_path)
+    _log(log, "Selecting overlapping planning authorities...")
     targets = select_overlapping_authorities(user_geojson, catalogue)
     if not targets:
         raise ValueError("No planning authorities overlap the supplied GeoJSON boundary.")
@@ -1868,13 +1870,21 @@ def select_overlapping_authorities(
     authority_catalogue: dict[str, object],
 ) -> list[CouncilTarget]:
     user_geometries = list(iter_feature_geometries(user_geojson))
+    user_geometry_keys = {_geometry_fingerprint(geometry) for geometry in user_geometries}
+    user_geometry_keys.discard(None)
+    user_geometry_bounds = [(geometry, geometry_bbox(geometry)) for geometry in user_geometries]
     targets: list[CouncilTarget] = []
     for feature in authority_catalogue.get("features", []):
         geometry = feature.get("geometry")
         if not isinstance(geometry, dict):
             continue
-        if not any(geometries_intersect(user_geometry, geometry) for user_geometry in user_geometries):
-            continue
+        if _geometry_fingerprint(geometry) not in user_geometry_keys:
+            bounds = geometry_bbox(geometry)
+            if not any(
+                bboxes_intersect(user_bounds, bounds) and geometries_intersect(user_geometry, geometry)
+                for user_geometry, user_bounds in user_geometry_bounds
+            ):
+                continue
         properties = feature.get("properties") or {}
         targets.append(
             CouncilTarget(
@@ -4546,6 +4556,12 @@ def iter_feature_geometries(geojson: dict[str, object]) -> Iterable[dict[str, ob
             yield geometry
     else:
         yield geojson
+
+
+def _geometry_fingerprint(geometry: dict[str, object]) -> bytes | None:
+    if not any(polygon and len(polygon[0]) >= 3 for polygon in geometry_polygons(geometry)):
+        return None
+    return sha256(json.dumps(geometry, sort_keys=True, separators=(",", ":")).encode()).digest()
 
 
 def geometries_intersect(a: dict[str, object], b: dict[str, object]) -> bool:

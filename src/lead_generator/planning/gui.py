@@ -3,6 +3,7 @@ from __future__ import annotations
 import queue
 import sys
 import threading
+from time import perf_counter
 from dataclasses import replace
 from datetime import date, timedelta
 from pathlib import Path
@@ -377,7 +378,8 @@ class LeadGeneratorApp(ctk.CTk):
         self.cancel_button.configure(state="disabled")
 
     def _poll_messages(self) -> None:
-        while True:
+        started = perf_counter()
+        for _ in range(50):
             try:
                 kind, payload = self.messages.get_nowait()
             except queue.Empty:
@@ -413,7 +415,9 @@ class LeadGeneratorApp(ctk.CTk):
                 self.resume_button.configure(state="normal")
                 messagebox.showerror("Search failed", str(payload))
                 self._append_log(f"Error: {payload}")
-        self.after(100, self._poll_messages)
+            if perf_counter() - started >= 0.02:
+                break
+        self.after(10 if not self.messages.empty() else 100, self._poll_messages)
 
     def _set_progress(self, completed: int, total: int) -> None:
         self.progress_label.configure(text=f"{completed} complete / {total} councils")
