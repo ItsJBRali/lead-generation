@@ -1,0 +1,335 @@
+{
+  "checked_at": "2026-10-11T14:18:21.848291+00:00",
+  "purpose": "Live contract evidence, not a guarantee of all published applications",
+  "councils": [
+    {
+      "council": "New Forest (Park)",
+      "portal": "https://planning.agileapplications.co.uk/nfnpa/search-applications/",
+      "windows": [
+        {
+          "window": "small",
+          "start": "2026-10-10",
+          "end": "2026-10-10",
+          "completeness": "Unavailable",
+          "error": "HTTP 401 while fetching https://planningapi.agileapplications.co.uk//api/application/search?status=registered&registrationDateFrom=2026-10-10T00:00:00%2B01:00&registrationDateTo=2026-10-10T23:59:59%2B01:00",
+          "seconds": 0.203,
+          "responses": [
+            {
+              "url": "https://identity.agileapplications.co.uk/api/client/get?url=nfnpa",
+              "status": 200,
+              "sha256": "5bf6550deea5c18c2e0ad537502c79be6c9cb388deba92ebc7bed5fb2708ee49",
+              "totals": [],
+              "continuation_advertised": false
+            }
+          ]
+        },
+        {
+          "window": "large",
+          "start": "2026-09-11",
+          "end": "2026-10-10",
+          "completeness": "Unavailable",
+          "error": "HTTP 401 while fetching https://planningapi.agileapplications.co.uk//api/application/search?status=registered&registrationDateFrom=2026-09-11T00:00:00%2B01:00&registrationDateTo=2026-10-10T23:59:59%2B01:00",
+          "seconds": 0.484,
+          "responses": [
+            {
+              "url": "https://identity.agileapplications.co.uk/api/client/get?url=nfnpa",
+              "status": 200,
+              "sha256": "5bf6550deea5c18c2e0ad537502c79be6c9cb388deba92ebc7bed5fb2708ee49",
+              "totals": [],
+              "continuation_advertised": false
+            }
+          ]
+        },
+        {
+          "window": "large_left",
+          "start": "2026-09-11",
+          "end": "2026-09-25",
+          "completeness": "Unavailable",
+          "error": "HTTP 401 while fetching https://planningapi.agileapplications.co.uk//api/application/search?status=registered&registrationDateFrom=2026-09-11T00:00:00%2B01:00&registrationDateTo=2026-09-25T23:59:59%2B01:00",
+          "seconds": 0.516,
+          "responses": [
+            {
+              "url": "https://identity.agileapplications.co.uk/api/client/get?url=nfnpa",
+              "status": 200,
+              "sha256": "5bf6550deea5c18c2e0ad537502c79be6c9cb388deba92ebc7bed5fb2708ee49",
+              "totals": [],
+              "continuation_advertised": false
+            }
+          ]
+        },
+        {
+          "window": "large_right",
+          "start": "2026-09-26",
+          "end": "2026-10-10",
+          "completeness": "Unavailable",
+          "error": "HTTP 401 while fetching https://planningapi.agileapplications.co.uk//api/application/search?status=registered&registrationDateFrom=2026-09-26T00:00:00%2B01:00&registrationDateTo=2026-10-10T23:59:59%2B01:00",
+          "seconds": 0.484,
+          "responses": [
+            {
+              "url": "https://identity.agileapplications.co.uk/api/client/get?url=nfnpa",
+              "status": 200,
+              "sha256": "5bf6550deea5c18c2e0ad537502c79be6c9cb388deba92ebc7bed5fb2708ee49",
+              "totals": [],
+              "continuation_advertised": false
+            }
+          ]
+        },
+        {
+          "window": "historical",
+          "start": "2025-09-11",
+          "end": "2025-10-10",
+          "completeness": "Unavailable",
+          "error": "HTTP 401 while fetching https://planningapi.agileapplications.co.uk//api/application/search?status=registered&registrationDateFrom=2025-09-11T00:00:00%2B01:00&registrationDateTo=2025-10-10T23:59:59%2B01:00",
+          "seconds": 0.5,
+          "responses": [
+            {
+              "url": "https://identity.agileapplications.co.uk/api/client/get?url=nfnpa",
+              "status": 200,
+              "sha256": "5bf6550deea5c18c2e0ad537502c79be6c9cb388deba92ebc7bed5fb2708ee49",
+              "totals": [],
+              "continuation_advertised": false
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "council": "Wiltshire",
+      "portal": "https://development.wiltshire.gov.uk/pr/s/?tabset-167f1=3",
+      "windows": [
+        {
+          "window": "small",
+          "start": "2026-10-10",
+          "end": "2026-10-10",
+          "unique_records": 0,
+          "undated": 0,
+          "inferred_dates": 0,
+          "outside_window": 0,
+          "completeness": "Unknown: no authoritative total or date-window contract",
+          "seconds": 0.984,
+          "responses": [
+            {
+              "url": "https://development.wiltshire.gov.uk/pr3/s/be-register-view?c__r=Arcus_BE_Public_Register",
+              "status": 200,
+              "sha256": "29f9da184094053c11a939e4d906fc6b4cdf7fd39b6366d4a36bbf21fdf3d452",
+              "totals": [],
+              "continuation_advertised": false
+            },
+            {
+              "url": "https://development.wiltshire.gov.uk/pr/s/sfsites/aura?r=10&other.PR_SearchCont.query=1",
+              "status": 200,
+              "sha256": "2f8ea72312c23870d282e425695f227705b113408e3005778a0cdcf8d825635b",
+              "totals": [],
+              "continuation_advertised": false
+            }
+          ]
+        },
+        {
+          "window": "large",
+          "start": "2026-09-11",
+          "end": "2026-10-10",
+          "unique_records": 516,
+          "undated": 0,
+          "inferred_dates": 0,
+          "outside_window": 0,
+          "completeness": "Unknown: no authoritative total or date-window contract",
+          "seconds": 1.579,
+          "responses": [
+            {
+              "url": "https://development.wiltshire.gov.uk/pr3/s/be-register-view?c__r=Arcus_BE_Public_Register",
+              "status": 200,
+              "sha256": "6e6168c7c64d353070179256e56250aa2d8778c66219dc96cebab044230380dd",
+              "totals": [],
+              "continuation_advertised": false
+            },
+            {
+              "url": "https://development.wiltshire.gov.uk/pr/s/sfsites/aura?r=10&other.PR_SearchCont.query=1",
+              "status": 200,
+              "sha256": "c9a1c8814ff514004e06cf527d9e3cc93d67b683b644df577c74bf3afae735f9",
+              "totals": [],
+              "continuation_advertised": false
+            }
+          ]
+        },
+        {
+          "window": "large_left",
+          "start": "2026-09-11",
+          "end": "2026-09-25",
+          "unique_records": 309,
+          "undated": 0,
+          "inferred_dates": 0,
+          "outside_window": 0,
+          "completeness": "Unknown: no authoritative total or date-window contract",
+          "seconds": 0.937,
+          "responses": [
+            {
+              "url": "https://development.wiltshire.gov.uk/pr3/s/be-register-view?c__r=Arcus_BE_Public_Register",
+              "status": 200,
+              "sha256": "caad538b9eb20c22267ed0664639fe7790565fa953c05d0e3068644019b26190",
+              "totals": [],
+              "continuation_advertised": false
+            },
+            {
+              "url": "https://development.wiltshire.gov.uk/pr/s/sfsites/aura?r=10&other.PR_SearchCont.query=1",
+              "status": 200,
+              "sha256": "02e98b696fa42d9af75d70e5f88eca23f3ae85425fa5f27e87064f52e9980b96",
+              "totals": [],
+              "continuation_advertised": false
+            }
+          ]
+        },
+        {
+          "window": "large_right",
+          "start": "2026-09-26",
+          "end": "2026-10-10",
+          "unique_records": 207,
+          "undated": 0,
+          "inferred_dates": 0,
+          "outside_window": 0,
+          "completeness": "Unknown: no authoritative total or date-window contract",
+          "seconds": 1.031,
+          "responses": [
+            {
+              "url": "https://development.wiltshire.gov.uk/pr3/s/be-register-view?c__r=Arcus_BE_Public_Register",
+              "status": 200,
+              "sha256": "5b5cc0a50acd8cd7145c01fe607297d5b481f76766cad6be1df536d0abac5028",
+              "totals": [],
+              "continuation_advertised": false
+            },
+            {
+              "url": "https://development.wiltshire.gov.uk/pr/s/sfsites/aura?r=10&other.PR_SearchCont.query=1",
+              "status": 200,
+              "sha256": "c9e51176b1576d92fe2e9ae70ca2ef5b005634fbd54e650ecee0fcf223d640af",
+              "totals": [],
+              "continuation_advertised": false
+            }
+          ]
+        },
+        {
+          "window": "historical",
+          "start": "2025-09-11",
+          "end": "2025-10-10",
+          "unique_records": 650,
+          "undated": 0,
+          "inferred_dates": 0,
+          "outside_window": 0,
+          "completeness": "Unknown: no authoritative total or date-window contract",
+          "seconds": 1.032,
+          "responses": [
+            {
+              "url": "https://development.wiltshire.gov.uk/pr3/s/be-register-view?c__r=Arcus_BE_Public_Register",
+              "status": 200,
+              "sha256": "8b6e789f072f5b93fa7840eea8a3d3ee6f4cff1242056c41b7c990eaef9a6950",
+              "totals": [],
+              "continuation_advertised": false
+            },
+            {
+              "url": "https://development.wiltshire.gov.uk/pr/s/sfsites/aura?r=10&other.PR_SearchCont.query=1",
+              "status": 200,
+              "sha256": "5c87e4a9fa859568f519395927713516a7eca70c56466c40b9db30cfb32ae26e",
+              "totals": [],
+              "continuation_advertised": false
+            }
+          ]
+        }
+      ],
+      "partition_comparison": {
+        "large_count": 516,
+        "partition_count": 516,
+        "missing_from_large": 0,
+        "missing_from_partitions": 0
+      }
+    },
+    {
+      "council": "Nuneaton",
+      "portal": "https://www.nuneatonandbedworth.gov.uk/planning-search",
+      "windows": [
+        {
+          "window": "small",
+          "start": "2026-10-10",
+          "end": "2026-10-10",
+          "completeness": "Unavailable",
+          "error": "Could not find AchieveForms form definition URI",
+          "seconds": 0.219,
+          "responses": [
+            {
+              "url": "https://www.nuneatonandbedworth.gov.uk/planning-search",
+              "status": 200,
+              "sha256": "84d9505d600b7cb299d5e38e327356b0cfbe34c2a209347c771c7fa7f94ee8a0",
+              "totals": [],
+              "continuation_advertised": false
+            }
+          ]
+        },
+        {
+          "window": "large",
+          "start": "2026-09-11",
+          "end": "2026-10-10",
+          "completeness": "Unavailable",
+          "error": "Could not find AchieveForms form definition URI",
+          "seconds": 0.421,
+          "responses": [
+            {
+              "url": "https://www.nuneatonandbedworth.gov.uk/planning-search",
+              "status": 200,
+              "sha256": "84d9505d600b7cb299d5e38e327356b0cfbe34c2a209347c771c7fa7f94ee8a0",
+              "totals": [],
+              "continuation_advertised": false
+            }
+          ]
+        },
+        {
+          "window": "large_left",
+          "start": "2026-09-11",
+          "end": "2026-09-25",
+          "completeness": "Unavailable",
+          "error": "Could not find AchieveForms form definition URI",
+          "seconds": 0.516,
+          "responses": [
+            {
+              "url": "https://www.nuneatonandbedworth.gov.uk/planning-search",
+              "status": 200,
+              "sha256": "84d9505d600b7cb299d5e38e327356b0cfbe34c2a209347c771c7fa7f94ee8a0",
+              "totals": [],
+              "continuation_advertised": false
+            }
+          ]
+        },
+        {
+          "window": "large_right",
+          "start": "2026-09-26",
+          "end": "2026-10-10",
+          "completeness": "Unavailable",
+          "error": "Could not find AchieveForms form definition URI",
+          "seconds": 0.5,
+          "responses": [
+            {
+              "url": "https://www.nuneatonandbedworth.gov.uk/planning-search",
+              "status": 200,
+              "sha256": "84d9505d600b7cb299d5e38e327356b0cfbe34c2a209347c771c7fa7f94ee8a0",
+              "totals": [],
+              "continuation_advertised": false
+            }
+          ]
+        },
+        {
+          "window": "historical",
+          "start": "2025-09-11",
+          "end": "2025-10-10",
+          "completeness": "Unavailable",
+          "error": "Could not find AchieveForms form definition URI",
+          "seconds": 0.5,
+          "responses": [
+            {
+              "url": "https://www.nuneatonandbedworth.gov.uk/planning-search",
+              "status": 200,
+              "sha256": "84d9505d600b7cb299d5e38e327356b0cfbe34c2a209347c771c7fa7f94ee8a0",
+              "totals": [],
+              "continuation_advertised": false
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

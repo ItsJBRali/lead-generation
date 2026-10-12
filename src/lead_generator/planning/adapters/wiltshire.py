@@ -144,6 +144,10 @@ class WiltshirePlanningScraper(PlanningScraper):
                 records = return_value.get("records")
                 if isinstance(records, list):
                     return [record for record in records if isinstance(record, dict)]
+            elif return_value == []:
+                # The live endpoint returns [] (rather than {records: []})
+                # for a valid search with no matching applications.
+                return []
         if found_search_action:
             raise CouncilFetchError("Wiltshire planning search result did not contain records")
         raise CouncilFetchError("Wiltshire planning search action was missing from the response")
@@ -255,3 +259,4 @@ class WiltshirePlanningScraper(PlanningScraper):
     def _path_prefix(self, path: str) -> str:
         match = re.match(r"(.+?)/s/", path, flags=re.IGNORECASE)
         return match.group(1) if match else ""
+

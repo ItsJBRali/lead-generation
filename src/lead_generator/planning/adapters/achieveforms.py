@@ -14,7 +14,7 @@ from lxml import etree
 from lead_generator.planning.adapters.base import PlanningScraper
 from lead_generator.planning.http import CouncilFetchError, CouncilHttpClient
 from lead_generator.planning.models import DiscoveryResult, PlanningApplication, PlanningDocument
-from lead_generator.planning.parsing import clean_text, extract_postcode, parse_council_date
+from lead_generator.planning.parsing import clean_text, extract_postcode, parse_council_date, usable_application_date
 
 
 @dataclass(frozen=True, slots=True)
@@ -363,14 +363,7 @@ class AchieveFormsPlanningScraper(PlanningScraper):
         return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query, doseq=True, safe=":/"), f"application-{quote(reference)}"))
 
     def _application_date(self, application: PlanningApplication) -> date | None:
-        for value in (application.date_received, application.date_validated):
-            if not value:
-                continue
-            try:
-                return date.fromisoformat(value[:10])
-            except ValueError:
-                continue
-        return None
+        return usable_application_date(application.date_received, application.date_validated)
 
     def _date_value(self, row: dict[str, str], *keys: str) -> str | None:
         value = self._first_value(row, *keys)

@@ -19,6 +19,7 @@ from urllib.request import (
     Request,
     build_opener,
 )
+from lead_generator.planning.metrics import metric_event
 
 try:
     from selenium.common.exceptions import WebDriverException
@@ -262,6 +263,8 @@ class CouncilHttpClient:
     def _send_raw(self, request: Request, url: str) -> _RawFetchResponse:
         last_error: Exception | None = None
         for attempt in range(self.retries + 1):
+            if attempt:
+                metric_event("retries")
             _raise_if_request_cancelled()
             _report_request_activity()
             try:
@@ -270,6 +273,7 @@ class CouncilHttpClient:
                     self._wait_for_turn(url)
                     _raise_if_request_cancelled()
                     _report_request_activity()
+                    metric_event("requests")
                     with self._opener().open(request, timeout=self.timeout_seconds) as response:
                         charset = response.headers.get_content_charset() or "utf-8"
                         body = response.read()
@@ -412,6 +416,7 @@ class CouncilBrowserClient:
         driver = self._ensure_driver()
         try:
             _report_request_activity()
+            metric_event("browser_operations")
             driver.get(url)
             self._wait_for_usable_page()
             return self._response()
@@ -429,6 +434,7 @@ class CouncilBrowserClient:
         driver = self._ensure_driver()
         try:
             _report_request_activity()
+            metric_event("browser_operations")
             if str(data.get("ajax", "")).casefold() == "true" or (
                 headers and headers.get("X-Requested-With", "").casefold() == "xmlhttprequest"
             ):
@@ -490,6 +496,7 @@ class CouncilBrowserClient:
             url = f"{url}{separator}{urlencode(params)}"
         driver = self._ensure_driver()
         try:
+            metric_event("browser_operations")
             result = driver.execute_async_script(
                 """
                 const done = arguments[arguments.length - 1];
